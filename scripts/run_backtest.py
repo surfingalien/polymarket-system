@@ -17,8 +17,6 @@ Metrics produced:
   - Calibration (Brier score, ECE)
   - Kelly vs flat-bet comparison
 """
-from __future__ import annotations
-
 import argparse
 import asyncio
 import json
