@@ -261,3 +261,69 @@ class TestCrossMarketCorrelator:
         # Same price, net_spread after fees will be negative
         arb = correlator.find_arbitrage(poly, kalshi, min_spread=0.05)
         assert len(arb) == 0
+
+
+# --- Regression tests for prediction-accuracy fixes ---
+
+class TestDecayDoesNotManufactureEdge:
+    def test_near_resolution_shrinks_toward_market_price(self):
+        """A 95% market with a 95% estimate must NOT drift toward 0.5 near expiry."""
+        model = ResolutionDecayModel()
+        _, prob = model.adjust_for_time(1, 0.8, 0.95, market_price=0.95)
+        assert abs(prob - 0.95) < 0.001  # no fake edge created
+
+    def test_near_resolution_shrinks_estimate_with_real_edge(self):
+        model = ResolutionDecayModel()
+        _, prob = model.adjust_for_time(1, 0.8, 0.70, market_price=0.50)
+        assert 0.50 < prob < 0.70  # edge shrunk toward market, not amplified
+
+    def test_no_market_price_means_no_pull(self):
+        model = ResolutionDecayModel()
+        _, prob = model.adjust_for_time(1, 0.8, 0.70)
+        assert prob == pytest.approx(0.70)
+
+
+class TestEnsembleNeutralSignalsDoNotDilute:
+    def _base_kwargs(self):
+        return dict(
+            market_price=0.5,
+            ai_probability=0.65,
+            ai_confidence=0.80,
+            bayesian_estimate=0.62,
+            momentum_signals=[],
+            sentiment_signal=None,
+        )
+
+    def test_neutral_signal_does_not_shrink_estimate(self):
+        pred = EnsemblePredictor()
+        without = pred.predict(microstructure_signals=[], **self._base_kwargs())
+        neutral = Signal(name="spread_quality", value=0.0, confidence=0.9, weight=2.0)
+        with_neutral = pred.predict(microstructure_signals=[neutral], **self._base_kwargs())
+        assert with_neutral.estimated_probability == pytest.approx(
+            without.estimated_probability
+        )
+
+    def test_disagreement_lowers_confidence(self):
+        pred = EnsemblePredictor()
+        agree = Signal(name="order_book_imbalance", value=0.7, confidence=0.8)
+        disagree = Signal(name="order_book_imbalance", value=-0.9, confidence=0.8)
+        r_agree = pred.predict(microstructure_signals=[agree], **self._base_kwargs())
+        r_disagree = pred.predict(microstructure_signals=[disagree], **self._base_kwargs())
+        assert r_disagree.confidence < r_agree.confidence
+
+
+class TestCalibrationDedupe:
+    def test_repeated_records_update_in_place(self):
+        tracker = CalibrationTracker()
+        for _ in range(50):                 # 50 analysis cycles, same market
+            tracker.record("m1", 0.7)
+        tracker.resolve("m1", 1.0)
+        stats = tracker.accuracy_stats()
+        assert stats["n"] == 1              # one market = one data point
+
+    def test_latest_prediction_wins(self):
+        tracker = CalibrationTracker()
+        tracker.record("m1", 0.9)
+        tracker.record("m1", 0.6)           # updated estimate
+        tracker.resolve("m1", 1.0)
+        assert tracker.brier_score() == pytest.approx((0.6 - 1.0) ** 2)

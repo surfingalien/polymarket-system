@@ -290,3 +290,45 @@ class TestSentimentDivergenceSignal:
         sig_obj = SentimentDivergenceSignal()
         sig = sig_obj.signal(-1.0, 1.0)
         assert -1.0 <= sig.value <= 1.0
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for prediction-accuracy fixes
+# ---------------------------------------------------------------------------
+
+class TestTemporalSignalIsDirectionless:
+    def test_value_always_zero(self):
+        """Time of day must never push YES/NO direction for a market."""
+        temporal = TemporalPatternSignal()
+        for hour in range(24):
+            assert temporal.signal(utc_hour=hour).value == 0.0
+
+    def test_off_peak_more_confident_than_peak(self):
+        temporal = TemporalPatternSignal()
+        dead = temporal.signal(utc_hour=4)
+        peak = temporal.signal(utc_hour=16)
+        assert dead.confidence > peak.confidence
+
+
+class TestLongshotAdjustmentScale:
+    def test_full_strength_reaches_max_adjustment(self):
+        det = LongshotBiasDetector(max_adjustment=0.06)
+        # price near 0 → strength ~1 → delta ~ -6pp
+        adjusted = det.adjust_probability(market_price=0.001, estimated_prob=0.50)
+        assert adjusted == pytest.approx(0.50 - 0.06, abs=0.005)
+
+    def test_signal_value_full_scale(self):
+        det = LongshotBiasDetector()
+        sig = det.signal(market_price=0.001)
+        assert sig.value < -0.95   # near full-scale lean NO
+
+
+class TestExcessReturnDedupe:
+    def test_repeated_records_update_in_place(self):
+        tracker = ExcessReturnTracker()
+        for _ in range(50):
+            tracker.record("m1", 0.7)
+        tracker.resolve("m1", 1.0)
+        stats = tracker.stats()
+        assert stats["n_resolved"] == 1
+        assert stats["n_pending"] == 0

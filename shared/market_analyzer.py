@@ -81,6 +81,9 @@ class FullMarketAnalysis:
     final_confidence: float = 0.0
     kelly_fraction: float = 0.0
     edge: float = 0.0
+    # Category- and hour-adjusted edge requirement (sports markets need less
+    # edge than finance; efficient hours need more).
+    min_edge_threshold: float = 0.03
 
     analyzed_at: float = field(default_factory=time.time)
 
@@ -90,7 +93,7 @@ class FullMarketAnalysis:
             self.final_confidence = self.ensemble.confidence
             self.kelly_fraction = self.ensemble.kelly_fraction
             self.edge = self.ensemble.edge
-            if not self.ensemble.has_edge or self.final_confidence < 0.5:
+            if abs(self.edge) < self.min_edge_threshold or self.final_confidence < 0.5:
                 self.signal = "HOLD"
             elif self.edge > 0:
                 self.signal = "BUY_YES"
@@ -136,7 +139,9 @@ class MarketAnalyzer:
 
         # Advanced signals (research-derived)
         self._longshot = LongshotBiasDetector()
-        self._order_flow = OrderFlowAnalyzer()
+        # One order-flow analyzer per market: trades in one market must not
+        # generate signals for unrelated markets.
+        self._order_flow: dict[str, OrderFlowAnalyzer] = {}
         self._temporal = TemporalPatternSignal()
         self._category = CategoryEdgeModel()
         self._quality = MarketQualityScorer()
@@ -212,56 +217,53 @@ class MarketAnalyzer:
         # 5. Momentum signals
         mom_signals = self._momentum.analyze(price_history) if price_history else []
 
-        # 6. Longshot bias correction
+        # 6. Longshot bias signal (applied ONCE, directly in step 14 —
+        #    feeding it into the ensemble too would double-count it)
         longshot_sig = self._longshot.signal(market_price)
 
-        # 7. Order flow signal (if populated)
-        of_sig = self._order_flow.signal()
+        # 7. Order flow signal (per-market, if trades have been recorded)
+        of_analyzer = self._order_flow.get(market_id)
+        of_sig = of_analyzer.signal() if of_analyzer else None
 
-        # 8. Temporal efficiency signal
+        # 8–10. Neutral meta-signals — kept for display/diagnostics; they
+        #     act through thresholds (step 15/16), not through the ensemble.
         temporal_sig = self._temporal.signal()
-
-        # 9. Market quality meta-signal
         quality_sig = self._quality.signal(volume_usd, liquidity_usd, price_change_pct, market_price)
-
-        # 10. Category edge signal
         category_sig = self._category.signal(question, ai.edge)
+        meta_signals: list[Signal] = [longshot_sig, temporal_sig, quality_sig, category_sig]
 
         # 11. Sentiment (primary) + dual-source divergence
         primary_sentiment_sig = self._sentiment_conv.to_signal(
             primary_news.sentiment_score, len(primary_news.articles)
         )
+        directional_extras: list[Signal] = []
         if secondary_sentiment != 0.0:
-            divergence_sig = self._divergence.signal(
+            directional_extras.append(self._divergence.signal(
                 primary_news.sentiment_score,
                 secondary_sentiment,
                 weight_a=1.0,
                 weight_b=0.7,
-            )
-            extra_signals: list[Signal] = [longshot_sig, temporal_sig, quality_sig,
-                                            category_sig, divergence_sig]
-        else:
-            extra_signals = [longshot_sig, temporal_sig, quality_sig, category_sig]
-
+            ))
         if of_sig:
-            extra_signals.append(of_sig)
+            directional_extras.append(of_sig)
 
-        # 12. Ensemble
+        # 12. Ensemble — only genuinely directional inputs
         raw_ensemble = self._ensemble.predict(
             market_price=market_price,
             ai_probability=ai.estimated_probability,
             ai_confidence=ai.confidence,
             bayesian_estimate=bay_mean,
-            microstructure_signals=ob_signals + extra_signals,
+            microstructure_signals=ob_signals + directional_extras,
             momentum_signals=mom_signals,
             sentiment_signal=primary_sentiment_sig,
         )
 
-        # 13. Time-to-resolution decay
+        # 13. Time-to-resolution decay (shrinks toward market price near expiry)
         adj_conf, adj_prob = self._decay.adjust_for_time(
             days_to_resolution,
             raw_ensemble.confidence,
             raw_ensemble.estimated_probability,
+            market_price=market_price,
         )
 
         # 14. Apply longshot bias as direct probability adjustment
@@ -270,19 +272,25 @@ class MarketAnalyzer:
         # 15. Scale confidence by market quality
         adj_conf = adj_conf * (0.5 + 0.5 * quality_score)
 
+        # 16. Category- and hour-adjusted edge requirement
+        min_edge = self._temporal.adjusted_min_edge(
+            self._category.adjusted_min_edge(question, 0.03)
+        )
+
         final_ensemble = EnsembleResult(
             raw_probability=raw_ensemble.raw_probability,
             estimated_probability=adj_prob,
             edge=adj_prob - market_price,
             kelly_fraction=self._kelly.compute(adj_prob, market_price),
             confidence=adj_conf,
-            signals=raw_ensemble.signals + extra_signals,
+            signals=raw_ensemble.signals + meta_signals,
         )
 
+        result.min_edge_threshold = min_edge
         result.ensemble = final_ensemble
         result.__post_init__()
 
-        # 16. Record for calibration + excess return
+        # 17. Record for calibration + excess return
         self._calibration.record(market_id, adj_prob)
         self._excess_return.record(market_id, adj_prob)
 
@@ -336,12 +344,14 @@ class MarketAnalyzer:
             quality_score = self._quality.score(volume, liquidity, 0.0, price)
 
             if ai:
+                # Same evidence scaling as the full analyze() path
                 bay_mean, _, _ = self._bayesian.estimate(
-                    price, [(ai.estimated_probability - price, ai.confidence)]
+                    price, [((ai.estimated_probability - price) * 2, ai.confidence)]
                 )
 
-                # Longshot + category + temporal signals
-                extra: list[Signal] = [
+                # Meta-signals for display only — longshot is applied directly
+                # below, the others act through thresholds, not the ensemble.
+                meta: list[Signal] = [
                     self._longshot.signal(price),
                     self._temporal.signal(),
                     self._quality.signal(volume, liquidity, 0.0, price),
@@ -353,7 +363,7 @@ class MarketAnalyzer:
                     ai_probability=ai.estimated_probability,
                     ai_confidence=ai.confidence,
                     bayesian_estimate=bay_mean,
-                    microstructure_signals=extra,
+                    microstructure_signals=[],
                     momentum_signals=[],
                     sentiment_signal=None,
                 )
@@ -368,11 +378,14 @@ class MarketAnalyzer:
                     edge=adj_prob - price,
                     kelly_fraction=self._kelly.compute(adj_prob, price),
                     confidence=adj_conf,
-                    signals=ens.signals,
+                    signals=ens.signals + meta,
                 )
             else:
                 ens = None
 
+            min_edge = self._temporal.adjusted_min_edge(
+                self._category.adjusted_min_edge(question, 0.03)
+            )
             r = FullMarketAnalysis(
                 market_id=m["id"],
                 question=question,
@@ -385,8 +398,12 @@ class MarketAnalyzer:
                 market_quality=quality_score,
                 ai_analysis=ai,
                 ensemble=ens,
+                min_edge_threshold=min_edge,
             )
             r.__post_init__()
+            if ens:
+                self._calibration.record(m["id"], ens.estimated_probability)
+                self._excess_return.record(m["id"], ens.estimated_probability)
             results.append(r)
 
         return results
@@ -395,9 +412,11 @@ class MarketAnalyzer:
     # Accessors
     # ------------------------------------------------------------------
 
-    def record_trade(self, price: float, size_usd: float, side: str) -> None:
-        """Feed live trade data into the order flow analyzer."""
-        self._order_flow.record_trade(price, size_usd, side)
+    def record_trade(self, market_id: str, price: float, size_usd: float, side: str) -> None:
+        """Feed live trade data into the per-market order flow analyzer."""
+        if market_id not in self._order_flow:
+            self._order_flow[market_id] = OrderFlowAnalyzer()
+        self._order_flow[market_id].record_trade(price, size_usd, side)
 
     def find_arbitrage(
         self,

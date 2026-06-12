@@ -63,12 +63,12 @@ class LongshotBiasDetector:
             # Longshot: YES overpriced → lean NO
             # Stronger bias closer to 0
             strength = (self._low - market_price) / self._low
-            adjustment = -min(strength * self._max_adj * 5, 1.0)
+            adjustment = -min(strength, 1.0)
             confidence = 0.55 + strength * 0.20
         elif market_price > self._high:
             # Favourite reversal: YES underpriced → lean YES
             strength = (market_price - self._high) / (1.0 - self._high)
-            adjustment = min(strength * self._max_adj * 5, 1.0)
+            adjustment = min(strength, 1.0)
             confidence = 0.50 + strength * 0.20
         else:
             adjustment = 0.0
@@ -82,9 +82,9 @@ class LongshotBiasDetector:
         )
 
     def adjust_probability(self, market_price: float, estimated_prob: float) -> float:
-        """Direct probability adjustment, keeping within [0.01, 0.99]."""
+        """Direct probability adjustment, capped at ±max_adjustment (6pp default)."""
         sig = self.signal(market_price)
-        delta = sig.value * self._max_adj
+        delta = sig.value * self._max_adj   # value ∈ [-1, 1] → delta ∈ [-6pp, +6pp]
         return max(0.01, min(0.99, estimated_prob + delta))
 
 
@@ -205,18 +205,21 @@ class TemporalPatternSignal:
 
     def signal(self, utc_hour: Optional[int] = None) -> Signal:
         """
-        Returns a meta-signal encoding whether the current window is
-        favourable for finding mispricings.
-        value=+1 means good hunting window; value=−1 means efficient.
+        Returns a neutral meta-signal describing the current efficiency window.
+
+        The value is always 0: time of day says nothing about whether any
+        particular market should resolve YES or NO, so it must never push
+        the directional estimate. Use `efficiency_multiplier` /
+        `adjusted_min_edge` to tighten or relax edge thresholds instead;
+        the confidence here reflects how exploitable the current window is.
         """
         mult = self.efficiency_multiplier(utc_hour)
-        # Map multiplier to [-1, +1]: 0.75→+1, 1.30→-1
-        value = -(mult - 1.0) / 0.30
-        value = max(-1.0, min(1.0, value))
+        # Off-peak (mult < 1) → more exploitable window → higher confidence
+        exploitability = max(0.0, min(1.0, (1.30 - mult) / 0.55))
         return Signal(
             name="temporal_efficiency",
-            value=value,
-            confidence=0.40,   # weak signal alone; amplifies other signals
+            value=0.0,
+            confidence=0.25 + 0.30 * exploitability,
             weight=0.4,
         )
 
@@ -354,6 +357,13 @@ class ExcessReturnTracker:
         self._records: deque[ExcessReturnRecord] = deque(maxlen=window)
 
     def record(self, market_id: str, predicted_prob: float) -> None:
+        # Re-predicting the same market each cycle updates its pending
+        # record in place — one market, one data point.
+        for r in self._records:
+            if r.market_id == market_id and r.outcome == -1.0:
+                r.predicted_prob = predicted_prob
+                r.timestamp = time.time()
+                return
         self._records.append(
             ExcessReturnRecord(
                 market_id=market_id,

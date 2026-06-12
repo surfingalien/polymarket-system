@@ -530,7 +530,9 @@ class EnsemblePredictor:
 
     DEFAULT_WEIGHTS = {
         "ai_analysis": 3.0,
-        "bayesian": 2.0,
+        # Bayesian posterior is largely derived from the same AI evidence,
+        # so keep its weight below ai_analysis to limit double-counting.
+        "bayesian": 1.5,
         "order_book_imbalance": 1.5,
         "depth_asymmetry": 0.5,
         "spread_quality": 0.2,
@@ -589,18 +591,33 @@ class EnsemblePredictor:
             sentiment_signal.weight = self._weights.get("news_sentiment", 1.2)
             all_signals.append(sentiment_signal)
 
-        # Weighted probability estimate
-        total_weight = sum(s.weight * s.confidence for s in all_signals)
-        if total_weight == 0:
+        # Weighted probability estimate.
+        # Only directional signals (value != 0) move the estimate; neutral
+        # meta-signals (value == 0, e.g. spread_quality) modulate confidence
+        # but must not dilute the weighted mean, otherwise adding more
+        # meta-signals arbitrarily shrinks every real edge toward zero.
+        directional = [s for s in all_signals if s.value != 0.0]
+        dir_weight = sum(s.weight * s.confidence for s in directional)
+        if dir_weight == 0:
             estimated = market_price
             confidence = 0.3
         else:
-            weighted_sum = sum(s.weighted_value for s in all_signals)
+            weighted_sum = sum(s.weighted_value for s in directional)
+            mean_value = weighted_sum / dir_weight
             # Convert signal [-1,+1] back to probability shift from market_price
-            raw_shift = (weighted_sum / total_weight) / 5.0
+            raw_shift = mean_value / 5.0
             estimated = max(0.01, min(0.99, market_price + raw_shift))
-            # Overall confidence: weighted average of signal confidences
-            confidence = min(1.0, total_weight / (len(all_signals) * 2.0 + 1))
+
+            # Confidence: weighted average of all signal confidences,
+            # discounted when directional signals disagree with each other.
+            total_w = sum(s.weight for s in all_signals)
+            avg_conf = sum(s.weight * s.confidence for s in all_signals) / total_w
+            dispersion = sum(
+                s.weight * s.confidence * abs(s.value - mean_value)
+                for s in directional
+            ) / dir_weight
+            agreement = max(0.0, 1.0 - dispersion / 2.0)   # dispersion ∈ [0, 2]
+            confidence = min(1.0, avg_conf * (0.7 + 0.3 * agreement))
 
         edge = estimated - market_price
         kelly_f = self._kelly.compute(estimated, market_price)
@@ -638,6 +655,13 @@ class CalibrationTracker:
         self._records: deque[CalibrationRecord] = deque(maxlen=max_records)
 
     def record(self, market_id: str, predicted_prob: float) -> None:
+        # The analyzer re-predicts the same market every cycle; update the
+        # pending record in place so one market contributes one data point.
+        for rec in self._records:
+            if rec.market_id == market_id and rec.actual_outcome is None:
+                rec.predicted_prob = predicted_prob
+                rec.timestamp = time.time()
+                return
         self._records.append(
             CalibrationRecord(
                 market_id=market_id,
@@ -721,6 +745,7 @@ class ResolutionDecayModel:
         days_to_resolution: float,
         base_confidence: float,
         estimated_prob: float,
+        market_price: Optional[float] = None,
     ) -> tuple[float, float]:
         """
         Returns (adjusted_confidence, adjusted_probability).
@@ -745,11 +770,12 @@ class ResolutionDecayModel:
 
         adjusted_conf = base_confidence * time_factor * discovery_discount
 
-        # Pull estimate slightly toward market price when very close to resolution
-        if days_to_resolution < 2:
+        # Shrink estimate toward the market price when very close to resolution
+        # (the market has discovered most information by then). Shrinking toward
+        # anything other than market price would manufacture edge out of thin air.
+        if days_to_resolution < 2 and market_price is not None:
             pull = 0.3
-            market_proxy = 0.5  # we don't have market price here; use neutral
-            adjusted_prob = estimated_prob * (1 - pull) + market_proxy * pull
+            adjusted_prob = estimated_prob * (1 - pull) + market_price * pull
         else:
             adjusted_prob = estimated_prob
 
