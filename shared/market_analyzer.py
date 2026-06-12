@@ -3,14 +3,18 @@ MarketAnalyzer — orchestrates all predictive models into a single
 analysis pipeline for a given market.
 
 Pipeline:
-  1. Fetch news
+  1. Expand query + fetch news (two-pass)
   2. Call Claude AI
   3. Run Bayesian estimator
   4. Analyze order book microstructure
   5. Compute momentum signals from price history
-  6. Apply time-to-resolution decay
-  7. Ensemble all signals → final probability + Kelly fraction
-  8. Record for calibration
+  6. Apply longshot bias correction
+  7. Apply category-specific edge adjustments
+  8. Apply hour-of-day temporal efficiency adjustment
+  9. Market quality scoring (volume + liquidity + movement)
+  10. Ensemble all signals → final probability + Kelly fraction
+  11. Time-to-resolution decay
+  12. Record for calibration + excess-return tracking
 """
 from __future__ import annotations
 
@@ -20,6 +24,16 @@ from typing import Optional, Sequence
 
 import structlog
 
+from .advanced_signals import (
+    CategoryEdgeModel,
+    ExcessReturnTracker,
+    LongshotBiasDetector,
+    MarketQualityScorer,
+    OrderFlowAnalyzer,
+    QueryExpander,
+    SentimentDivergenceSignal,
+    TemporalPatternSignal,
+)
 from .claude_agent import ClaudeAgent, MarketAnalysis
 from .news_fetcher import NewsFetcher
 from .predictive_models import (
@@ -35,6 +49,7 @@ from .predictive_models import (
     PricePoint,
     ResolutionDecayModel,
     SentimentConverter,
+    Signal,
 )
 
 log = structlog.get_logger(__name__)
@@ -51,6 +66,8 @@ class FullMarketAnalysis:
     volume_usd: float = 0.0
     liquidity_usd: float = 0.0
     days_to_resolution: float = 30.0
+    category: str = "default"
+    market_quality: float = 0.0
 
     # AI layer
     ai_analysis: Optional[MarketAnalysis] = None
@@ -87,14 +104,15 @@ class FullMarketAnalysis:
 
     def summary(self) -> str:
         return (
-            f"[{self.platform}] {self.question[:60]} | "
+            f"[{self.platform}/{self.category}] {self.question[:55]} | "
             f"mkt={self.market_price:.0%} est={self.final_probability:.0%} "
-            f"edge={self.edge:+.1%} conf={self.final_confidence:.0%} → {self.signal}"
+            f"edge={self.edge:+.1%} conf={self.final_confidence:.0%} "
+            f"q={self.market_quality:.2f} → {self.signal}"
         )
 
 
 class MarketAnalyzer:
-    """Full analysis pipeline combining AI + statistical models."""
+    """Full analysis pipeline combining AI + statistical + microstructure models."""
 
     def __init__(
         self,
@@ -104,6 +122,8 @@ class MarketAnalyzer:
     ) -> None:
         self._claude = claude
         self._news = news
+
+        # Core predictive models
         self._bayesian = BayesianEstimator()
         self._kelly = KellyCriterion(max_fraction=kelly_max_fraction)
         self._ob_analyzer = OrderBookAnalyzer()
@@ -113,6 +133,20 @@ class MarketAnalyzer:
         self._decay = ResolutionDecayModel()
         self._calibration = CalibrationTracker()
         self._correlator = CrossMarketCorrelator()
+
+        # Advanced signals (research-derived)
+        self._longshot = LongshotBiasDetector()
+        self._order_flow = OrderFlowAnalyzer()
+        self._temporal = TemporalPatternSignal()
+        self._category = CategoryEdgeModel()
+        self._quality = MarketQualityScorer()
+        self._excess_return = ExcessReturnTracker()
+        self._divergence = SentimentDivergenceSignal()
+        self._query_expander = QueryExpander()
+
+    # ------------------------------------------------------------------
+    # Full single-market analysis
+    # ------------------------------------------------------------------
 
     async def analyze(
         self,
@@ -126,7 +160,13 @@ class MarketAnalyzer:
         order_book: Optional[OrderBookSnapshot] = None,
         price_history: Optional[Sequence[PricePoint]] = None,
         news_query: Optional[str] = None,
+        price_change_pct: float = 0.0,
     ) -> FullMarketAnalysis:
+
+        category = self._category.detect_category(question)
+        quality_score = self._quality.score(
+            volume_usd, liquidity_usd, price_change_pct, market_price
+        )
 
         result = FullMarketAnalysis(
             market_id=market_id,
@@ -136,30 +176,35 @@ class MarketAnalyzer:
             volume_usd=volume_usd,
             liquidity_usd=liquidity_usd,
             days_to_resolution=days_to_resolution,
+            category=category,
+            market_quality=quality_score,
         )
 
-        # 1. News
-        query = news_query or question[:80]
-        news_result = await self._news.fetch(query)
+        # 1. Expand query + fetch news (two-pass: primary query + key terms)
+        queries = self._query_expander.expand(news_query or question, max_queries=3)
+        primary_news = await self._news.fetch(queries[0])
+        secondary_sentiment = 0.0
+        if len(queries) > 1:
+            secondary_news = await self._news.fetch(queries[1])
+            secondary_sentiment = secondary_news.sentiment_score
 
         # 2. Claude AI analysis
         ai = await self._claude.analyze_market(
             market_id=market_id,
             question=question,
             market_price=market_price,
-            news_summary=news_result.summary,
+            news_summary=primary_news.summary,
         )
         result.ai_analysis = ai
 
-        # 3. Bayesian estimate — use news sentiment + AI as evidence
+        # 3. Bayesian estimate
         evidence: list[tuple[float, float]] = []
         if ai.estimated_probability != market_price:
             ai_strength = (ai.estimated_probability - market_price) * 2
             evidence.append((ai_strength, ai.confidence))
-        if news_result.articles:
-            evidence.append((news_result.sentiment_score, 0.5))
-
-        bay_mean, bay_lo, bay_hi = self._bayesian.estimate(market_price, evidence)
+        if primary_news.articles:
+            evidence.append((primary_news.sentiment_score, 0.5))
+        bay_mean, _, _ = self._bayesian.estimate(market_price, evidence)
 
         # 4. Microstructure signals
         ob_signals = self._ob_analyzer.analyze(order_book) if order_book else []
@@ -167,48 +212,85 @@ class MarketAnalyzer:
         # 5. Momentum signals
         mom_signals = self._momentum.analyze(price_history) if price_history else []
 
-        # 6. Sentiment signal
-        sentiment_sig = self._sentiment_conv.to_signal(
-            news_result.sentiment_score, len(news_result.articles)
-        )
+        # 6. Longshot bias correction
+        longshot_sig = self._longshot.signal(market_price)
 
-        # 7. Ensemble
+        # 7. Order flow signal (if populated)
+        of_sig = self._order_flow.signal()
+
+        # 8. Temporal efficiency signal
+        temporal_sig = self._temporal.signal()
+
+        # 9. Market quality meta-signal
+        quality_sig = self._quality.signal(volume_usd, liquidity_usd, price_change_pct, market_price)
+
+        # 10. Category edge signal
+        category_sig = self._category.signal(question, ai.edge)
+
+        # 11. Sentiment (primary) + dual-source divergence
+        primary_sentiment_sig = self._sentiment_conv.to_signal(
+            primary_news.sentiment_score, len(primary_news.articles)
+        )
+        if secondary_sentiment != 0.0:
+            divergence_sig = self._divergence.signal(
+                primary_news.sentiment_score,
+                secondary_sentiment,
+                weight_a=1.0,
+                weight_b=0.7,
+            )
+            extra_signals: list[Signal] = [longshot_sig, temporal_sig, quality_sig,
+                                            category_sig, divergence_sig]
+        else:
+            extra_signals = [longshot_sig, temporal_sig, quality_sig, category_sig]
+
+        if of_sig:
+            extra_signals.append(of_sig)
+
+        # 12. Ensemble
         raw_ensemble = self._ensemble.predict(
             market_price=market_price,
             ai_probability=ai.estimated_probability,
             ai_confidence=ai.confidence,
             bayesian_estimate=bay_mean,
-            microstructure_signals=ob_signals,
+            microstructure_signals=ob_signals + extra_signals,
             momentum_signals=mom_signals,
-            sentiment_signal=sentiment_sig,
+            sentiment_signal=primary_sentiment_sig,
         )
 
-        # 8. Time-to-resolution decay
+        # 13. Time-to-resolution decay
         adj_conf, adj_prob = self._decay.adjust_for_time(
             days_to_resolution,
             raw_ensemble.confidence,
             raw_ensemble.estimated_probability,
         )
 
-        from .predictive_models import EnsembleResult as ER
-        final_ensemble = ER(
+        # 14. Apply longshot bias as direct probability adjustment
+        adj_prob = self._longshot.adjust_probability(market_price, adj_prob)
+
+        # 15. Scale confidence by market quality
+        adj_conf = adj_conf * (0.5 + 0.5 * quality_score)
+
+        final_ensemble = EnsembleResult(
             raw_probability=raw_ensemble.raw_probability,
             estimated_probability=adj_prob,
             edge=adj_prob - market_price,
             kelly_fraction=self._kelly.compute(adj_prob, market_price),
             confidence=adj_conf,
-            signals=raw_ensemble.signals,
+            signals=raw_ensemble.signals + extra_signals,
         )
 
         result.ensemble = final_ensemble
         result.__post_init__()
 
-        # Record for calibration
+        # 16. Record for calibration + excess return
         self._calibration.record(market_id, adj_prob)
+        self._excess_return.record(market_id, adj_prob)
 
         log.info(
             "full_analysis_complete",
             market_id=market_id,
+            category=category,
+            quality=round(quality_score, 2),
             signal=result.signal,
             edge=round(result.edge, 3),
             confidence=round(result.final_confidence, 2),
@@ -217,16 +299,19 @@ class MarketAnalyzer:
         )
         return result
 
+    # ------------------------------------------------------------------
+    # Batch analysis (AI-only, no order book/price history for speed)
+    # ------------------------------------------------------------------
+
     async def analyze_batch(
         self,
         markets: list[dict],
         batch_size: int = 5,
     ) -> list[FullMarketAnalysis]:
         """
-        Lightweight batch analysis — uses Claude batch endpoint, skips
-        order book and price history for speed.
+        Lightweight batch analysis — single Claude call per batch,
+        applies longshot bias, category, quality, and temporal signals.
         """
-        # Prepare Claude batch input
         claude_input = [
             {
                 "id": m["id"],
@@ -243,31 +328,61 @@ class MarketAnalyzer:
         for m in markets:
             ai = ai_map.get(m["id"])
             price = float(m.get("price", 0.5))
+            volume = float(m.get("volume", 0))
+            liquidity = float(m.get("liquidity", 0))
+            question = m.get("question", "")
+
+            category = self._category.detect_category(question)
+            quality_score = self._quality.score(volume, liquidity, 0.0, price)
 
             if ai:
                 bay_mean, _, _ = self._bayesian.estimate(
                     price, [(ai.estimated_probability - price, ai.confidence)]
                 )
+
+                # Longshot + category + temporal signals
+                extra: list[Signal] = [
+                    self._longshot.signal(price),
+                    self._temporal.signal(),
+                    self._quality.signal(volume, liquidity, 0.0, price),
+                    self._category.signal(question, ai.edge),
+                ]
+
                 ens = self._ensemble.predict(
                     market_price=price,
                     ai_probability=ai.estimated_probability,
                     ai_confidence=ai.confidence,
                     bayesian_estimate=bay_mean,
-                    microstructure_signals=[],
+                    microstructure_signals=extra,
                     momentum_signals=[],
                     sentiment_signal=None,
+                )
+
+                # Apply longshot direct adjustment + quality confidence scaling
+                adj_prob = self._longshot.adjust_probability(price, ens.estimated_probability)
+                adj_conf = ens.confidence * (0.5 + 0.5 * quality_score)
+
+                ens = EnsembleResult(
+                    raw_probability=ens.raw_probability,
+                    estimated_probability=adj_prob,
+                    edge=adj_prob - price,
+                    kelly_fraction=self._kelly.compute(adj_prob, price),
+                    confidence=adj_conf,
+                    signals=ens.signals,
                 )
             else:
                 ens = None
 
             r = FullMarketAnalysis(
                 market_id=m["id"],
-                question=m.get("question", ""),
+                question=question,
                 platform=m.get("platform", "unknown"),
                 market_price=price,
-                volume_usd=float(m.get("volume", 0)),
-                liquidity_usd=float(m.get("liquidity", 0)),
+                volume_usd=volume,
+                liquidity_usd=liquidity,
                 days_to_resolution=float(m.get("days_to_resolution", 30)),
+                category=category,
+                market_quality=quality_score,
                 ai_analysis=ai,
                 ensemble=ens,
             )
@@ -275,6 +390,14 @@ class MarketAnalyzer:
             results.append(r)
 
         return results
+
+    # ------------------------------------------------------------------
+    # Accessors
+    # ------------------------------------------------------------------
+
+    def record_trade(self, price: float, size_usd: float, side: str) -> None:
+        """Feed live trade data into the order flow analyzer."""
+        self._order_flow.record_trade(price, size_usd, side)
 
     def find_arbitrage(
         self,
@@ -284,11 +407,20 @@ class MarketAnalyzer:
     ) -> list:
         return self._correlator.find_arbitrage(poly_markets, kalshi_markets, min_spread)
 
-    def calibration_stats(self) -> dict:
-        return self._calibration.accuracy_stats()
-
     def resolve_market(self, market_id: str, outcome: float) -> None:
         self._calibration.resolve(market_id, outcome)
+        self._excess_return.resolve(market_id, outcome)
 
     def update_signal_weight(self, signal_name: str, performance_delta: float) -> None:
         self._ensemble.update_weights(signal_name, performance_delta)
+
+    def calibration_stats(self) -> dict:
+        cal = self._calibration.accuracy_stats()
+        er = self._excess_return.stats()
+        return {**cal, "excess_return": er}
+
+    def market_quality(self, volume_usd: float, liquidity_usd: float) -> float:
+        return self._quality.score(volume_usd, liquidity_usd)
+
+    def is_market_tradeable(self, volume_usd: float, liquidity_usd: float) -> bool:
+        return self._quality.is_tradeable(volume_usd, liquidity_usd)

@@ -16,6 +16,19 @@ from .predictive_models import (
     PricePoint,
     EnsembleResult,
 )
+from .advanced_signals import (
+    LongshotBiasDetector,
+    OrderFlowAnalyzer,
+    TemporalPatternSignal,
+    CategoryEdgeModel,
+    ExcessReturnTracker,
+    MarketQualityScorer,
+    QueryExpander,
+    SentimentDivergenceSignal,
+    TradeEvent,
+    CategoryProfile,
+    CATEGORY_PROFILES,
+)
 
 __all__ = [
     "ClaudeAgent", "MarketAnalysis",
@@ -27,4 +40,8 @@ __all__ = [
     "MomentumAnalyzer", "EnsemblePredictor", "CalibrationTracker",
     "CrossMarketCorrelator", "ResolutionDecayModel",
     "OrderBookSnapshot", "PricePoint", "EnsembleResult",
+    "LongshotBiasDetector", "OrderFlowAnalyzer", "TemporalPatternSignal",
+    "CategoryEdgeModel", "ExcessReturnTracker", "MarketQualityScorer",
+    "QueryExpander", "SentimentDivergenceSignal",
+    "TradeEvent", "CategoryProfile", "CATEGORY_PROFILES",
 ]
