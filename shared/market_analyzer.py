@@ -35,6 +35,7 @@ from .advanced_signals import (
     TemporalPatternSignal,
 )
 from .claude_agent import ClaudeAgent, MarketAnalysis
+from .learning_engine import LearningEngine
 from .news_fetcher import NewsFetcher
 from .predictive_models import (
     BayesianEstimator,
@@ -122,6 +123,7 @@ class MarketAnalyzer:
         claude: ClaudeAgent,
         news: NewsFetcher,
         kelly_max_fraction: float = 0.25,
+        learning_state_file: str = "data/learning_state.json",
     ) -> None:
         self._claude = claude
         self._news = news
@@ -136,6 +138,13 @@ class MarketAnalyzer:
         self._decay = ResolutionDecayModel()
         self._calibration = CalibrationTracker()
         self._correlator = CrossMarketCorrelator()
+
+        # Self-learning brain — loads persisted weights on startup
+        from pathlib import Path
+        self.learning = LearningEngine(
+            self._ensemble, state_file=Path(learning_state_file)
+        )
+        self.learning.load()
 
         # Advanced signals (research-derived)
         self._longshot = LongshotBiasDetector()
@@ -427,16 +436,27 @@ class MarketAnalyzer:
         return self._correlator.find_arbitrage(poly_markets, kalshi_markets, min_spread)
 
     def resolve_market(self, market_id: str, outcome: float) -> None:
+        """Feed a resolved outcome back into calibration, excess-return, and the learning engine."""
         self._calibration.resolve(market_id, outcome)
         self._excess_return.resolve(market_id, outcome)
+        self.learning.on_market_resolved(market_id, outcome)
 
     def update_signal_weight(self, signal_name: str, performance_delta: float) -> None:
         self._ensemble.update_weights(signal_name, performance_delta)
 
+    def apply_learning_decay(self) -> None:
+        """Call once per cycle to regularise learned weights back toward defaults."""
+        self.learning.apply_decay()
+
+    def save_learning_state(self) -> None:
+        """Persist the evolved weights and trade memories to disk."""
+        self.learning.save()
+
     def calibration_stats(self) -> dict:
         cal = self._calibration.accuracy_stats()
         er = self._excess_return.stats()
-        return {**cal, "excess_return": er}
+        learning = self.learning.performance_summary()
+        return {**cal, "excess_return": er, "learning": learning}
 
     def market_quality(self, volume_usd: float, liquidity_usd: float) -> float:
         return self._quality.score(volume_usd, liquidity_usd)

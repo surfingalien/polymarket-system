@@ -1,4 +1,5 @@
 from .claude_agent import ClaudeAgent, MarketAnalysis
+from .learning_engine import LearningEngine, TradeMemory, SignalSnapshot
 from .risk_manager import RiskManager, RiskDecision, Position
 from .market_analyzer import MarketAnalyzer, FullMarketAnalysis
 from .signal_router import SignalRouter, RoutedSignal
@@ -32,6 +33,7 @@ from .advanced_signals import (
 
 __all__ = [
     "ClaudeAgent", "MarketAnalysis",
+    "LearningEngine", "TradeMemory", "SignalSnapshot",
     "RiskManager", "RiskDecision", "Position",
     "MarketAnalyzer", "FullMarketAnalysis",
     "SignalRouter", "RoutedSignal",

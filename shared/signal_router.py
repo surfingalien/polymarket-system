@@ -8,6 +8,7 @@ from typing import Callable, Coroutine, Optional
 
 import structlog
 
+from .learning_engine import LearningEngine
 from .market_analyzer import FullMarketAnalysis
 from .risk_manager import RiskDecision, RiskManager
 
@@ -35,6 +36,7 @@ class SignalRouter:
         poly_executor: Optional[TradeExecutor] = None,
         kalshi_executor: Optional[TradeExecutor] = None,
         bankroll_usd: float = 1000.0,
+        learning_engine: Optional[LearningEngine] = None,
     ) -> None:
         self._risk = risk_manager
         self._executors: dict[str, TradeExecutor] = {}
@@ -43,6 +45,7 @@ class SignalRouter:
         if kalshi_executor:
             self._executors["kalshi"] = kalshi_executor
         self._bankroll = bankroll_usd
+        self._learning = learning_engine
 
     async def route(self, analysis: FullMarketAnalysis) -> RoutedSignal:
         if analysis.signal == "HOLD":
@@ -109,6 +112,9 @@ class SignalRouter:
                 entry_price=entry_price,
             )
             routed.executed = True
+            # Notify learning engine so signals can earn credit when this market resolves
+            if self._learning is not None:
+                self._learning.on_trade_placed(analysis)
             log.info(
                 "trade_executed",
                 market_id=analysis.market_id,
