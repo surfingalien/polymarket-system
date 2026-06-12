@@ -9,6 +9,10 @@ tenacity>=8.3.0
 structlog>=24.2.0
 rich>=13.7.0
 
+# Web Dashboard
+streamlit>=1.35.0
+plotly>=5.22.0
+
 # Cryptography & Web3 (Polymarket + Kalshi auth)
 cryptography>=42.0.0
 web3>=6.20.0
