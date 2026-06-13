@@ -9,9 +9,11 @@ across Python 3.10–3.14 and all Streamlit Cloud versions.
 """
 from __future__ import annotations
 
+import asyncio
 import math
 import random
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -36,6 +38,7 @@ try:
         CategoryEdgeModel, LongshotBiasDetector,
         MarketQualityScorer, TemporalPatternSignal,
     )
+    from shared.claude_agent import ClaudeAgent
     from shared.learning_engine import LearningEngine
     from shared.predictive_models import (
         BayesianEstimator, CrossMarketCorrelator,
@@ -47,6 +50,55 @@ try:
 except ImportError as _e:
     st.error(f"Missing dependency — check requirements: {_e}")
     st.stop()
+
+# ── API key resolution (Streamlit secrets → env var → None) ──────────────────
+import os
+
+def _get_secret(name: str) -> str:
+    """Read from st.secrets first, fall back to environment variable."""
+    try:
+        return st.secrets[name]
+    except Exception:
+        return os.environ.get(name, "")
+
+
+def _run_coro_sync(coro):
+    """Run an async coroutine safely from a synchronous Streamlit context."""
+    result_box: list = [None]
+    exc_box: list = [None]
+
+    def _target():
+        try:
+            result_box[0] = asyncio.run(coro)
+        except Exception as e:
+            exc_box[0] = e
+
+    t = threading.Thread(target=_target, daemon=True)
+    t.start()
+    t.join(timeout=90)
+    if exc_box[0]:
+        raise exc_box[0]
+    return result_box[0]
+
+
+def _live_ai_analysis(api_key: str, markets: list[dict]) -> dict[str, dict]:
+    """Batch-call Claude AI; returns {market_id: plain_dict}."""
+    agent = ClaudeAgent(api_key=api_key, model="claude-opus-4-8")
+    batch_input = [
+        {"id": m["id"], "question": m["question"], "price": m["price"]}
+        for m in markets
+    ]
+    analyses = _run_coro_sync(agent.analyze_batch(batch_input))
+    return {
+        a.market_id: {
+            "prob":      float(a.estimated_probability),
+            "conf":      float(a.confidence),
+            "reasoning": str(a.reasoning),
+            "factors":   [str(f) for f in a.key_factors],
+            "flags":     [str(f) for f in a.uncertainty_flags],
+        }
+        for a in analyses
+    }
 
 # ── CSS ───────────────────────────────────────────────────────────────────────
 st.markdown("""
@@ -157,7 +209,18 @@ def _history(mkt: dict, n: int = 30) -> list[float]:
 # ── full analysis pipeline — returns only plain primitives ────────────────────
 
 @st.cache_data(ttl=120, show_spinner=False)
-def _run_analysis() -> list[dict]:
+def _run_analysis(anthropic_key: str = "") -> tuple[list[dict], bool]:
+    # Fetch AI probability estimates — live Claude when key is present, else mock
+    live_ai: dict[str, dict] = {}
+    using_live = False
+    if anthropic_key:
+        try:
+            live_ai = _live_ai_analysis(anthropic_key, MOCK_MARKETS)
+            using_live = True
+        except Exception as _live_err:
+            live_ai = {}
+            using_live = False
+
     bay   = BayesianEstimator()
     kelly = KellyCriterion(max_fraction=0.15)
     ob    = OrderBookAnalyzer()
@@ -171,7 +234,7 @@ def _run_analysis() -> list[dict]:
 
     out = []
     for mkt in MOCK_MARKETS:
-        ai_d = _mock_ai(mkt)
+        ai_d = live_ai.get(mkt["id"]) or _mock_ai(mkt)
         hist = _history(mkt)
 
         ob_snap = OrderBookSnapshot(
@@ -233,13 +296,18 @@ def _run_analysis() -> list[dict]:
             "quality": float(q_score), "signal": signal,
             "min_edge": float(min_edge), "history": hist, "signals": sigs,
         })
-    return out
+    return out, using_live
 
 
 # ── sidebar ───────────────────────────────────────────────────────────────────
+_anthropic_key = _get_secret("ANTHROPIC_API_KEY")
+
 with st.sidebar:
     st.title("🤖 Polymarket AI Bot")
-    st.markdown("🔵 **MOCK MODE** — no real trades placed")
+    if _anthropic_key:
+        st.markdown("🟢 **LIVE CLAUDE AI** · 🔵 Mock trades")
+    else:
+        st.markdown("🔵 **MOCK MODE** — no real trades placed")
     st.divider()
     budget   = st.number_input("Paper budget ($)", value=100.0, min_value=10.0, step=10.0)
     min_conf = st.slider("Min confidence", 0.40, 0.90, 0.55, 0.05)
@@ -247,18 +315,22 @@ with st.sidebar:
     if st.button("🔄 Re-run Analysis", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
-    st.divider()
-    st.caption("Add API keys to Streamlit secrets to go live:")
-    st.code("ANTHROPIC_API_KEY = 'sk-ant-...'\nPOLYMARKET_API_KEY = '...'", language="toml")
+    if not _anthropic_key:
+        st.divider()
+        st.caption("Add API keys to Streamlit secrets to go live:")
+        st.code("ANTHROPIC_API_KEY = 'sk-ant-...'\nPOLYMARKET_API_KEY = '...'", language="toml")
 
 # ── load data ─────────────────────────────────────────────────────────────────
 try:
     with st.spinner("Running predictive models…"):
-        all_analyses = _run_analysis()
+        all_analyses, _live_ai_mode = _run_analysis(_anthropic_key)
 except Exception as exc:
     st.error("Analysis pipeline failed — see details below.")
     st.exception(exc)
     st.stop()
+
+if _anthropic_key and not _live_ai_mode:
+    st.warning("ANTHROPIC_API_KEY found but Claude AI call failed — showing mock analysis. Check key validity.")
 
 analyses = [a for a in all_analyses if a["conf"] >= min_conf or a["signal"] == "HOLD"]
 
@@ -273,7 +345,7 @@ c1.metric("Markets Scanned",    len(analyses))
 c2.metric("Actionable Signals", len(actionable))
 c3.metric("Avg Edge",           f"{avg_edge:.1%}")
 c4.metric("Best Edge",          f"{abs(best['edge']):.1%}", best["platform"])
-c5.metric("Mode",               "🔵 MOCK")
+c5.metric("Mode",               "🟢 LIVE AI" if _live_ai_mode else "🔵 MOCK")
 st.divider()
 
 # ── tabs ──────────────────────────────────────────────────────────────────────
@@ -593,7 +665,8 @@ with t5:
 
 # ── footer ────────────────────────────────────────────────────────────────────
 st.divider()
+_mode_label = "LIVE CLAUDE AI · Mock trades" if _live_ai_mode else "MOCK MODE · No real trades"
 st.caption(
-    f"🤖 Polymarket AI Bot | MOCK MODE | "
-    f"No real trades | {time.strftime('%H:%M UTC', time.gmtime())}"
+    f"🤖 Polymarket AI Bot | {_mode_label} | "
+    f"{time.strftime('%H:%M UTC', time.gmtime())}"
 )
