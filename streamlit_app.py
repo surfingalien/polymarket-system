@@ -18,32 +18,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-# ── path ──────────────────────────────────────────────────────────────────────
-sys.path.insert(0, str(Path(__file__).parent))
-
-from shared.advanced_signals import (
-    CategoryEdgeModel,
-    LongshotBiasDetector,
-    MarketQualityScorer,
-    TemporalPatternSignal,
-)
-from shared.claude_agent import MarketAnalysis
-from shared.learning_engine import LearningEngine
-from shared.predictive_models import (
-    BayesianEstimator,
-    CalibrationTracker,
-    CrossMarketCorrelator,
-    EnsemblePredictor,
-    KellyCriterion,
-    MomentumAnalyzer,
-    OrderBookAnalyzer,
-    OrderBookSnapshot,
-    PricePoint,
-    ResolutionDecayModel,
-    Signal,
-)
-
-# ── page config (must be first) ───────────────────────────────────────────────
+# ── page config (must be first Streamlit call) ────────────────────────────────
 st.set_page_config(
     page_title="Polymarket AI Bot",
     page_icon="🤖",
@@ -51,20 +26,47 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ── custom CSS ────────────────────────────────────────────────────────────────
+# ── path setup ────────────────────────────────────────────────────────────────
+sys.path.insert(0, str(Path(__file__).parent))
+
+# ── imports (wrapped so Streamlit shows a friendly error on missing package) ──
+try:
+    from shared.advanced_signals import (
+        CategoryEdgeModel,
+        LongshotBiasDetector,
+        MarketQualityScorer,
+        TemporalPatternSignal,
+    )
+    from shared.learning_engine import LearningEngine
+    from shared.predictive_models import (
+        BayesianEstimator,
+        CrossMarketCorrelator,
+        EnsemblePredictor,
+        KellyCriterion,
+        MomentumAnalyzer,
+        OrderBookAnalyzer,
+        OrderBookSnapshot,
+        PricePoint,
+        ResolutionDecayModel,
+        Signal,
+    )
+except ImportError as _e:
+    st.error(f"Import error — check requirements: {_e}")
+    st.stop()
+
+# ── CSS ───────────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
-  .signal-yes  { color:#00d26a; font-weight:700; font-size:1.05rem; }
-  .signal-no   { color:#ff4b4b; font-weight:700; font-size:1.05rem; }
-  .signal-hold { color:#aaaaaa; font-weight:600; font-size:1.05rem; }
+  .signal-yes  { color:#00d26a; font-weight:700; }
+  .signal-no   { color:#ff4b4b; font-weight:700; }
+  .signal-hold { color:#aaaaaa; font-weight:600; }
   .metric-card { background:#1e1e2e; border-radius:8px; padding:12px 16px;
                  margin-bottom:8px; border-left:3px solid #6366f1; }
-  .badge-mock  { background:#2563eb; color:#fff; border-radius:4px;
-                 padding:2px 8px; font-size:0.8rem; font-weight:700; }
-  .badge-live  { background:#16a34a; color:#fff; border-radius:4px;
-                 padding:2px 8px; font-size:0.8rem; font-weight:700; }
 </style>
 """, unsafe_allow_html=True)
+
+# ── signal label lookup (top-level so all tabs can access it) ─────────────────
+SIGNAL_ICONS = {"BUY_YES": "🟢 BUY YES", "BUY_NO": "🔴 BUY NO", "HOLD": "⚪ HOLD"}
 
 # ── mock market catalogue ─────────────────────────────────────────────────────
 MOCK_MARKETS = [
@@ -114,14 +116,13 @@ _REASONINGS = {
     "finance": (
         "Fed dot-plot and PCE trajectory suggest markets are under-pricing a cut. "
         "Employment data remains solid but leading indicators are softening, giving "
-        "the Fed political cover to ease. Consensus among primary dealers has shifted "
+        "the Fed political cover to ease. Consensus among primary dealers shifted "
         "toward a July move in the past 10 days."
     ),
     "crypto": (
         "On-chain accumulation by large wallets is at a 6-month high. Options market "
         "implied volatility shows institutional hedging consistent with an anticipated "
-        "move higher. The spot ETF inflow trend is accelerating and not yet reflected "
-        "in current pricing."
+        "move higher. Spot ETF inflow trend is accelerating and not yet reflected in pricing."
     ),
     "politics": (
         "Historical base rate for this type of executive action is ~28%. Current "
@@ -150,46 +151,41 @@ _FLAGS = {
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
-def _mock_ai(mkt: dict) -> MarketAnalysis:
-    rng = random.Random(mkt["id"])
+def _mock_ai_values(mkt: dict) -> dict:
+    """Return mock AI analysis as a plain dict — no custom dataclasses."""
+    rng  = random.Random(mkt["id"])
     bias = {"finance": 0.05, "crypto": 0.07, "politics": -0.04, "sports": 0.04}
     edge = bias.get(mkt["category"], 0.0) + rng.gauss(0, 0.04)
-    est  = max(0.05, min(0.95, mkt["price"] + edge))
     cat  = mkt["category"]
-    return MarketAnalysis(
-        market_id=mkt["id"], question=mkt["question"],
-        market_price=mkt["price"], estimated_probability=est,
-        confidence=rng.uniform(0.58, 0.88),
-        reasoning=_REASONINGS.get(cat, "Analysis in progress."),
-        key_factors=_KEY_FACTORS.get(cat, []),
-        uncertainty_flags=_FLAGS.get(cat, []),
-    )
+    return {
+        "estimated_prob": float(max(0.05, min(0.95, mkt["price"] + edge))),
+        "confidence":     float(rng.uniform(0.58, 0.88)),
+        "reasoning":      _REASONINGS.get(cat, "Analysis in progress."),
+        "key_factors":    _KEY_FACTORS.get(cat, []),
+        "uncertainty":    _FLAGS.get(cat, []),
+    }
 
 
-def _price_history(mkt: dict, n: int = 30) -> list[PricePoint]:
+def _price_history_values(mkt: dict, n: int = 30) -> list[float]:
     rng   = random.Random(mkt["id"] + "h")
     trend = mkt.get("trend", 0.0)
     price = mkt["price"] - trend * n
     out   = []
-    for i in range(n):
+    for _ in range(n):
         price = max(0.03, min(0.97, price + trend + rng.gauss(0, 0.007)))
-        out.append(PricePoint(price=price, volume=rng.uniform(40_000, 180_000), timestamp=float(i)))
+        out.append(float(price))
     return out
 
 
-def _order_book(mkt: dict) -> OrderBookSnapshot:
-    rng = random.Random(mkt["id"] + "ob")
-    p   = mkt["price"]
-    bids = [(p - 0.01 * i, rng.uniform(15_000, 80_000)) for i in range(1, 4)]
-    asks = [(p + 0.01 * i, rng.uniform(12_000, 65_000)) for i in range(1, 4)]
-    return OrderBookSnapshot(bids=bids, asks=asks)
-
-
-# ── core analysis (cached) ────────────────────────────────────────────────────
+# ── core analysis — returns ONLY plain Python primitives ─────────────────────
 
 @st.cache_data(ttl=120, show_spinner=False)
 def _run_analysis() -> list[dict]:
-    """Full predictive stack on mock markets. Result cached 2 min."""
+    """
+    Full predictive stack on mock markets.
+    Returns plain dicts/lists with float/str/bool values only — no custom
+    dataclass objects — so Streamlit's cache serialiser never trips.
+    """
     bay    = BayesianEstimator()
     kelly  = KellyCriterion(max_fraction=0.15)
     ob_ana = OrderBookAnalyzer()
@@ -203,21 +199,30 @@ def _run_analysis() -> list[dict]:
 
     results = []
     for mkt in MOCK_MARKETS:
-        ai      = _mock_ai(mkt)
-        history = _price_history(mkt)
-        ob      = _order_book(mkt)
+        ai_d    = _mock_ai_values(mkt)
+        history = _price_history_values(mkt)
 
-        evidence = [((ai.estimated_probability - mkt["price"]) * 2, ai.confidence)]
+        # Build dataclass objects locally — they are NOT stored in the cache return
+        ob = OrderBookSnapshot(
+            bids=[(mkt["price"] - 0.01 * i, random.uniform(15_000, 80_000)) for i in range(1, 4)],
+            asks=[(mkt["price"] + 0.01 * i, random.uniform(12_000, 65_000)) for i in range(1, 4)],
+        )
+        pp_list = [
+            PricePoint(price=p, volume=50_000.0, timestamp=float(i))
+            for i, p in enumerate(history)
+        ]
+
+        evidence = [((ai_d["estimated_prob"] - mkt["price"]) * 2, ai_d["confidence"])]
         bay_mean, bay_lo, bay_hi = bay.estimate(mkt["price"], evidence)
 
         ob_sigs  = ob_ana.analyze(ob)
-        mom_sigs = mom.analyze(history)
+        mom_sigs = mom.analyze(pp_list)
 
         raw_ens = ens.predict(
             market_price=mkt["price"],
-            ai_probability=ai.estimated_probability,
-            ai_confidence=ai.confidence,
-            bayesian_estimate=bay_mean,
+            ai_probability=ai_d["estimated_prob"],
+            ai_confidence=ai_d["confidence"],
+            bayesian_estimate=float(bay_mean),
             microstructure_signals=ob_sigs,
             momentum_signals=mom_sigs,
             sentiment_signal=None,
@@ -227,13 +232,13 @@ def _run_analysis() -> list[dict]:
             mkt["days"], raw_ens.confidence,
             raw_ens.estimated_probability, market_price=mkt["price"],
         )
-        adj_prob = ls.adjust_probability(mkt["price"], adj_prob)
+        adj_prob = ls.adjust_probability(mkt["price"], float(adj_prob))
         q_score  = qsc.score(mkt["volume"], mkt["liquidity"], 0.0, mkt["price"])
-        adj_conf *= (0.5 + 0.5 * q_score)
+        adj_conf  = float(adj_conf) * (0.5 + 0.5 * float(q_score))
         min_edge = tmp.adjusted_min_edge(cat.adjusted_min_edge(mkt["question"], 0.03))
 
-        edge = adj_prob - mkt["price"]
-        kf   = kelly.compute(adj_prob, mkt["price"])
+        edge = float(adj_prob) - mkt["price"]
+        kf   = float(kelly.compute(float(adj_prob), mkt["price"]))
 
         if abs(edge) < min_edge or adj_conf < 0.50:
             sig = "HOLD"
@@ -242,22 +247,46 @@ def _run_analysis() -> list[dict]:
         else:
             sig = "BUY_NO"
 
+        # Serialise Signal objects to plain dicts immediately
+        signal_dicts = [
+            {
+                "name":       str(s.name),
+                "value":      float(s.value),
+                "confidence": float(s.confidence),
+                "weight":     float(s.weight) if s.weight else 1.0,
+            }
+            for s in raw_ens.signals
+            if s.value != 0.0
+        ]
+
         results.append({
-            "mkt": mkt,
-            "ai": ai,
-            "bayesian": bay_mean,
-            "bayesian_ci": (bay_lo, bay_hi),
-            "ob_signals": ob_sigs,
-            "mom_signals": mom_sigs,
-            "all_signals": raw_ens.signals,
-            "prob": adj_prob,
-            "conf": adj_conf,
-            "edge": edge,
-            "kelly": kf,
-            "quality": q_score,
-            "signal": sig,
-            "min_edge": min_edge,
-            "history": [pp.price for pp in history],
+            # market metadata (already primitives)
+            "id":       mkt["id"],
+            "platform": mkt["platform"],
+            "question": mkt["question"],
+            "price":    mkt["price"],
+            "volume":   mkt["volume"],
+            "liquidity":mkt["liquidity"],
+            "days":     mkt["days"],
+            "category": mkt["category"],
+            # analysis outputs — all plain floats/strings/lists
+            "ai_prob":      float(ai_d["estimated_prob"]),
+            "ai_conf":      float(ai_d["confidence"]),
+            "ai_reasoning": ai_d["reasoning"],
+            "ai_factors":   list(ai_d["key_factors"]),
+            "ai_flags":     list(ai_d["uncertainty"]),
+            "bayesian":     float(bay_mean),
+            "bay_lo":       float(bay_lo),
+            "bay_hi":       float(bay_hi),
+            "prob":         float(adj_prob),
+            "conf":         float(adj_conf),
+            "edge":         float(edge),
+            "kelly":        float(kf),
+            "quality":      float(q_score),
+            "signal":       sig,
+            "min_edge":     float(min_edge),
+            "history":      history,   # list[float]
+            "signals":      signal_dicts,
         })
     return results
 
@@ -266,60 +295,48 @@ def _run_analysis() -> list[dict]:
 
 with st.sidebar:
     st.title("🤖 Polymarket AI Bot")
-    mode_label = '<span class="badge-mock">MOCK MODE</span>' if True else '<span class="badge-live">LIVE</span>'
-    st.markdown(f"Status: {mode_label} &nbsp;✅ Safe", unsafe_allow_html=True)
+    st.markdown("Status: **🔵 MOCK MODE** — no real trades")
     st.divider()
 
-    budget = st.number_input("Paper budget (USD)", value=100.0, min_value=10.0, step=10.0)
-    min_conf = st.slider("Min confidence threshold", 0.40, 0.90, 0.55, 0.05)
-    min_edge_override = st.slider("Min edge threshold", 0.02, 0.12, 0.04, 0.01)
+    budget       = st.number_input("Paper budget (USD)", value=100.0, min_value=10.0, step=10.0)
+    min_conf     = st.slider("Min confidence", 0.40, 0.90, 0.55, 0.05)
     st.divider()
-
-    auto_refresh = st.checkbox("Auto-refresh (90s)", value=False)
-    if auto_refresh:
-        st.info("Page will refresh every 90 seconds.")
-        time.sleep(0.1)
-        st.rerun()
 
     if st.button("🔄 Re-run Analysis", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
 
     st.divider()
-    st.caption("**API keys** — set in `.env` to enable live data:")
-    st.code("ANTHROPIC_API_KEY=sk-...\nPOLYMARKET_API_KEY=...\nKALSHI_API_KEY=...", language="bash")
-    st.caption("Run `python scripts/quickstart.py` for guided setup.")
+    st.caption("**Live mode** — add keys to Streamlit secrets:")
+    st.code("ANTHROPIC_API_KEY = 'sk-ant-...'\nPOLYMARKET_API_KEY = '...'\nKALSHI_API_KEY = '...'", language="toml")
 
 
 # ── load data ─────────────────────────────────────────────────────────────────
 
-with st.spinner("Running predictive models…"):
-    analyses = _run_analysis()
+try:
+    with st.spinner("Running predictive models…"):
+        analyses = _run_analysis()
+except Exception as _exc:
+    st.error(f"Analysis failed: {_exc}")
+    st.exception(_exc)
+    st.stop()
 
-# apply sidebar filters
 analyses = [a for a in analyses if a["conf"] >= min_conf or a["signal"] == "HOLD"]
 
-# ── top header ────────────────────────────────────────────────────────────────
+# ── header metrics ────────────────────────────────────────────────────────────
 
 st.markdown("## 📊 Polymarket + Kalshi AI Trading Dashboard")
-col_h1, col_h2, col_h3, col_h4, col_h5 = st.columns(5)
 
-actionable    = [a for a in analyses if a["signal"] != "HOLD"]
-avg_edge      = np.mean([abs(a["edge"]) for a in actionable]) if actionable else 0.0
-best          = max(analyses, key=lambda a: abs(a["edge"]))
-arb_pairs     = [
-    (a, b) for a in analyses for b in analyses
-    if a["mkt"]["id"] != b["mkt"]["id"]
-    and a["mkt"]["question"][:25].lower() == b["mkt"]["question"][:25].lower()
-    and abs(a["mkt"]["price"] - b["mkt"]["price"]) > 0.03
-]
+actionable = [a for a in analyses if a["signal"] != "HOLD"]
+avg_edge   = float(np.mean([abs(a["edge"]) for a in actionable])) if actionable else 0.0
+best       = max(analyses, key=lambda a: abs(a["edge"]))
 
-col_h1.metric("Markets Scanned",   len(analyses))
-col_h2.metric("Actionable Signals", len(actionable))
-col_h3.metric("Avg Edge",          f"{avg_edge:.1%}")
-col_h4.metric("Best Edge",         f"{abs(best['edge']):.1%}", best["mkt"]["platform"])
-col_h5.metric("Arb Opportunities", len(arb_pairs))
-
+c1, c2, c3, c4, c5 = st.columns(5)
+c1.metric("Markets Scanned",    len(analyses))
+c2.metric("Actionable Signals", len(actionable))
+c3.metric("Avg Edge",           f"{avg_edge:.1%}")
+c4.metric("Best Edge",          f"{abs(best['edge']):.1%}", best["platform"])
+c5.metric("Mode",               "MOCK 🔵")
 st.divider()
 
 # ── tabs ──────────────────────────────────────────────────────────────────────
@@ -337,59 +354,57 @@ tab_scan, tab_deep, tab_brain, tab_arb, tab_port = st.tabs([
 with tab_scan:
     st.subheader("Live Market Scan — All Platforms")
 
-    SIGNAL_ICONS = {"BUY_YES": "🟢 BUY YES", "BUY_NO": "🔴 BUY NO", "HOLD": "⚪ HOLD"}
-
     rows = []
     for a in sorted(analyses, key=lambda x: -abs(x["edge"])):
-        m   = a["mkt"]
-        bar = "█" * int(a["prob"] * 10) + "░" * (10 - int(a["prob"] * 10))
         rows.append({
-            "Platform":  m["platform"],
-            "Question":  m["question"][:62] + ("…" if len(m["question"]) > 62 else ""),
-            "Market":    f"{m['price']:.0%}",
+            "Platform":  a["platform"],
+            "Question":  a["question"][:62] + ("…" if len(a["question"]) > 62 else ""),
+            "Market %":  f"{a['price']:.0%}",
             "AI Est.":   f"{a['prob']:.0%}",
             "Edge":      f"{a['edge']:+.1%}",
             "Conf.":     f"{a['conf']:.0%}",
             "Kelly":     f"{a['kelly']:.1%}",
-            "Quality":   f"{a['quality']:.2f}",
+            "Quality":   a["quality"],
             "Signal":    SIGNAL_ICONS[a["signal"]],
-            "Days Left": m["days"],
+            "Days Left": a["days"],
         })
 
-    df = pd.DataFrame(rows)
+    df_scan = pd.DataFrame(rows)
     st.dataframe(
-        df,
+        df_scan,
         use_container_width=True,
         hide_index=True,
         column_config={
-            "Edge":    st.column_config.TextColumn(width="small"),
-            "Signal":  st.column_config.TextColumn(width="medium"),
-            "Quality": st.column_config.ProgressColumn(min_value=0, max_value=1, format="%.2f"),
+            "Quality": st.column_config.ProgressColumn(
+                label="Quality", min_value=0.0, max_value=1.0, format="%.2f"
+            ),
         },
     )
 
     # Sparkline grid
-    st.markdown("#### Price History (30 days)")
-    cols = st.columns(4)
+    st.markdown("#### 30-Day Price Trend")
+    n_cols = 4
+    cols   = st.columns(n_cols)
+    _fill  = {"BUY_YES": "rgba(0,210,106,0.12)",
+               "BUY_NO":  "rgba(255,75,75,0.12)",
+               "HOLD":    "rgba(136,136,136,0.10)"}
+    _line  = {"BUY_YES": "#00d26a", "BUY_NO": "#ff4b4b", "HOLD": "#888888"}
+
     for i, a in enumerate(analyses):
-        with cols[i % 4]:
-            hist = a["history"]
-            color    = "#00d26a" if a["signal"] == "BUY_YES" else ("#ff4b4b" if a["signal"] == "BUY_NO" else "#888888")
-            fillclr  = {"#00d26a": "rgba(0,210,106,0.12)",
-                        "#ff4b4b": "rgba(255,75,75,0.12)",
-                        "#888888": "rgba(136,136,136,0.10)"}[color]
+        with cols[i % n_cols]:
             fig = go.Figure(go.Scatter(
-                y=hist, mode="lines",
-                line=dict(color=color, width=2),
-                fill="tozeroy", fillcolor=fillclr,
+                y=a["history"], mode="lines",
+                line=dict(color=_line[a["signal"]], width=2),
+                fill="tozeroy", fillcolor=_fill[a["signal"]],
             ))
             fig.update_layout(
-                margin=dict(l=0, r=0, t=0, b=0), height=80,
+                margin=dict(l=0, r=0, t=0, b=0), height=70,
                 paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                xaxis=dict(visible=False), yaxis=dict(visible=False, range=[0, 1]),
+                xaxis=dict(visible=False),
+                yaxis=dict(visible=False, range=[0, 1]),
                 showlegend=False,
             )
-            sig_html = (
+            lbl = (
                 f'<span class="signal-yes">{SIGNAL_ICONS[a["signal"]]}</span>'
                 if a["signal"] == "BUY_YES" else
                 f'<span class="signal-no">{SIGNAL_ICONS[a["signal"]]}</span>'
@@ -397,12 +412,12 @@ with tab_scan:
                 f'<span class="signal-hold">{SIGNAL_ICONS[a["signal"]]}</span>'
             )
             st.markdown(
-                f"**{a['mkt']['question'][:38]}…**<br>"
-                f"mkt {a['mkt']['price']:.0%} → est {a['prob']:.0%} "
-                f"({a['edge']:+.1%}) {sig_html}",
+                f"**{a['question'][:38]}…**  "
+                f"mkt {a['price']:.0%}→{a['prob']:.0%} ({a['edge']:+.1%}) {lbl}",
                 unsafe_allow_html=True,
             )
-            st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+            st.plotly_chart(fig, use_container_width=True,
+                            config={"displayModeBar": False})
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -412,118 +427,123 @@ with tab_scan:
 with tab_deep:
     st.subheader("Deep Market Analysis")
 
-    market_options = {
-        f"{a['mkt']['platform']} | {a['mkt']['question'][:70]}": i
-        for i, a in enumerate(analyses)
+    options = {
+        f"{a['platform']} | {a['question'][:70]}": i for i, a in enumerate(analyses)
     }
-    chosen_label = st.selectbox("Select a market", list(market_options.keys()))
-    chosen_idx   = market_options[chosen_label]
-    a = analyses[chosen_idx]
-    m = a["mkt"]
+    chosen = analyses[options[st.selectbox("Select a market", list(options.keys()))]]
 
     col_l, col_r = st.columns([3, 2])
 
     with col_l:
         # Probability gauge
-        fig_gauge = go.Figure(go.Indicator(
+        fig_g = go.Figure(go.Indicator(
             mode="gauge+number+delta",
-            value=a["prob"] * 100,
-            delta={"reference": m["price"] * 100, "valueformat": ".1f",
-                   "suffix": "pp vs market"},
+            value=chosen["prob"] * 100,
+            delta={"reference": chosen["price"] * 100,
+                   "valueformat": ".1f", "suffix": "pp vs market"},
             number={"suffix": "%", "valueformat": ".1f"},
             gauge={
-                "axis":  {"range": [0, 100]},
-                "bar":   {"color": "#6366f1"},
+                "axis": {"range": [0, 100]},
+                "bar":  {"color": "#6366f1"},
                 "steps": [
-                    {"range": [0, 30],  "color": "#ff4b4b40"},
-                    {"range": [30, 70], "color": "#ffffff10"},
-                    {"range": [70, 100],"color": "#00d26a40"},
+                    {"range": [0, 30],   "color": "rgba(255,75,75,0.2)"},
+                    {"range": [30, 70],  "color": "rgba(255,255,255,0.05)"},
+                    {"range": [70, 100], "color": "rgba(0,210,106,0.2)"},
                 ],
-                "threshold": {"line": {"color": "#ffffff", "width": 2},
-                              "thickness": 0.8, "value": m["price"] * 100},
+                "threshold": {
+                    "line": {"color": "#ffffff", "width": 2},
+                    "thickness": 0.8,
+                    "value": chosen["price"] * 100,
+                },
             },
             title={"text": "AI Estimated Probability (YES)"},
         ))
-        fig_gauge.update_layout(height=280, margin=dict(l=20, r=20, t=40, b=20),
-                                paper_bgcolor="rgba(0,0,0,0)", font_color="#ffffff")
-        st.plotly_chart(fig_gauge, use_container_width=True)
+        fig_g.update_layout(height=260, margin=dict(l=20, r=20, t=40, b=20),
+                            paper_bgcolor="rgba(0,0,0,0)", font_color="#ffffff")
+        st.plotly_chart(fig_g, use_container_width=True)
 
-        # Price history chart
-        hist_dates = pd.date_range(end=pd.Timestamp.today(), periods=len(a["history"]), freq="D")
+        # Price history
+        dates = pd.date_range(end=pd.Timestamp.today(),
+                              periods=len(chosen["history"]), freq="D")
         fig_h = go.Figure()
         fig_h.add_trace(go.Scatter(
-            x=hist_dates, y=a["history"], mode="lines+markers",
-            line=dict(color="#6366f1", width=2), marker=dict(size=4),
+            x=list(dates), y=chosen["history"],
+            mode="lines+markers",
+            line=dict(color="#6366f1", width=2),
+            marker=dict(size=3),
             name="Market Price",
         ))
-        fig_h.add_hline(y=a["prob"], line_dash="dash", line_color="#00d26a",
-                        annotation_text=f"AI Est. {a['prob']:.0%}", annotation_position="right")
+        fig_h.add_hline(y=chosen["prob"], line_dash="dash",
+                        line_color="#00d26a",
+                        annotation_text=f"AI Est {chosen['prob']:.0%}",
+                        annotation_position="right")
         fig_h.update_layout(
-            title="30-Day Price History", height=220,
+            title="30-Day Price History", height=210,
             paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-            xaxis=dict(gridcolor="#333"), yaxis=dict(gridcolor="#333", range=[0, 1]),
-            margin=dict(l=0, r=60, t=40, b=0), font_color="#ccc",
+            xaxis=dict(gridcolor="#333"), font_color="#ccc",
+            yaxis=dict(gridcolor="#333", range=[0, 1]),
+            margin=dict(l=0, r=70, t=40, b=0),
         )
         st.plotly_chart(fig_h, use_container_width=True)
 
     with col_r:
-        # Key metrics
-        signal_color = {"BUY_YES": "#00d26a", "BUY_NO": "#ff4b4b", "HOLD": "#888888"}
+        sig_color = {"BUY_YES": "#00d26a", "BUY_NO": "#ff4b4b", "HOLD": "#888888"}
         st.markdown(f"""
 <div class="metric-card">
-<b>Signal</b>: <span style="color:{signal_color[a['signal']]}; font-size:1.2rem; font-weight:700">{SIGNAL_ICONS[a['signal']]}</span><br>
-<b>Edge</b>: {a['edge']:+.2%} &nbsp;|&nbsp; <b>Min required</b>: ±{a['min_edge']:.2%}<br>
-<b>Kelly fraction</b>: {a['kelly']:.2%} of bankroll<br>
-<b>Suggested size</b>: ${budget * a['kelly']:.2f}<br>
-<b>Confidence</b>: {a['conf']:.0%} &nbsp;|&nbsp; <b>Quality</b>: {a['quality']:.2f}<br>
-<b>Days to resolution</b>: {m['days']}<br>
-<b>Category</b>: {m['category'].title()}<br>
-<b>Bayesian est.</b>: {a['bayesian']:.2%} &nbsp;[{a['bayesian_ci'][0]:.2%}–{a['bayesian_ci'][1]:.2%}]
+<b>Signal</b>: <span style="color:{sig_color[chosen['signal']]};font-size:1.1rem;font-weight:700">
+{SIGNAL_ICONS[chosen['signal']]}</span><br>
+<b>Edge</b>: {chosen['edge']:+.2%} &nbsp;|&nbsp; <b>Min required</b>: ±{chosen['min_edge']:.2%}<br>
+<b>Kelly fraction</b>: {chosen['kelly']:.2%} of bankroll<br>
+<b>Suggested size</b>: ${budget * chosen['kelly']:.2f}<br>
+<b>Confidence</b>: {chosen['conf']:.0%} &nbsp;|&nbsp; <b>Quality</b>: {chosen['quality']:.2f}<br>
+<b>Days to resolve</b>: {chosen['days']}<br>
+<b>Bayesian est.</b>: {chosen['bayesian']:.2%} [{chosen['bay_lo']:.2%}–{chosen['bay_hi']:.2%}]
 </div>
 """, unsafe_allow_html=True)
 
-        # Claude AI reasoning
         st.markdown("**🤖 Claude AI Reasoning**")
-        st.info(a["ai"].reasoning)
-
+        st.info(chosen["ai_reasoning"])
         st.markdown("**✅ Key Factors**")
-        for f in a["ai"].key_factors:
+        for f in chosen["ai_factors"]:
             st.markdown(f"- {f}")
-
         st.markdown("**⚠️ Uncertainty Flags**")
-        for f in a["ai"].uncertainty_flags:
+        for f in chosen["ai_flags"]:
             st.markdown(f"- {f}")
 
-    # Signal breakdown bar chart
+    # Signal breakdown
     st.markdown("#### Signal Breakdown")
-    sigs = [(s.name, s.value, s.confidence, s.weight)
-            for s in a["all_signals"] if s.value != 0.0]
+    sigs = chosen["signals"]
     if sigs:
-        names, vals, confs, weights = zip(*sigs)
+        names  = [s["name"].replace("_", " ").title() for s in sigs]
+        vals   = [s["value"] for s in sigs]
+        confs  = [s["confidence"] for s in sigs]
         colors = ["#00d26a" if v > 0 else "#ff4b4b" for v in vals]
-        fig_sig = go.Figure()
-        fig_sig.add_trace(go.Bar(
-            x=list(names), y=list(vals), marker_color=colors,
+
+        fig_s = go.Figure()
+        fig_s.add_trace(go.Bar(
+            x=names, y=vals, marker_color=colors,
             text=[f"{v:+.2f}" for v in vals], textposition="outside",
             name="Signal Value",
         ))
-        fig_sig.add_trace(go.Scatter(
-            x=list(names), y=list(confs), mode="markers",
+        fig_s.add_trace(go.Scatter(
+            x=names, y=confs, mode="markers",
             marker=dict(size=10, color="#f59e0b", symbol="diamond"),
             name="Confidence", yaxis="y2",
         ))
-        fig_sig.update_layout(
-            height=300, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-            yaxis=dict(title="Signal value [-1,+1]", gridcolor="#333",
+        fig_s.update_layout(
+            height=280,
+            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+            yaxis=dict(title="Signal value", gridcolor="#333",
                        range=[-1.1, 1.1], zeroline=True, zerolinecolor="#555"),
             yaxis2=dict(title="Confidence", overlaying="y", side="right",
-                        range=[0, 1.1], gridcolor="#333"),
-            xaxis=dict(gridcolor="#333"), legend=dict(orientation="h", y=1.1),
+                        range=[0, 1.2], gridcolor="#333"),
+            xaxis=dict(gridcolor="#333", tickangle=-20),
+            legend=dict(orientation="h", y=1.1),
             margin=dict(l=0, r=60, t=40, b=60), font_color="#ccc",
         )
-        st.plotly_chart(fig_sig, use_container_width=True)
+        st.plotly_chart(fig_s, use_container_width=True)
     else:
-        st.info("All signals are neutral — no directional edge detected for this market.")
+        st.info("No directional signals for this market — all signals are neutral.")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -533,88 +553,88 @@ with tab_deep:
 with tab_brain:
     st.subheader("🧠 Self-Learning Signal Weight Brain")
     st.markdown(
-        "The bot's **LearningEngine** adjusts these weights automatically as markets resolve. "
-        "After ~50 resolved markets the weights reflect which signals are genuinely predictive "
-        "for your specific market mix. Weights are persisted across restarts in `data/learning_state.json`."
+        "Signal weights auto-update as markets resolve. After ~50 resolved markets, "
+        "the bot weights reflect which signals are genuinely predictive for your "
+        "market mix. State persists in `data/learning_state.json`."
     )
 
-    ens_for_brain = EnsemblePredictor()
-    brain         = LearningEngine(ens_for_brain, state_file=Path("data/learning_state.json"))
-    brain.load()
-    summary       = brain.performance_summary()
+    try:
+        _ens_b = EnsemblePredictor()
+        _brain = LearningEngine(_ens_b, state_file=Path("data/learning_state.json"))
+        _brain.load()
+        summary = _brain.performance_summary()
+    except Exception as _be:
+        summary = {"resolved_markets": 0, "win_rate": 0.0,
+                   "avg_brier_improvement": 0.0, "weight_drift": {},
+                   "current_weights": dict(EnsemblePredictor.DEFAULT_WEIGHTS),
+                   "pending_markets": 0}
 
-    col_b1, col_b2, col_b3, col_b4 = st.columns(4)
-    col_b1.metric("Resolved Markets",    summary["resolved_markets"])
-    col_b2.metric("Win Rate",            f"{summary['win_rate']:.0%}"
-                  if summary["resolved_markets"] else "N/A")
-    col_b3.metric("Pending Signals",     summary.get("pending_markets", 0))
-    col_b4.metric("Avg Brier Δ",         f"{summary['avg_brier_improvement']:+.4f}"
-                  if summary["resolved_markets"] else "N/A")
+    b1, b2, b3, b4 = st.columns(4)
+    b1.metric("Resolved Markets",  summary["resolved_markets"])
+    b2.metric("Win Rate",
+              f"{summary['win_rate']:.0%}" if summary["resolved_markets"] else "N/A")
+    b3.metric("Pending",           summary.get("pending_markets", 0))
+    b4.metric("Avg Brier Δ",
+              f"{summary['avg_brier_improvement']:+.4f}"
+              if summary["resolved_markets"] else "N/A")
 
-    st.markdown("#### Current Signal Weights vs Defaults")
+    st.markdown("#### Signal Weights: Current vs Default")
     defaults = EnsemblePredictor.DEFAULT_WEIGHTS
-    current  = summary["current_weights"]
-    drift    = summary["weight_drift"]
+    current  = summary.get("current_weights", defaults)
+    drift    = summary.get("weight_drift", {})
 
-    weight_rows = []
-    for name, default_w in defaults.items():
-        cur_w    = current.get(name, default_w)
-        drift_w  = drift.get(name, 0.0)
-        weight_rows.append({
-            "Signal":       name.replace("_", " ").title(),
-            "Default":      round(default_w, 3),
-            "Current":      round(cur_w, 3),
-            "Drift":        f"{drift_w:+.3f}",
-            "Learned":      cur_w,
-        })
-
-    df_w = pd.DataFrame(weight_rows)
+    w_rows = [
+        {
+            "Signal":   name.replace("_", " ").title(),
+            "Default":  round(default_w, 3),
+            "Current":  round(float(current.get(name, default_w)), 3),
+            "Drift":    f"{float(drift.get(name, 0.0)):+.3f}",
+            "Bar":      float(current.get(name, default_w)),
+        }
+        for name, default_w in defaults.items()
+    ]
     st.dataframe(
-        df_w[["Signal", "Default", "Current", "Drift", "Learned"]],
+        pd.DataFrame(w_rows),
         use_container_width=True,
         hide_index=True,
         column_config={
-            "Learned": st.column_config.ProgressColumn(
-                label="Current Weight",
-                min_value=0.0, max_value=8.0, format="%.2f"
+            "Bar": st.column_config.ProgressColumn(
+                label="Weight", min_value=0.0, max_value=8.0, format="%.2f"
             ),
         },
     )
 
-    # Weight drift bar chart
-    sig_names = [r["Signal"] for r in weight_rows]
-    drift_vals = [float(r["Drift"]) for r in weight_rows]
-    drift_colors = ["#00d26a" if v >= 0 else "#ff4b4b" for v in drift_vals]
-
-    fig_drift = go.Figure(go.Bar(
-        x=sig_names, y=drift_vals, marker_color=drift_colors,
-        text=[f"{v:+.3f}" for v in drift_vals], textposition="outside",
+    # Drift chart
+    _dnames = [r["Signal"] for r in w_rows]
+    _dvals  = [float(r["Drift"]) for r in w_rows]
+    fig_d = go.Figure(go.Bar(
+        x=_dnames, y=_dvals,
+        marker_color=["#00d26a" if v >= 0 else "#ff4b4b" for v in _dvals],
+        text=[f"{v:+.3f}" for v in _dvals], textposition="outside",
     ))
-    fig_drift.update_layout(
-        title="Weight Drift from Default (learning signal)",
-        height=260, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-        xaxis=dict(gridcolor="#333"), font_color="#ccc",
-        yaxis=dict(title="Δ weight", gridcolor="#333", zeroline=True, zerolinecolor="#555"),
-        margin=dict(l=0, r=0, t=40, b=80),
+    fig_d.update_layout(
+        title="Weight Drift from Default",
+        height=250,
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        xaxis=dict(gridcolor="#333", tickangle=-20),
+        yaxis=dict(gridcolor="#333", zeroline=True, zerolinecolor="#555"),
+        margin=dict(l=0, r=0, t=40, b=80), font_color="#ccc",
     )
-    st.plotly_chart(fig_drift, use_container_width=True)
+    st.plotly_chart(fig_d, use_container_width=True)
 
     if summary["resolved_markets"] == 0:
-        st.info(
-            "No resolved markets yet — weights are at defaults. "
-            "As markets resolve, the brain will automatically shift weight toward "
-            "the signals that proved most predictive."
-        )
+        st.info("No resolved markets yet — weights are at defaults. "
+                "The brain starts learning as real markets resolve.")
 
-    st.markdown("#### How it learns")
-    st.markdown("""
-| Step | What happens |
-|---|---|
-| 1. Trade fires | Signal snapshot (value, confidence, weight) saved in memory |
-| 2. Market resolves | For each signal: compute Brier improvement vs naïve market-price baseline |
-| 3. Weight update | `delta = 0.08 × improvement × confidence` applied to `EnsemblePredictor` |
-| 4. Regularisation | Every cycle weights drift 2% back toward defaults (prevents overfitting) |
-| 5. Persist | Saved to `data/learning_state.json` — survives restarts |
+    with st.expander("How the learning loop works"):
+        st.markdown("""
+| Step | Action |
+|------|--------|
+| Trade placed | Snapshot which signals fired, with values + confidence |
+| Market resolves | Compute Brier improvement per signal vs naïve baseline |
+| Weight update | `delta = 0.08 × improvement × confidence` |
+| Regularisation | Each cycle: weights nudge 2% back toward defaults |
+| Persist | Saved to `data/learning_state.json` on shutdown |
 """)
 
 
@@ -624,43 +644,46 @@ with tab_brain:
 
 with tab_arb:
     st.subheader("⚡ Cross-Platform Arbitrage Scanner")
-    st.markdown("Jaccard similarity matching between Polymarket and Kalshi markets. Net spread after fees.")
+    st.markdown("Jaccard word-set similarity matching between Polymarket and Kalshi.")
 
     poly_raw   = [
-        {"condition_id": a["mkt"]["id"], "question": a["mkt"]["question"], "best_ask": a["mkt"]["price"]}
-        for a in analyses if a["mkt"]["platform"] == "Polymarket"
+        {"condition_id": a["id"], "question": a["question"], "best_ask": a["price"]}
+        for a in analyses if a["platform"] == "Polymarket"
     ]
     kalshi_raw = [
-        {"ticker": a["mkt"]["id"], "title": a["mkt"]["question"], "yes_ask": a["mkt"]["price"]}
-        for a in analyses if a["mkt"]["platform"] == "Kalshi"
+        {"ticker": a["id"], "title": a["question"], "yes_ask": a["price"]}
+        for a in analyses if a["platform"] == "Kalshi"
     ]
 
-    correlator = CrossMarketCorrelator()
-    arb_opps   = correlator.find_arbitrage(poly_raw, kalshi_raw, min_spread=0.0)
+    try:
+        arb = CrossMarketCorrelator().find_arbitrage(poly_raw, kalshi_raw, min_spread=0.0)
+    except Exception:
+        arb = []
 
-    if arb_opps:
-        arb_rows = []
-        for opp in arb_opps:
-            arb_rows.append({
-                "Polymarket Question": opp.poly_question[:55] + "…",
-                "Kalshi Question":     opp.kalshi_question[:55] + "…",
-                "Poly Price":          f"{opp.polymarket_yes_price:.1%}",
-                "Kalshi Price":        f"{opp.kalshi_yes_price:.1%}",
-                "Gross Spread":        f"{opp.spread:+.1%}",
-                "Net Spread":          f"{opp.net_spread:+.1%}",
-                "Direction":           opp.direction,
-            })
+    if arb:
+        arb_rows = [
+            {
+                "Polymarket":   o.poly_question[:50] + "…",
+                "Kalshi":       o.kalshi_question[:50] + "…",
+                "Poly Price":   f"{o.polymarket_yes_price:.1%}",
+                "Kalshi Price": f"{o.kalshi_yes_price:.1%}",
+                "Gross Spread": f"{o.spread:+.1%}",
+                "Net Spread":   f"{o.net_spread:+.1%}",
+                "Direction":    o.direction,
+            }
+            for o in arb
+        ]
         st.dataframe(pd.DataFrame(arb_rows), use_container_width=True, hide_index=True)
     else:
-        st.info("No arbitrage opportunities found above the minimum spread threshold.")
-        st.markdown("""
-**How arb detection works:**
-1. Every Polymarket market is compared against every Kalshi market using Jaccard word-set similarity
-2. Matches above 40% similarity are compared on price
-3. Gross spread − platform fees = net spread
-4. Only net spreads > threshold are flagged
+        st.info("No arb opportunities above the spread threshold in this mock dataset. "
+                "With real live market data, overlapping Poly/Kalshi markets would surface here.")
 
-Add more Kalshi markets with overlapping questions to surface real opportunities.
+    with st.expander("How arb detection works"):
+        st.markdown("""
+1. Every Polymarket market is compared to every Kalshi market using Jaccard word-set similarity
+2. Pairs above 40% similarity are flagged as covering the same event
+3. Gross spread (price difference) − platform fees = **net spread**
+4. Only net spreads above the minimum threshold are shown
 """)
 
 
@@ -669,11 +692,10 @@ Add more Kalshi markets with overlapping questions to surface real opportunities
 # ═══════════════════════════════════════════════════════════════════════════════
 
 with tab_port:
-    st.subheader("💼 Portfolio Simulator (Mock Mode)")
-    st.info("Running in **MOCK MODE** — no real trades are placed. P&L is simulated from signals.")
+    st.subheader("💼 Paper Portfolio Simulator")
+    st.info("**MOCK MODE** — All P&L is simulated. No real trades are placed.")
 
-    # Simulate a small paper portfolio
-    rng_port = random.Random(42)
+    rng_p    = random.Random(42)
     positions = []
     pnl_total = 0.0
 
@@ -683,69 +705,63 @@ with tab_port:
         size = min(budget * a["kelly"], budget * 0.15)
         if size < 1.0:
             continue
-        entry_price = a["mkt"]["price"]
-        # Random mock outcome: favour the edge direction
-        bias = 0.6 if (
-            (a["signal"] == "BUY_YES" and a["prob"] > entry_price) or
-            (a["signal"] == "BUY_NO"  and a["prob"] < entry_price)
-        ) else 0.4
-        won   = rng_port.random() < bias
-        pnl   = size * (1 / entry_price - 1) if won else -size
+        bias = 0.62 if (
+            (a["signal"] == "BUY_YES" and a["prob"] > a["price"]) or
+            (a["signal"] == "BUY_NO"  and a["prob"] < a["price"])
+        ) else 0.38
+        won = rng_p.random() < bias
+        pnl = size * (1.0 / a["price"] - 1.0) if won else -size
         pnl_total += pnl
         positions.append({
-            "Platform":   a["mkt"]["platform"],
-            "Question":   a["mkt"]["question"][:55] + "…",
-            "Direction":  a["signal"].replace("BUY_", ""),
-            "Size ($)":   f"${size:.2f}",
-            "Entry":      f"{entry_price:.1%}",
-            "Est.":       f"{a['prob']:.1%}",
-            "Edge":       f"{a['edge']:+.1%}",
-            "Mock P&L":   f"${pnl:+.2f}",
-            "Status":     "✅ WIN" if won else "❌ LOSS",
+            "Platform":  a["platform"],
+            "Question":  a["question"][:52] + "…",
+            "Direction": a["signal"].replace("BUY_", ""),
+            "Size":      f"${size:.2f}",
+            "Entry":     f"{a['price']:.0%}",
+            "AI Est.":   f"{a['prob']:.0%}",
+            "Edge":      f"{a['edge']:+.1%}",
+            "Mock P&L":  f"${pnl:+.2f}",
+            "Result":    "✅ WIN" if won else "❌ LOSS",
         })
 
     if positions:
-        col_p1, col_p2, col_p3 = st.columns(3)
-        col_p1.metric("Simulated Trades",    len(positions))
-        col_p2.metric("Net Mock P&L",        f"${pnl_total:+.2f}",
-                      delta_color="normal" if pnl_total >= 0 else "inverse")
-        col_p3.metric("ROI",                 f"{pnl_total / budget:.1%}")
+        p1, p2, p3 = st.columns(3)
+        p1.metric("Simulated Trades", len(positions))
+        p2.metric("Net Mock P&L",     f"${pnl_total:+.2f}")
+        p3.metric("ROI",              f"{pnl_total / budget:.1%}")
 
-        # P&L bar chart
-        qs   = [p["Question"][:35] + "…" for p in positions]
-        pnls = [float(p["Mock P&L"].replace("$", "").replace("+", "")) for p in positions]
+        _qs   = [p["Question"][:30] for p in positions]
+        _pnls = [float(p["Mock P&L"].replace("$", "").replace("+", "")) for p in positions]
         fig_pnl = go.Figure(go.Bar(
-            x=qs, y=pnls,
-            marker_color=["#00d26a" if v >= 0 else "#ff4b4b" for v in pnls],
-            text=[f"${v:+.2f}" for v in pnls], textposition="outside",
+            x=_qs, y=_pnls,
+            marker_color=["#00d26a" if v >= 0 else "#ff4b4b" for v in _pnls],
+            text=[f"${v:+.2f}" for v in _pnls], textposition="outside",
         ))
         fig_pnl.update_layout(
-            title="Simulated Trade P&L", height=300,
+            title="Simulated Trade P&L", height=280,
             paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-            xaxis=dict(gridcolor="#333", tickangle=-30), font_color="#ccc",
+            xaxis=dict(gridcolor="#333", tickangle=-30),
             yaxis=dict(gridcolor="#333", zeroline=True, zerolinecolor="#555"),
-            margin=dict(l=0, r=0, t=40, b=120),
+            margin=dict(l=0, r=0, t=40, b=100), font_color="#ccc",
         )
         st.plotly_chart(fig_pnl, use_container_width=True)
-
         st.dataframe(pd.DataFrame(positions), use_container_width=True, hide_index=True)
     else:
         st.info("No positions meet the current confidence/edge thresholds.")
 
     st.divider()
     st.markdown("""
-#### Before going live
-- [ ] Run in mock mode for **at least 2 weeks**
-- [ ] Verify all API connections (`python scripts/quickstart.py`)
+#### Pre-live checklist
+- [ ] Run in mock mode for **≥ 2 weeks** and review decisions manually
+- [ ] Run `python scripts/quickstart.py` to verify all API connections
 - [ ] Confirm risk limits are appropriate for your bankroll
-- [ ] Start with **tiny position sizes** (< $5 per trade)
+- [ ] Start with **< $5 per trade** when going live
 - [ ] Only then set `MOCK_MODE=false` in `.env`
 """)
 
 # ── footer ────────────────────────────────────────────────────────────────────
 st.divider()
 st.caption(
-    "🤖 Polymarket AI Bot — **MOCK MODE** | "
-    "Data is simulated. No real trades executed. | "
-    f"Analysis refreshes every 2 min | Last run: {time.strftime('%H:%M:%S UTC', time.gmtime())}"
+    f"🤖 Polymarket AI Bot | **MOCK MODE** | "
+    f"No real trades | Last refreshed: {time.strftime('%H:%M UTC', time.gmtime())}"
 )
