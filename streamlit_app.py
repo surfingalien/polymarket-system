@@ -435,32 +435,39 @@ with tab_deep:
     col_l, col_r = st.columns([3, 2])
 
     with col_l:
-        # Probability gauge
-        fig_g = go.Figure(go.Indicator(
-            mode="gauge+number+delta",
-            value=chosen["prob"] * 100,
-            delta={"reference": chosen["price"] * 100,
-                   "valueformat": ".1f", "suffix": "pp vs market"},
-            number={"suffix": "%", "valueformat": ".1f"},
-            gauge={
-                "axis": {"range": [0, 100]},
-                "bar":  {"color": "#6366f1"},
-                "steps": [
-                    {"range": [0, 30],   "color": "rgba(255,75,75,0.2)"},
-                    {"range": [30, 70],  "color": "rgba(255,255,255,0.05)"},
-                    {"range": [70, 100], "color": "rgba(0,210,106,0.2)"},
-                ],
-                "threshold": {
-                    "line": {"color": "#ffffff", "width": 2},
-                    "thickness": 0.8,
-                    "value": chosen["price"] * 100,
-                },
-            },
-            title={"text": "AI Estimated Probability (YES)"},
+        # Probability comparison — native Streamlit components (no Plotly Indicator)
+        sig_color = {"BUY_YES": "#00d26a", "BUY_NO": "#ff4b4b", "HOLD": "#888888"}
+        st.markdown(f"""
+<div style="text-align:center; padding:12px; background:#1e1e2e; border-radius:10px; margin-bottom:12px;">
+  <div style="font-size:0.85rem; color:#aaa; margin-bottom:4px;">AI ESTIMATED PROBABILITY (YES)</div>
+  <div style="font-size:3rem; font-weight:800; color:{sig_color[chosen['signal']]};">
+    {chosen['prob']:.1%}
+  </div>
+  <div style="font-size:1rem; color:#ccc;">
+    Market price: {chosen['price']:.1%} &nbsp;|&nbsp;
+    Edge: <span style="color:{sig_color[chosen['signal']]};font-weight:700;">{chosen['edge']:+.1%}</span>
+  </div>
+</div>
+""", unsafe_allow_html=True)
+
+        # Probability comparison bar
+        fig_cmp = go.Figure()
+        fig_cmp.add_trace(go.Bar(
+            x=["Market Price", "AI Estimate", "Bayesian Est."],
+            y=[chosen["price"] * 100, chosen["prob"] * 100, chosen["bayesian"] * 100],
+            marker_color=["#6366f1", sig_color[chosen["signal"]], "#f59e0b"],
+            text=[f"{chosen['price']:.1%}", f"{chosen['prob']:.1%}", f"{chosen['bayesian']:.1%}"],
+            textposition="outside",
         ))
-        fig_g.update_layout(height=260, margin=dict(l=20, r=20, t=40, b=20),
-                            paper_bgcolor="rgba(0,0,0,0)", font_color="#ffffff")
-        st.plotly_chart(fig_g, use_container_width=True)
+        fig_cmp.update_layout(
+            height=220, title="Probability Comparison",
+            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+            yaxis=dict(range=[0, 110], gridcolor="#333", ticksuffix="%"),
+            xaxis=dict(gridcolor="#333"),
+            margin=dict(l=0, r=0, t=40, b=0), font_color="#ccc",
+            showlegend=False,
+        )
+        st.plotly_chart(fig_cmp, use_container_width=True)
 
         # Price history
         dates = pd.date_range(end=pd.Timestamp.today(),
