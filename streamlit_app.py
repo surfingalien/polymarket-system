@@ -15,6 +15,7 @@ import random
 import sys
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -47,6 +48,7 @@ try:
         OrderBookSnapshot, PricePoint,
         ResolutionDecayModel,
     )
+    from polymarket_bot.polymarket_client import PolymarketClient
 except ImportError as _e:
     st.error(f"Missing dependency — check requirements: {_e}")
     st.stop()
@@ -99,6 +101,86 @@ def _live_ai_analysis(api_key: str, markets: list[dict]) -> dict[str, dict]:
         }
         for a in analyses
     }
+
+
+# ── Polymarket live market fetching ───────────────────────────────────────────
+
+_CAT_KEYWORDS: dict[str, list[str]] = {
+    "crypto":   ["bitcoin", "btc", "ethereum", "eth", "crypto", "blockchain",
+                 "defi", "nft", "token", "solana", "doge", "xrp"],
+    "finance":  ["fed", "interest rate", "inflation", "cpi", "gdp", "recession",
+                 "s&p", "nasdaq", "stock", "economy", "fomc", "treasury",
+                 "rate cut", "rate hike", "tariff"],
+    "politics": ["president", "election", "congress", "senate", "trump", "biden",
+                 "democrat", "republican", "vote", "law", "regulation",
+                 "executive order", "supreme court", "house", "legislation"],
+    "sports":   ["championship", "nba", "nfl", "mlb", "nhl", "world cup",
+                 "super bowl", "playoffs", "league", "win", "team", "fifa",
+                 "wimbledon", "olympic"],
+}
+
+
+def _guess_category(question: str) -> str:
+    q = question.lower()
+    for cat, kws in _CAT_KEYWORDS.items():
+        if any(kw in q for kw in kws):
+            return cat
+    return "finance"
+
+
+def _days_until(iso_str: str | None) -> int:
+    if not iso_str:
+        return 30
+    try:
+        end = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+        return max(1, (end - datetime.now(timezone.utc)).days)
+    except Exception:
+        return 30
+
+
+def _fetch_polymarket_markets_sync(api_key: str, limit: int = 25) -> list[dict]:
+    """Fetch live Polymarket markets in a background thread (async-safe)."""
+    async def _inner():
+        client = PolymarketClient(api_key=api_key)
+        try:
+            raw = await client.get_markets(limit=limit, active_only=True)
+            result = []
+            for m in raw:
+                price = float(m.mid_price)
+                if not (0.03 <= price <= 0.97):
+                    continue
+                if m.volume_24h < 500:
+                    continue
+                result.append({
+                    "id":        m.condition_id,
+                    "platform":  "Polymarket",
+                    "question":  m.question,
+                    "price":     price,
+                    "volume":    float(m.volume_24h),
+                    "liquidity": float(m.liquidity),
+                    "days":      _days_until(m.end_date_iso),
+                    "category":  _guess_category(m.question),
+                    "trend":     0.0,
+                })
+            return result
+        finally:
+            await client.close()
+
+    return _run_coro_sync(_inner())
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _get_markets(poly_key: str = "") -> tuple[list[dict], bool]:
+    """Return (markets, is_live). Falls back to MOCK_MARKETS on any failure."""
+    if not poly_key:
+        return MOCK_MARKETS, False
+    try:
+        markets = _fetch_polymarket_markets_sync(poly_key, limit=25)
+        if len(markets) < 3:
+            return MOCK_MARKETS, False
+        return markets, True
+    except Exception:
+        return MOCK_MARKETS, False
 
 # ── CSS ───────────────────────────────────────────────────────────────────────
 st.markdown("""
@@ -209,13 +291,13 @@ def _history(mkt: dict, n: int = 30) -> list[float]:
 # ── full analysis pipeline — returns only plain primitives ────────────────────
 
 @st.cache_data(ttl=120, show_spinner=False)
-def _run_analysis(anthropic_key: str = "") -> tuple[list[dict], bool]:
+def _run_analysis(markets: list[dict], anthropic_key: str = "") -> tuple[list[dict], bool]:
     # Fetch AI probability estimates — live Claude when key is present, else mock
     live_ai: dict[str, dict] = {}
     using_live = False
     if anthropic_key:
         try:
-            live_ai = _live_ai_analysis(anthropic_key, MOCK_MARKETS)
+            live_ai = _live_ai_analysis(anthropic_key, markets)
             using_live = True
         except Exception as _live_err:
             live_ai = {}
@@ -233,7 +315,7 @@ def _run_analysis(anthropic_key: str = "") -> tuple[list[dict], bool]:
     tmp   = TemporalPatternSignal()
 
     out = []
-    for mkt in MOCK_MARKETS:
+    for mkt in markets:
         ai_d = live_ai.get(mkt["id"]) or _mock_ai(mkt)
         hist = _history(mkt)
 
@@ -301,13 +383,19 @@ def _run_analysis(anthropic_key: str = "") -> tuple[list[dict], bool]:
 
 # ── sidebar ───────────────────────────────────────────────────────────────────
 _anthropic_key = _get_secret("ANTHROPIC_API_KEY")
+_poly_key      = _get_secret("POLYMARKET_API_KEY")
 
 with st.sidebar:
     st.title("🤖 Polymarket AI Bot")
     if _anthropic_key:
-        st.markdown("🟢 **LIVE CLAUDE AI** · 🔵 Mock trades")
+        st.markdown("🟢 **LIVE CLAUDE AI**")
     else:
-        st.markdown("🔵 **MOCK MODE** — no real trades placed")
+        st.markdown("🟡 Mock AI analysis")
+    if _poly_key:
+        st.markdown("🟢 **LIVE POLYMARKET** markets")
+    else:
+        st.markdown("🟡 Mock market data")
+    st.markdown("🔵 Mock trades — no real orders")
     st.divider()
     budget   = st.number_input("Paper budget ($)", value=100.0, min_value=10.0, step=10.0)
     min_conf = st.slider("Min confidence", 0.40, 0.90, 0.55, 0.05)
@@ -315,20 +403,27 @@ with st.sidebar:
     if st.button("🔄 Re-run Analysis", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
-    if not _anthropic_key:
+    if not _anthropic_key or not _poly_key:
         st.divider()
-        st.caption("Add API keys to Streamlit secrets to go live:")
-        st.code("ANTHROPIC_API_KEY = 'sk-ant-...'\nPOLYMARKET_API_KEY = '...'", language="toml")
+        missing = []
+        if not _anthropic_key:
+            missing.append("ANTHROPIC_API_KEY")
+        if not _poly_key:
+            missing.append("POLYMARKET_API_KEY")
+        st.caption(f"Add to Streamlit secrets to enable live data: {', '.join(missing)}")
 
 # ── load data ─────────────────────────────────────────────────────────────────
 try:
-    with st.spinner("Running predictive models…"):
-        all_analyses, _live_ai_mode = _run_analysis(_anthropic_key)
+    with st.spinner("Fetching markets and running predictive models…"):
+        _source_markets, _markets_live = _get_markets(_poly_key)
+        all_analyses, _live_ai_mode = _run_analysis(_source_markets, _anthropic_key)
 except Exception as exc:
     st.error("Analysis pipeline failed — see details below.")
     st.exception(exc)
     st.stop()
 
+if _poly_key and not _markets_live:
+    st.warning("POLYMARKET_API_KEY found but live market fetch failed — showing mock markets.")
 if _anthropic_key and not _live_ai_mode:
     st.warning("ANTHROPIC_API_KEY found but Claude AI call failed — showing mock analysis. Check key validity.")
 
@@ -345,7 +440,11 @@ c1.metric("Markets Scanned",    len(analyses))
 c2.metric("Actionable Signals", len(actionable))
 c3.metric("Avg Edge",           f"{avg_edge:.1%}")
 c4.metric("Best Edge",          f"{abs(best['edge']):.1%}", best["platform"])
-c5.metric("Mode",               "🟢 LIVE AI" if _live_ai_mode else "🔵 MOCK")
+_mode_str = ("🟢 AI+Live" if (_live_ai_mode and _markets_live)
+             else "🟢 Live Mkts" if _markets_live
+             else "🟢 Live AI"  if _live_ai_mode
+             else "🔵 MOCK")
+c5.metric("Mode", _mode_str)
 st.divider()
 
 # ── tabs ──────────────────────────────────────────────────────────────────────
@@ -665,8 +764,9 @@ with t5:
 
 # ── footer ────────────────────────────────────────────────────────────────────
 st.divider()
-_mode_label = "LIVE CLAUDE AI · Mock trades" if _live_ai_mode else "MOCK MODE · No real trades"
-st.caption(
-    f"🤖 Polymarket AI Bot | {_mode_label} | "
-    f"{time.strftime('%H:%M UTC', time.gmtime())}"
-)
+_parts = []
+if _markets_live: _parts.append("Live Polymarket markets")
+if _live_ai_mode: _parts.append("Live Claude AI")
+if not _parts:    _parts.append("Mock mode")
+_parts.append("No real trades")
+st.caption(f"🤖 Polymarket AI Bot | {' · '.join(_parts)} | {time.strftime('%H:%M UTC', time.gmtime())}")
