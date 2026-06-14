@@ -18,6 +18,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+import httpx
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -169,18 +170,75 @@ def _fetch_polymarket_markets_sync(api_key: str, limit: int = 25) -> list[dict]:
     return _run_coro_sync(_inner())
 
 
+def _fetch_kalshi_markets_sync(limit: int = 20) -> list[dict]:
+    """Fetch live Kalshi markets via public API endpoint (no auth required for market data)."""
+    async def _inner():
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            resp = await client.get(
+                "https://trading-api.kalshi.com/trade-api/v2/markets",
+                params={"limit": limit, "status": "open"},
+                headers={"Content-Type": "application/json"},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            result = []
+            for m in data.get("markets", []):
+                ticker = m.get("ticker", "")
+                if not ticker:
+                    continue
+                yes_ask = m.get("yes_ask", 50) / 100.0
+                yes_bid = m.get("yes_bid", 50) / 100.0
+                mid = (yes_ask + yes_bid) / 2.0
+                if not (0.03 <= mid <= 0.97):
+                    continue
+                vol = float(m.get("volume", 0))
+                if vol < 500:
+                    continue
+                result.append({
+                    "id":        ticker,
+                    "platform":  "Kalshi",
+                    "question":  m.get("title", ticker),
+                    "price":     mid,
+                    "volume":    vol,
+                    "liquidity": float(m.get("open_interest", 0)) * mid,
+                    "days":      _days_until(m.get("close_time")),
+                    "category":  _guess_category(m.get("title", "")),
+                    "trend":     0.0,
+                })
+            return result
+    return _run_coro_sync(_inner())
+
+
 @st.cache_data(ttl=60, show_spinner=False)
-def _get_markets(poly_key: str = "") -> tuple[list[dict], bool]:
-    """Return (markets, is_live). Falls back to MOCK_MARKETS on any failure."""
-    if not poly_key:
-        return MOCK_MARKETS, False
-    try:
-        markets = _fetch_polymarket_markets_sync(poly_key, limit=25)
-        if len(markets) < 3:
-            return MOCK_MARKETS, False
-        return markets, True
-    except Exception:
-        return MOCK_MARKETS, False
+def _get_markets(poly_key: str = "", kalshi_key: str = "") -> tuple[list[dict], bool, bool]:
+    """Return (markets, poly_live, kalshi_live). Each platform falls back to mock independently."""
+    poly_live, kalshi_live = False, False
+    poly_mkts: list[dict] = []
+    kalshi_mkts: list[dict] = []
+
+    # ── Polymarket ────────────────────────────────────────────────────────────
+    if poly_key:
+        try:
+            fetched = _fetch_polymarket_markets_sync(poly_key, limit=25)
+            if len(fetched) >= 3:
+                poly_mkts, poly_live = fetched, True
+        except Exception:
+            pass
+    if not poly_live:
+        poly_mkts = [m for m in MOCK_MARKETS if m["platform"] == "Polymarket"]
+
+    # ── Kalshi ────────────────────────────────────────────────────────────────
+    if kalshi_key:
+        try:
+            fetched = _fetch_kalshi_markets_sync(limit=20)
+            if len(fetched) >= 2:
+                kalshi_mkts, kalshi_live = fetched, True
+        except Exception:
+            pass
+    if not kalshi_live:
+        kalshi_mkts = [m for m in MOCK_MARKETS if m["platform"] == "Kalshi"]
+
+    return poly_mkts + kalshi_mkts, poly_live, kalshi_live
 
 # ── CSS ───────────────────────────────────────────────────────────────────────
 st.markdown("""
@@ -384,18 +442,14 @@ def _run_analysis(markets: list[dict], anthropic_key: str = "") -> tuple[list[di
 # ── sidebar ───────────────────────────────────────────────────────────────────
 _anthropic_key = _get_secret("ANTHROPIC_API_KEY")
 _poly_key      = _get_secret("POLYMARKET_API_KEY")
+_kalshi_key    = _get_secret("KALSHI_API_KEY")
 
 with st.sidebar:
     st.title("🤖 Polymarket AI Bot")
-    if _anthropic_key:
-        st.markdown("🟢 **LIVE CLAUDE AI**")
-    else:
-        st.markdown("🟡 Mock AI analysis")
-    if _poly_key:
-        st.markdown("🟢 **LIVE POLYMARKET** markets")
-    else:
-        st.markdown("🟡 Mock market data")
-    st.markdown("🔵 Mock trades — no real orders")
+    st.markdown(("🟢 **LIVE CLAUDE AI**" if _anthropic_key else "🟡 Mock AI analysis"))
+    st.markdown(("🟢 **LIVE POLYMARKET**" if _poly_key      else "🟡 Mock Polymarket data"))
+    st.markdown(("🟢 **LIVE KALSHI**"     if _kalshi_key    else "🟡 Mock Kalshi data"))
+    st.markdown("🔵 Mock trades — no real orders placed")
     st.divider()
     budget   = st.number_input("Paper budget ($)", value=100.0, min_value=10.0, step=10.0)
     min_conf = st.slider("Min confidence", 0.40, 0.90, 0.55, 0.05)
@@ -403,29 +457,33 @@ with st.sidebar:
     if st.button("🔄 Re-run Analysis", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
-    if not _anthropic_key or not _poly_key:
+    _missing = [k for k, v in {
+        "ANTHROPIC_API_KEY": _anthropic_key,
+        "POLYMARKET_API_KEY": _poly_key,
+        "KALSHI_API_KEY": _kalshi_key,
+    }.items() if not v]
+    if _missing:
         st.divider()
-        missing = []
-        if not _anthropic_key:
-            missing.append("ANTHROPIC_API_KEY")
-        if not _poly_key:
-            missing.append("POLYMARKET_API_KEY")
-        st.caption(f"Add to Streamlit secrets to enable live data: {', '.join(missing)}")
+        st.caption("Missing secrets (add via Manage app → Secrets):")
+        for _k in _missing:
+            st.caption(f"  • {_k}")
 
 # ── load data ─────────────────────────────────────────────────────────────────
 try:
     with st.spinner("Fetching markets and running predictive models…"):
-        _source_markets, _markets_live = _get_markets(_poly_key)
+        _source_markets, _poly_live, _kalshi_live = _get_markets(_poly_key, _kalshi_key)
         all_analyses, _live_ai_mode = _run_analysis(_source_markets, _anthropic_key)
 except Exception as exc:
     st.error("Analysis pipeline failed — see details below.")
     st.exception(exc)
     st.stop()
 
-if _poly_key and not _markets_live:
-    st.warning("POLYMARKET_API_KEY found but live market fetch failed — showing mock markets.")
+if _poly_key    and not _poly_live:
+    st.warning("POLYMARKET_API_KEY set but live market fetch failed — using mock Polymarket markets.")
+if _kalshi_key  and not _kalshi_live:
+    st.warning("KALSHI_API_KEY set but live market fetch failed — using mock Kalshi markets.")
 if _anthropic_key and not _live_ai_mode:
-    st.warning("ANTHROPIC_API_KEY found but Claude AI call failed — showing mock analysis. Check key validity.")
+    st.warning("ANTHROPIC_API_KEY set but Claude AI call failed — using mock analysis. Check key validity.")
 
 analyses = [a for a in all_analyses if a["conf"] >= min_conf or a["signal"] == "HOLD"]
 
@@ -440,10 +498,8 @@ c1.metric("Markets Scanned",    len(analyses))
 c2.metric("Actionable Signals", len(actionable))
 c3.metric("Avg Edge",           f"{avg_edge:.1%}")
 c4.metric("Best Edge",          f"{abs(best['edge']):.1%}", best["platform"])
-_mode_str = ("🟢 AI+Live" if (_live_ai_mode and _markets_live)
-             else "🟢 Live Mkts" if _markets_live
-             else "🟢 Live AI"  if _live_ai_mode
-             else "🔵 MOCK")
+_any_live = _live_ai_mode or _poly_live or _kalshi_live
+_mode_str = "🟢 LIVE" if _any_live else "🔵 MOCK"
 c5.metric("Mode", _mode_str)
 st.divider()
 
@@ -765,7 +821,8 @@ with t5:
 # ── footer ────────────────────────────────────────────────────────────────────
 st.divider()
 _parts = []
-if _markets_live: _parts.append("Live Polymarket markets")
+if _poly_live:    _parts.append("Live Polymarket")
+if _kalshi_live:  _parts.append("Live Kalshi")
 if _live_ai_mode: _parts.append("Live Claude AI")
 if not _parts:    _parts.append("Mock mode")
 _parts.append("No real trades")
