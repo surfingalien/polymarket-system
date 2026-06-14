@@ -13,6 +13,9 @@ scipy>=1.13.0
 pandas>=2.2.0
 streamlit>=1.35.0
 
-# Live order signing (EIP-712). Lazily imported — the dashboard's demo/paper
-# mode still works if this fails to install; only live execution needs it.
-py-clob-client>=0.19.0
+# py-clob-client is intentionally NOT listed here.
+# It pulls in ckzg/cytoolz/bitarray (C extensions) that may lack Python 3.14
+# wheels and would break the entire Streamlit Cloud deploy. The signing is
+# lazy-imported: demo + paper trading work without it. Live order execution
+# from the dashboard requires adding py-clob-client to a custom environment
+# or running the local bot (main.py) which uses the full requirements.txt.

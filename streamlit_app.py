@@ -878,6 +878,10 @@ with t6:
     if live_trading:
         st.error("🚨 **LIVE TRADING ENABLED** — buttons below place REAL orders with "
                  "REAL money on Polygon. Each requires an explicit confirmation.")
+        st.caption("Note: live execution requires `py-clob-client` to be installed in "
+                   "this environment. If you see a 'SigningUnavailable' error, use the "
+                   "local bot (`MOCK_MODE=false python main.py`) instead — it includes "
+                   "the full signing toolchain via requirements.txt.")
     else:
         st.info("🔵 **Paper mode** — buttons below simulate fills only. "
                 "No real orders are placed.")

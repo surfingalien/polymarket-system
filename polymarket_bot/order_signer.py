@@ -149,9 +149,13 @@ class PolymarketOrderSigner:
             from py_clob_client.clob_types import ApiCreds
         except ImportError as exc:
             raise SigningUnavailable(
-                "py-clob-client is not installed in this environment, so live "
-                "order signing is unavailable here. Install it (pip install "
-                "py-clob-client) or place live trades from the local bot."
+                "py-clob-client is not installed in this environment. "
+                "The Streamlit Cloud deployment intentionally excludes it "
+                "to avoid C-extension build failures on Python 3.14. "
+                "To execute live orders, either: (a) run the local bot "
+                "(`MOCK_MODE=false python main.py`) which uses the full "
+                "requirements.txt, or (b) add py-clob-client to a custom "
+                "Streamlit environment with a matching Python version."
             ) from exc
 
         kwargs = {"key": self._private_key, "chain_id": self._chain_id}
