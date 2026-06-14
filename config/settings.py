@@ -21,6 +21,14 @@ class PolymarketSettings(BaseSettings):
     chain_id: int = Field(default=137, description="137=Polygon mainnet, 80002=Amoy testnet")
     mock_mode: bool = Field(default=True)
     max_markets_per_cycle: int = Field(default=20)
+    signature_type: int = Field(
+        default=0,
+        description="0=EOA, 1=Polymarket email/Magic proxy, 2=Polymarket Safe/browser wallet",
+    )
+    funder: str = Field(
+        default="",
+        description="Proxy/Safe wallet address holding funds (required for signature_type 1/2)",
+    )
 
 
 class KalshiSettings(BaseSettings):

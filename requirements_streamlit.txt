@@ -12,3 +12,7 @@ numpy>=1.26.0
 scipy>=1.13.0
 pandas>=2.2.0
 streamlit>=1.35.0
+
+# Live order signing (EIP-712). Lazily imported — the dashboard's demo/paper
+# mode still works if this fails to install; only live execution needs it.
+py-clob-client>=0.19.0

@@ -50,6 +50,7 @@ try:
         ResolutionDecayModel,
     )
     from polymarket_bot.polymarket_client import PolymarketClient
+    from polymarket_bot.order_signer import PolymarketOrderSigner, SigningUnavailable
 except ImportError as _e:
     st.error(f"Missing dependency — check requirements: {_e}")
     st.stop()
@@ -153,15 +154,17 @@ def _fetch_polymarket_markets_sync(api_key: str, limit: int = 25) -> list[dict]:
                 if m.volume_24h < 500:
                     continue
                 result.append({
-                    "id":        m.condition_id,
-                    "platform":  "Polymarket",
-                    "question":  m.question,
-                    "price":     price,
-                    "volume":    float(m.volume_24h),
-                    "liquidity": float(m.liquidity),
-                    "days":      _days_until(m.end_date_iso),
-                    "category":  _guess_category(m.question),
-                    "trend":     0.0,
+                    "id":           m.condition_id,
+                    "platform":     "Polymarket",
+                    "question":     m.question,
+                    "price":        price,
+                    "volume":       float(m.volume_24h),
+                    "liquidity":    float(m.liquidity),
+                    "days":         _days_until(m.end_date_iso),
+                    "category":     _guess_category(m.question),
+                    "trend":        0.0,
+                    "yes_token_id": m.yes_token_id,
+                    "no_token_id":  m.no_token_id,
                 })
             return result
         finally:
@@ -239,6 +242,28 @@ def _get_markets(poly_key: str = "", kalshi_key: str = "") -> tuple[list[dict], 
         kalshi_mkts = [m for m in MOCK_MARKETS if m["platform"] == "Kalshi"]
 
     return poly_mkts + kalshi_mkts, poly_live, kalshi_live
+
+
+def _execute_live_polymarket_order(
+    token_id: str, price: float, size_usd: float, side: str,
+    private_key: str, sig_type: int, funder: str,
+) -> dict:
+    """Place a REAL EIP-712-signed Polymarket order. Only ever called from the
+    gated live-trading path. Never runs in mock mode."""
+    shares = size_usd / price if price > 0 else 0.0
+    signer = PolymarketOrderSigner(
+        private_key=private_key,
+        signature_type=sig_type,
+        funder=funder,
+        mock_mode=False,
+    )
+    res = _run_coro_sync(signer.place_order_async(
+        token_id=token_id,
+        price=round(float(price), 4),
+        size=round(float(shares), 4),
+        side=side,
+    ))
+    return {"order_id": res.order_id, "status": res.status, "shares": round(shares, 4)}
 
 # ── CSS ───────────────────────────────────────────────────────────────────────
 st.markdown("""
@@ -435,21 +460,30 @@ def _run_analysis(markets: list[dict], anthropic_key: str = "") -> tuple[list[di
             "edge": float(edge), "kelly": float(kf),
             "quality": float(q_score), "signal": signal,
             "min_edge": float(min_edge), "history": hist, "signals": sigs,
+            "yes_token_id": str(mkt.get("yes_token_id", "")),
+            "no_token_id":  str(mkt.get("no_token_id", "")),
         })
     return out, using_live
 
 
 # ── sidebar ───────────────────────────────────────────────────────────────────
-_anthropic_key = _get_secret("ANTHROPIC_API_KEY")
-_poly_key      = _get_secret("POLYMARKET_API_KEY")
-_kalshi_key    = _get_secret("KALSHI_API_KEY")
+_anthropic_key   = _get_secret("ANTHROPIC_API_KEY")
+_poly_key        = _get_secret("POLYMARKET_API_KEY")
+_kalshi_key      = _get_secret("KALSHI_API_KEY")
+_poly_pk         = _get_secret("POLYMARKET_PRIVATE_KEY")
+_poly_sig_type   = int(_get_secret("POLYMARKET_SIGNATURE_TYPE") or 0)
+_poly_funder     = _get_secret("POLYMARKET_FUNDER")
+
+if "paper_ledger" not in st.session_state:
+    st.session_state.paper_ledger = []
+if "live_ledger" not in st.session_state:
+    st.session_state.live_ledger = []
 
 with st.sidebar:
     st.title("🤖 Polymarket AI Bot")
     st.markdown(("🟢 **LIVE CLAUDE AI**" if _anthropic_key else "🟡 Mock AI analysis"))
     st.markdown(("🟢 **LIVE POLYMARKET**" if _poly_key      else "🟡 Mock Polymarket data"))
     st.markdown(("🟢 **LIVE KALSHI**"     if _kalshi_key    else "🟡 Mock Kalshi data"))
-    st.markdown("🔵 Mock trades — no real orders placed")
     st.divider()
     budget   = st.number_input("Paper budget ($)", value=100.0, min_value=10.0, step=10.0)
     min_conf = st.slider("Min confidence", 0.40, 0.90, 0.55, 0.05)
@@ -457,6 +491,23 @@ with st.sidebar:
     if st.button("🔄 Re-run Analysis", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
+
+    # ── live trading gate (DANGER) ──────────────────────────────────────────
+    st.divider()
+    st.markdown("### ⚠️ Live Trading")
+    live_trading = False
+    if not _poly_pk:
+        st.caption("🔵 Paper mode only. Add `POLYMARKET_PRIVATE_KEY` to secrets "
+                   "to unlock live execution (never paste keys into chat).")
+    else:
+        st.caption("Wallet key detected. Live execution is OFF until you enable it.")
+        live_trading = st.toggle("🚨 Enable LIVE trading (real money)", value=False)
+        if live_trading:
+            st.error("LIVE MODE — orders placed here spend REAL funds on Polygon. "
+                     "Start with < $5 per trade.")
+            st.caption(f"Wallet sig type: {_poly_sig_type} "
+                       f"({'EOA' if _poly_sig_type == 0 else 'proxy/safe'})")
+
     _missing = [k for k, v in {
         "ANTHROPIC_API_KEY": _anthropic_key,
         "POLYMARKET_API_KEY": _poly_key,
@@ -504,9 +555,9 @@ c5.metric("Mode", _mode_str)
 st.divider()
 
 # ── tabs ──────────────────────────────────────────────────────────────────────
-t1, t2, t3, t4, t5 = st.tabs([
+t1, t2, t3, t4, t5, t6 = st.tabs([
     "📡 Market Scanner", "🔬 Deep Analysis",
-    "🧠 Learning Brain", "⚡ Arbitrage", "💼 Portfolio",
+    "🧠 Learning Brain", "⚡ Arbitrage", "💼 Portfolio", "🚀 Execute",
 ])
 
 
@@ -818,6 +869,109 @@ with t5:
 - [ ] Only then: set `MOCK_MODE=false` in `.env`
 """)
 
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 6 — Execute
+# ══════════════════════════════════════════════════════════════════════════════
+with t6:
+    st.subheader("🚀 Execute Trades")
+
+    if live_trading:
+        st.error("🚨 **LIVE TRADING ENABLED** — buttons below place REAL orders with "
+                 "REAL money on Polygon. Each requires an explicit confirmation.")
+    else:
+        st.info("🔵 **Paper mode** — buttons below simulate fills only. "
+                "No real orders are placed.")
+
+    exec_signals = [a for a in actionable if a["kelly"] > 0]
+    if not exec_signals:
+        st.info("No actionable BUY signals at the current confidence threshold.")
+    else:
+        st.caption(f"{len(exec_signals)} actionable signal(s). "
+                   "Suggested size = Kelly fraction × budget (capped at 15%).")
+
+        for a in sorted(exec_signals, key=lambda x: -abs(x["edge"])):
+            size = float(min(budget * a["kelly"], budget * 0.15))
+            direction = "YES" if a["signal"] == "BUY_YES" else "NO"
+            is_poly = a["platform"] == "Polymarket"
+            token_id = a["yes_token_id"] if direction == "YES" else a["no_token_id"]
+            can_live = bool(live_trading and is_poly and token_id and _poly_pk)
+
+            with st.container(border=True):
+                cL, cR = st.columns([3, 2])
+                with cL:
+                    st.markdown(
+                        f"**{a['platform']}** · {a['question'][:70]}  \n"
+                        f"{SIGNAL_ICONS[a['signal']]} · entry **{a['price']:.0%}** · "
+                        f"AI **{a['prob']:.0%}** · edge **{a['edge']:+.1%}** · "
+                        f"conf **{a['conf']:.0%}**"
+                    )
+                    st.caption(f"Suggested size: **${size:.2f}** "
+                               f"(≈{(size / a['price']) if a['price'] else 0:.1f} shares @ {a['price']:.0%})")
+                with cR:
+                    # Paper trade — always available
+                    if st.button("📝 Paper Buy", key=f"paper_{a['id']}",
+                                 use_container_width=True):
+                        st.session_state.paper_ledger.append({
+                            "Platform": a["platform"], "Question": a["question"][:50],
+                            "Dir": direction, "Size $": round(size, 2),
+                            "Entry": f"{a['price']:.0%}", "Edge": f"{a['edge']:+.1%}",
+                            "Time": time.strftime("%H:%M:%S"),
+                        })
+                        st.toast(f"Paper buy recorded: {a['question'][:30]}")
+
+                    # Live execution — heavily gated
+                    if live_trading:
+                        if not is_poly:
+                            st.caption("⚠️ Live execution from the dashboard supports "
+                                       "Polymarket only. Use the bot for Kalshi.")
+                        elif not token_id:
+                            st.caption("⚠️ No token id (mock market) — paper only.")
+                        elif can_live:
+                            confirm = st.checkbox(
+                                f"Confirm REAL ${size:.2f} order",
+                                key=f"confirm_{a['id']}",
+                            )
+                            if st.button("🚨 EXECUTE LIVE", key=f"live_{a['id']}",
+                                         type="primary", use_container_width=True,
+                                         disabled=not confirm):
+                                try:
+                                    with st.spinner("Signing & posting order…"):
+                                        res = _execute_live_polymarket_order(
+                                            token_id=token_id, price=a["price"],
+                                            size_usd=size, side="BUY",
+                                            private_key=_poly_pk,
+                                            sig_type=_poly_sig_type,
+                                            funder=_poly_funder,
+                                        )
+                                    st.session_state.live_ledger.append({
+                                        "Platform": a["platform"],
+                                        "Question": a["question"][:50],
+                                        "Dir": direction, "Size $": round(size, 2),
+                                        "Order ID": res["order_id"],
+                                        "Status": res["status"],
+                                        "Time": time.strftime("%H:%M:%S"),
+                                    })
+                                    st.success(f"Order posted: {res['order_id']} "
+                                               f"({res['status']})")
+                                except SigningUnavailable as exc:
+                                    st.error(f"Live signing unavailable: {exc}")
+                                except Exception as exc:
+                                    st.error(f"Order failed: {exc}")
+
+    # ── ledgers ─────────────────────────────────────────────────────────────
+    if st.session_state.live_ledger:
+        st.markdown("#### 🚨 Live Orders This Session")
+        st.dataframe(pd.DataFrame(st.session_state.live_ledger),
+                     use_container_width=True, hide_index=True)
+    if st.session_state.paper_ledger:
+        st.markdown("#### 📝 Paper Orders This Session")
+        st.dataframe(pd.DataFrame(st.session_state.paper_ledger),
+                     use_container_width=True, hide_index=True)
+        if st.button("Clear paper ledger"):
+            st.session_state.paper_ledger = []
+            st.rerun()
+
+
 # ── footer ────────────────────────────────────────────────────────────────────
 st.divider()
 _parts = []
@@ -825,5 +979,5 @@ if _poly_live:    _parts.append("Live Polymarket")
 if _kalshi_live:  _parts.append("Live Kalshi")
 if _live_ai_mode: _parts.append("Live Claude AI")
 if not _parts:    _parts.append("Mock mode")
-_parts.append("No real trades")
+_parts.append("🚨 LIVE TRADING" if live_trading else "Paper trades only")
 st.caption(f"🤖 Polymarket AI Bot | {' · '.join(_parts)} | {time.strftime('%H:%M UTC', time.gmtime())}")

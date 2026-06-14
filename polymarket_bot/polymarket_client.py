@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import hashlib
 import hmac
-import json
 import time
 from dataclasses import dataclass, field
 from typing import Optional
@@ -17,6 +16,8 @@ from typing import Optional
 import httpx
 import structlog
 from tenacity import retry, stop_after_attempt, wait_exponential
+
+from .order_signer import PolymarketOrderSigner
 
 log = structlog.get_logger(__name__)
 
@@ -101,6 +102,8 @@ class PolymarketClient:
         gamma_host: str = GAMMA_HOST,
         chain_id: int = 137,
         mock_mode: bool = True,
+        signature_type: int = 0,
+        funder: str = "",
     ) -> None:
         self._pk = private_key
         self._api_key = api_key
@@ -111,6 +114,18 @@ class PolymarketClient:
         self._chain_id = chain_id
         self.mock_mode = mock_mode
         self._http = httpx.AsyncClient(timeout=20.0)
+        # EIP-712 order signer (lazily uses py-clob-client only when going live)
+        self._signer = PolymarketOrderSigner(
+            private_key=private_key,
+            api_key=api_key,
+            api_secret=api_secret,
+            api_passphrase=api_passphrase,
+            host=self._clob,
+            chain_id=chain_id,
+            signature_type=signature_type,
+            funder=funder,
+            mock_mode=mock_mode,
+        )
 
     # ------------------------------------------------------------------
     # Market data (public)
@@ -174,17 +189,18 @@ class PolymarketClient:
             )
             return {"id": f"mock_{int(time.time())}", "status": "MOCK"}
 
-        headers = self._auth_headers("POST", "/order", json.dumps(order.to_dict()))
+        # Live order: must be EIP-712 signed by the funding wallet. The CLOB
+        # rejects orders that carry only an HMAC API-key header.
         try:
-            resp = await self._http.post(
-                f"{self._clob}/order",
-                json=order.to_dict(),
-                headers=headers,
+            result = await self._signer.place_order_async(
+                token_id=order.token_id,
+                price=order.price,
+                size=order.size,
+                side=order.side,
+                order_type=order.order_type,
             )
-            resp.raise_for_status()
-            result = resp.json()
-            log.info("order_placed", order_id=result.get("orderID"), status=result.get("status"))
-            return result
+            log.info("order_placed", order_id=result.order_id, status=result.status)
+            return {"id": result.order_id, "status": result.status, **result.raw}
         except Exception as exc:
             log.error("place_order_failed", error=str(exc))
             raise

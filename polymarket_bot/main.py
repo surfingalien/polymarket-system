@@ -42,6 +42,8 @@ class PolymarketBot:
             gamma_host=cfg.polymarket.gamma_host,
             chain_id=cfg.polymarket.chain_id,
             mock_mode=cfg.polymarket.mock_mode,
+            signature_type=cfg.polymarket.signature_type,
+            funder=cfg.polymarket.funder,
         )
 
         self._news = NewsFetcher(
