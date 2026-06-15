@@ -79,9 +79,13 @@ def _run_coro_sync(coro):
 
     t = threading.Thread(target=_target, daemon=True)
     t.start()
-    t.join(timeout=90)
+    t.join(timeout=30)          # fail fast — don't let the UI hang
+    if t.is_alive():
+        raise TimeoutError("API request timed out after 30 s — the host may be unreachable")
     if exc_box[0]:
         raise exc_box[0]
+    if result_box[0] is None:
+        raise RuntimeError("API call returned no data")
     return result_box[0]
 
 
@@ -213,11 +217,13 @@ def _fetch_kalshi_markets_sync(limit: int = 20) -> list[dict]:
 
 
 @st.cache_data(ttl=60, show_spinner=False)
-def _get_markets(poly_key: str = "", kalshi_key: str = "") -> tuple[list[dict], bool, bool]:
-    """Return (markets, poly_live, kalshi_live). Each platform falls back to mock independently."""
+def _get_markets(poly_key: str = "", kalshi_key: str = "") -> tuple[list[dict], bool, bool, str, str]:
+    """Return (markets, poly_live, kalshi_live, poly_err, kalshi_err)."""
     poly_live, kalshi_live = False, False
     poly_mkts: list[dict] = []
     kalshi_mkts: list[dict] = []
+    poly_err = ""
+    kalshi_err = ""
 
     # ── Polymarket ────────────────────────────────────────────────────────────
     if poly_key:
@@ -225,8 +231,10 @@ def _get_markets(poly_key: str = "", kalshi_key: str = "") -> tuple[list[dict], 
             fetched = _fetch_polymarket_markets_sync(poly_key, limit=25)
             if len(fetched) >= 3:
                 poly_mkts, poly_live = fetched, True
-        except Exception:
-            pass
+            else:
+                poly_err = f"Only {len(fetched)} markets returned (need ≥ 3, check filters)"
+        except Exception as e:
+            poly_err = f"{type(e).__name__}: {e}"
     if not poly_live:
         poly_mkts = [m for m in MOCK_MARKETS if m["platform"] == "Polymarket"]
 
@@ -236,12 +244,14 @@ def _get_markets(poly_key: str = "", kalshi_key: str = "") -> tuple[list[dict], 
             fetched = _fetch_kalshi_markets_sync(limit=20)
             if len(fetched) >= 2:
                 kalshi_mkts, kalshi_live = fetched, True
-        except Exception:
-            pass
+            else:
+                kalshi_err = f"Only {len(fetched)} markets returned (need ≥ 2)"
+        except Exception as e:
+            kalshi_err = f"{type(e).__name__}: {e}"
     if not kalshi_live:
         kalshi_mkts = [m for m in MOCK_MARKETS if m["platform"] == "Kalshi"]
 
-    return poly_mkts + kalshi_mkts, poly_live, kalshi_live
+    return poly_mkts + kalshi_mkts, poly_live, kalshi_live, poly_err, kalshi_err
 
 
 def _execute_live_polymarket_order(
@@ -522,17 +532,27 @@ with st.sidebar:
 # ── load data ─────────────────────────────────────────────────────────────────
 try:
     with st.spinner("Fetching markets and running predictive models…"):
-        _source_markets, _poly_live, _kalshi_live = _get_markets(_poly_key, _kalshi_key)
+        _source_markets, _poly_live, _kalshi_live, _poly_err, _kalshi_err = \
+            _get_markets(_poly_key, _kalshi_key)
         all_analyses, _live_ai_mode = _run_analysis(_source_markets, _anthropic_key)
 except Exception as exc:
     st.error("Analysis pipeline failed — see details below.")
     st.exception(exc)
     st.stop()
 
-if _poly_key    and not _poly_live:
-    st.warning("POLYMARKET_API_KEY set but live market fetch failed — using mock Polymarket markets.")
-if _kalshi_key  and not _kalshi_live:
-    st.warning("KALSHI_API_KEY set but live market fetch failed — using mock Kalshi markets.")
+if _poly_key and not _poly_live:
+    st.warning(
+        f"**Polymarket live fetch failed** — using mock markets.  \n"
+        f"**Error:** `{_poly_err}`  \n"
+        "Common causes: API endpoint changed, network restriction, or invalid key format."
+    )
+if _kalshi_key and not _kalshi_live:
+    st.warning(
+        f"**Kalshi live fetch failed** — using mock markets.  \n"
+        f"**Error:** `{_kalshi_err}`  \n"
+        "Note: `trading-api.kalshi.com` requires RSA auth even for market reads — "
+        "the dashboard may need a signed request."
+    )
 if _anthropic_key and not _live_ai_mode:
     st.warning("ANTHROPIC_API_KEY set but Claude AI call failed — using mock analysis. Check key validity.")
 
