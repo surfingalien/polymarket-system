@@ -266,25 +266,45 @@ class PolymarketClient:
         }
 
     def _parse_market(self, m: dict) -> Optional[Market]:
+        if not isinstance(m, dict):
+            return None
         try:
-            cid = m.get("conditionId") or m.get("condition_id", "")
+            cid = m.get("conditionId") or m.get("condition_id") or m.get("id", "")
             if not cid:
                 return None
-            tokens = m.get("tokens", [])
-            yes_token = next((t["token_id"] for t in tokens if t.get("outcome") == "Yes"), "")
-            no_token = next((t["token_id"] for t in tokens if t.get("outcome") == "No"), "")
-            prices = m.get("outcomePrices", [])
-            yes_price = float(prices[0]) if prices else 0.5
+            tokens = m.get("tokens") or []
+            yes_token = ""
+            no_token = ""
+            for t in tokens:
+                if not isinstance(t, dict):
+                    continue
+                outcome = (t.get("outcome") or "").lower()
+                if outcome == "yes":
+                    yes_token = t.get("token_id", "")
+                elif outcome == "no":
+                    no_token = t.get("token_id", "")
+            # Fallback: clobTokenIds is a flat list [yes_id, no_id]
+            if not yes_token:
+                clob_ids = m.get("clobTokenIds") or []
+                if len(clob_ids) >= 1:
+                    yes_token = clob_ids[0]
+                if len(clob_ids) >= 2:
+                    no_token = clob_ids[1]
+            prices = m.get("outcomePrices") or []
+            try:
+                yes_price = float(prices[0]) if prices else 0.5
+            except (ValueError, TypeError):
+                yes_price = 0.5
             return Market(
                 condition_id=cid,
                 question=m.get("question", ""),
                 yes_token_id=yes_token,
                 no_token_id=no_token,
-                best_bid=yes_price - 0.005,
-                best_ask=yes_price + 0.005,
+                best_bid=max(0.0, yes_price - 0.005),
+                best_ask=min(1.0, yes_price + 0.005),
                 last_price=yes_price,
-                volume_24h=float(m.get("volumeNum", m.get("volume", 0))),
-                liquidity=float(m.get("liquidityNum", m.get("liquidity", 0))),
+                volume_24h=float(m.get("volumeNum") or m.get("volume") or 0),
+                liquidity=float(m.get("liquidityNum") or m.get("liquidity") or 0),
                 active=bool(m.get("active", True)),
                 end_date_iso=m.get("endDate") or m.get("end_date_iso"),
             )

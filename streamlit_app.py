@@ -51,6 +51,7 @@ try:
     )
     from polymarket_bot.polymarket_client import PolymarketClient
     from polymarket_bot.order_signer import PolymarketOrderSigner, SigningUnavailable
+    from kalshi_bot.kalshi_client import KalshiClient
 except ImportError as _e:
     st.error(f"Missing dependency — check requirements: {_e}")
     st.stop()
@@ -177,47 +178,46 @@ def _fetch_polymarket_markets_sync(api_key: str, limit: int = 25) -> list[dict]:
     return _run_coro_sync(_inner())
 
 
-def _fetch_kalshi_markets_sync(limit: int = 20) -> list[dict]:
-    """Fetch live Kalshi markets via public API endpoint (no auth required for market data)."""
+def _fetch_kalshi_markets_sync(api_key_id: str, pem_content: str, limit: int = 20) -> list[dict]:
+    """Fetch live Kalshi markets using RSA-PSS signed requests."""
     async def _inner():
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            resp = await client.get(
-                "https://trading-api.kalshi.com/trade-api/v2/markets",
-                params={"limit": limit, "status": "open"},
-                headers={"Content-Type": "application/json"},
-            )
-            resp.raise_for_status()
-            data = resp.json()
+        client = KalshiClient(
+            api_key_id=api_key_id,
+            private_key_content=pem_content,
+            mock_mode=False,
+        )
+        try:
+            raw = await client.get_markets(limit=limit, status="open")
             result = []
-            for m in data.get("markets", []):
-                ticker = m.get("ticker", "")
-                if not ticker:
-                    continue
-                yes_ask = m.get("yes_ask", 50) / 100.0
-                yes_bid = m.get("yes_bid", 50) / 100.0
-                mid = (yes_ask + yes_bid) / 2.0
+            for m in raw:
+                mid = m.mid_price
                 if not (0.03 <= mid <= 0.97):
                     continue
-                vol = float(m.get("volume", 0))
-                if vol < 500:
+                if m.volume < 500:
                     continue
                 result.append({
-                    "id":        ticker,
+                    "id":        m.ticker,
                     "platform":  "Kalshi",
-                    "question":  m.get("title", ticker),
-                    "price":     mid,
-                    "volume":    vol,
-                    "liquidity": float(m.get("open_interest", 0)) * mid,
-                    "days":      _days_until(m.get("close_time")),
-                    "category":  _guess_category(m.get("title", "")),
+                    "question":  m.title,
+                    "price":     float(mid),
+                    "volume":    float(m.volume),
+                    "liquidity": float(m.open_interest) * float(mid),
+                    "days":      _days_until(m.close_time),
+                    "category":  _guess_category(m.title),
                     "trend":     0.0,
                 })
             return result
+        finally:
+            await client.close()
     return _run_coro_sync(_inner())
 
 
 @st.cache_data(ttl=60, show_spinner=False)
-def _get_markets(poly_key: str = "", kalshi_key: str = "") -> tuple[list[dict], bool, bool, str, str]:
+def _get_markets(
+    poly_key: str = "",
+    kalshi_key: str = "",
+    kalshi_pem: str = "",
+) -> tuple[list[dict], bool, bool, str, str]:
     """Return (markets, poly_live, kalshi_live, poly_err, kalshi_err)."""
     poly_live, kalshi_live = False, False
     poly_mkts: list[dict] = []
@@ -228,7 +228,7 @@ def _get_markets(poly_key: str = "", kalshi_key: str = "") -> tuple[list[dict], 
     # ── Polymarket ────────────────────────────────────────────────────────────
     if poly_key:
         try:
-            fetched = _fetch_polymarket_markets_sync(poly_key, limit=25)
+            fetched = _fetch_polymarket_markets_sync(poly_key, limit=50)
             if len(fetched) >= 3:
                 poly_mkts, poly_live = fetched, True
             else:
@@ -239,15 +239,17 @@ def _get_markets(poly_key: str = "", kalshi_key: str = "") -> tuple[list[dict], 
         poly_mkts = [m for m in MOCK_MARKETS if m["platform"] == "Polymarket"]
 
     # ── Kalshi ────────────────────────────────────────────────────────────────
-    if kalshi_key:
+    if kalshi_key and kalshi_pem:
         try:
-            fetched = _fetch_kalshi_markets_sync(limit=20)
+            fetched = _fetch_kalshi_markets_sync(kalshi_key, kalshi_pem, limit=50)
             if len(fetched) >= 2:
                 kalshi_mkts, kalshi_live = fetched, True
             else:
                 kalshi_err = f"Only {len(fetched)} markets returned (need ≥ 2)"
         except Exception as e:
             kalshi_err = f"{type(e).__name__}: {e}"
+    elif kalshi_key and not kalshi_pem:
+        kalshi_err = "KALSHI_PRIVATE_KEY_PEM not set — RSA auth required for all Kalshi endpoints"
     if not kalshi_live:
         kalshi_mkts = [m for m in MOCK_MARKETS if m["platform"] == "Kalshi"]
 
@@ -480,6 +482,7 @@ def _run_analysis(markets: list[dict], anthropic_key: str = "") -> tuple[list[di
 _anthropic_key   = _get_secret("ANTHROPIC_API_KEY")
 _poly_key        = _get_secret("POLYMARKET_API_KEY")
 _kalshi_key      = _get_secret("KALSHI_API_KEY")
+_kalshi_pem      = _get_secret("KALSHI_PRIVATE_KEY_PEM")
 _poly_pk         = _get_secret("POLYMARKET_PRIVATE_KEY")
 _poly_sig_type   = int(_get_secret("POLYMARKET_SIGNATURE_TYPE") or 0)
 _poly_funder     = _get_secret("POLYMARKET_FUNDER")
@@ -493,7 +496,7 @@ with st.sidebar:
     st.title("🤖 Polymarket AI Bot")
     st.markdown(("🟢 **LIVE CLAUDE AI**" if _anthropic_key else "🟡 Mock AI analysis"))
     st.markdown(("🟢 **LIVE POLYMARKET**" if _poly_key      else "🟡 Mock Polymarket data"))
-    st.markdown(("🟢 **LIVE KALSHI**"     if _kalshi_key    else "🟡 Mock Kalshi data"))
+    st.markdown(("🟢 **LIVE KALSHI**"     if (_kalshi_key and _kalshi_pem)    else "🟡 Mock Kalshi data"))
     st.divider()
     budget   = st.number_input("Paper budget ($)", value=100.0, min_value=10.0, step=10.0)
     min_conf = st.slider("Min confidence", 0.40, 0.90, 0.55, 0.05)
@@ -522,6 +525,7 @@ with st.sidebar:
         "ANTHROPIC_API_KEY": _anthropic_key,
         "POLYMARKET_API_KEY": _poly_key,
         "KALSHI_API_KEY": _kalshi_key,
+        "KALSHI_PRIVATE_KEY_PEM": _kalshi_pem,
     }.items() if not v]
     if _missing:
         st.divider()
@@ -533,7 +537,7 @@ with st.sidebar:
 try:
     with st.spinner("Fetching markets and running predictive models…"):
         _source_markets, _poly_live, _kalshi_live, _poly_err, _kalshi_err = \
-            _get_markets(_poly_key, _kalshi_key)
+            _get_markets(_poly_key, _kalshi_key, _kalshi_pem)
         all_analyses, _live_ai_mode = _run_analysis(_source_markets, _anthropic_key)
 except Exception as exc:
     st.error("Analysis pipeline failed — see details below.")

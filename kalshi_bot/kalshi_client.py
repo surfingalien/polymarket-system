@@ -93,6 +93,7 @@ class KalshiClient:
         self,
         api_key_id: str = "",
         private_key_path: str = "keys/kalshi_private.pem",
+        private_key_content: str = "",
         base_url: str = "https://trading-api.kalshi.com/trade-api/v2",
         mock_mode: bool = True,
     ) -> None:
@@ -100,7 +101,10 @@ class KalshiClient:
         self._key_path = private_key_path
         self._base = base_url.rstrip("/")
         self.mock_mode = mock_mode
-        self._private_key = self._load_private_key(private_key_path)
+        if private_key_content:
+            self._private_key = self._load_private_key_from_string(private_key_content)
+        else:
+            self._private_key = self._load_private_key(private_key_path)
         self._http = httpx.AsyncClient(timeout=20.0)
 
     # ------------------------------------------------------------------
@@ -306,6 +310,15 @@ class KalshiClient:
                 return serialization.load_pem_private_key(f.read(), password=None)
         except Exception as exc:
             log.warning("kalshi_key_load_failed", error=str(exc))
+            return None
+
+    def _load_private_key_from_string(self, pem_content: str):
+        try:
+            return serialization.load_pem_private_key(
+                pem_content.encode(), password=None
+            )
+        except Exception as exc:
+            log.warning("kalshi_key_parse_failed", error=str(exc))
             return None
 
     def _parse_market(self, m: dict) -> Optional[KalshiMarket]:

@@ -12,6 +12,7 @@ numpy>=1.26.0
 scipy>=1.13.0
 pandas>=2.2.0
 streamlit>=1.35.0
+cryptography>=42.0.0
 
 # py-clob-client is intentionally NOT listed here.
 # It pulls in ckzg/cytoolz/bitarray (C extensions) that may lack Python 3.14
