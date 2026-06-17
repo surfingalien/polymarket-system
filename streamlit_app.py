@@ -248,7 +248,23 @@ def _get_markets(
             else:
                 kalshi_err = f"Only {len(fetched)} markets returned (need ≥ 2)"
         except Exception as e:
-            kalshi_err = f"{type(e).__name__}: {e}"
+            # Unwrap tenacity RetryError to show the real HTTP status
+            real_exc = e
+            try:
+                from tenacity import RetryError
+                if isinstance(e, RetryError):
+                    real_exc = e.last_attempt.exception() or e
+            except Exception:
+                pass
+            # Extract HTTP status + body snippet for 4xx errors
+            detail = str(real_exc)
+            try:
+                if hasattr(real_exc, "response"):
+                    r = real_exc.response
+                    detail = f"HTTP {r.status_code}: {r.text[:200]}"
+            except Exception:
+                pass
+            kalshi_err = f"{type(real_exc).__name__}: {detail}"
     elif kalshi_key and not kalshi_pem:
         kalshi_err = "KALSHI_PRIVATE_KEY_PEM not set — RSA auth required for all Kalshi endpoints"
     if not kalshi_live:
