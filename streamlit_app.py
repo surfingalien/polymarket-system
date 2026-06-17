@@ -612,6 +612,15 @@ if "paper_ledger" not in st.session_state:
 if "live_ledger" not in st.session_state:
     st.session_state.live_ledger = []
 
+# ── demo_mode must be initialized before data loading (used for _eff_* keys) ──
+_any_key = bool(
+    _get_secret("ANTHROPIC_API_KEY") or
+    _get_secret("POLYMARKET_API_KEY") or
+    _get_secret("KALSHI_API_KEY")
+)
+if "demo_mode" not in st.session_state:
+    st.session_state.demo_mode = not _any_key
+
 with st.sidebar:
     st.title("🤖 Polymarket AI Bot")
     st.markdown("**API Keys**")
@@ -626,16 +635,17 @@ with st.sidebar:
 
     # ── Bot Controls ────────────────────────────────────────────────────────
     st.markdown("**🤖 Bot Controls**")
-    _any_key = bool(_poly_key or _kalshi_key or _anthropic_key)
-    demo_mode = st.toggle(
-        "🔵 Demo mode (mock data)",
-        value=not _any_key,
-        help="Use simulated data even when API keys are set. "
-             "Switch OFF to use your live API connections.",
+    _refresh_label = st.selectbox(
+        "⏱ Auto-refresh",
+        ["Off", "Every 1 min", "Every 5 min", "Every 15 min", "Every 30 min"],
+        index=0,
+        help="Run the bot 24/7 — fetches fresh data and logs paper trades "
+             "automatically on the chosen interval.",
     )
-    auto_paper = st.toggle(
+    st.toggle(
         "📝 Auto-execute paper trades",
         value=False,
+        key="auto_paper",
         help="Bot automatically logs a paper trade for every Buy signal "
              "that passes your confidence filter on each analysis run.",
     )
@@ -647,16 +657,14 @@ with st.sidebar:
     # ── live trading gate (DANGER) ──────────────────────────────────────────
     st.divider()
     st.markdown("### ⚠️ Live Trading")
-    live_trading = False
     if not _poly_pk:
-        st.caption("🔵 Paper mode only. Add `POLYMARKET_PRIVATE_KEY` to secrets "
+        st.caption("📝 Paper mode only — add `POLYMARKET_PRIVATE_KEY` to secrets "
                    "to unlock live execution (never paste keys into chat).")
+        st.caption("Toggle visible in the main panel once wallet key is set.")
     else:
-        st.caption("Wallet key detected. Live execution is OFF until you enable it.")
-        live_trading = st.toggle("🚨 Enable LIVE trading (real money)", value=False)
-        if live_trading:
-            st.error("LIVE MODE — orders placed here spend REAL funds on Polygon. "
-                     "Start with < $5 per trade.")
+        st.caption("Wallet key detected. Toggle Live trading in the main panel ↗")
+        if st.session_state.get("live_trading", False):
+            st.error("⚡ LIVE MODE ACTIVE — real money at risk!")
             st.caption(f"Wallet sig type: {_poly_sig_type} "
                        f"({'EOA' if _poly_sig_type == 0 else 'proxy/safe'})")
 
@@ -672,24 +680,16 @@ with st.sidebar:
         for _k in _missing:
             st.caption(f"  • {_k}")
 
+# ── read all bot state from session_state (set by widgets below) ──────────────
+demo_mode   = st.session_state.demo_mode
+auto_paper  = st.session_state.get("auto_paper", False)
+live_trading = st.session_state.get("live_trading", False)
+
 # ── effective keys: demo mode forces mock data regardless of key presence ─────
 _eff_anthropic  = "" if demo_mode else _anthropic_key
 _eff_poly       = "" if demo_mode else _poly_key
 _eff_kalshi     = "" if demo_mode else _kalshi_key
 _eff_kalshi_pem = "" if demo_mode else _kalshi_pem
-
-# ── Run Analysis button — main panel, always visible even if sidebar is closed ─
-_ra1, _ra2 = st.columns([5, 1])
-with _ra1:
-    _mode_txt = "🔵 **Demo mode** — using simulated markets & mock AI" if demo_mode else (
-        "🟢 **Live mode** — connected to real APIs" if (_eff_poly or _eff_kalshi or _eff_anthropic)
-        else "🔵 **Demo mode** — add API keys to go live"
-    )
-    st.caption(_mode_txt)
-with _ra2:
-    if st.button("▶️ Run", type="primary", use_container_width=True, key="run_top"):
-        st.cache_data.clear()
-        st.rerun()
 
 # ── load data ─────────────────────────────────────────────────────────────────
 try:
@@ -787,11 +787,22 @@ _chips = "".join([
     _conn_chip(_poly_live,    bool(_poly_key),       "Polymarket"),
     _conn_chip(_kalshi_live,  bool(_kalshi_key and _kalshi_pem), "Kalshi"),
 ])
-_sc1, _sc2 = st.columns([5, 1])
-with _sc1:
+_bar1, _bar2, _bar3 = st.columns([4, 2, 1])
+with _bar1:
     st.markdown(f'<div style="padding:4px 0 10px">{_chips}</div>', unsafe_allow_html=True)
-with _sc2:
-    if st.button("🔄 Re-run", use_container_width=True, key="rerun_main"):
+with _bar2:
+    _demo_new = st.toggle(
+        "🔵 Demo mode",
+        value=st.session_state.demo_mode,
+        key="demo_main",
+        help="ON = safe simulated data. OFF = live API connections.",
+    )
+    if _demo_new != st.session_state.demo_mode:
+        st.session_state.demo_mode = _demo_new
+        st.cache_data.clear()
+        st.rerun()
+with _bar3:
+    if st.button("▶ Run", type="primary", use_container_width=True, key="run_main"):
         st.cache_data.clear()
         st.rerun()
 
@@ -814,6 +825,49 @@ c4.metric("Best Edge",          f"{abs(best['edge']):.1%}", best["platform"])
 _any_live = _live_ai_mode or _poly_live or _kalshi_live
 _mode_str = "🟢 LIVE" if _any_live else "🔵 MOCK"
 c5.metric("Mode", _mode_str)
+
+# ── bot status row ─────────────────────────────────────────────────────────────
+_bs1, _bs2, _bs3, _bs4 = st.columns(4)
+with _bs1:
+    _at_icon = "🟢" if auto_paper else "⚫"
+    st.info(f"{_at_icon} **Auto-trade:** {'ON — bot logs paper trades' if auto_paper else 'OFF'}")
+with _bs2:
+    if _poly_pk:
+        _lt_new = st.toggle(
+            "🚨 Live trading (real $)",
+            value=st.session_state.get("live_trading", False),
+            key="live_trading",
+            help="Switch from Paper to real-money execution on Polymarket. "
+                 "Start with $5–$10. Both bots default mock_mode=true — never "
+                 "enable without weeks of mock testing and verified API connections.",
+        )
+        live_trading = _lt_new
+        if _lt_new:
+            st.error("LIVE MODE — real funds at risk!", icon="🚨")
+    else:
+        st.info("📝 **Paper mode** — add POLYMARKET_PRIVATE_KEY for live")
+        live_trading = False
+with _bs3:
+    _n_p = len(st.session_state.paper_ledger)
+    _n_l = len(st.session_state.live_ledger)
+    _trade_txt = f"📋 Paper: {_n_p}"
+    if _n_l:
+        _trade_txt += f" / 🚨 Live: {_n_l}"
+    st.info(f"**Trades today:** {_trade_txt}")
+with _bs4:
+    st.info(f"⏱ **Refresh:** {_refresh_label}")
+
+# ── 24/7 auto-refresh ─────────────────────────────────────────────────────────
+_REFRESH_MAP = {"Off": None, "Every 1 min": 60, "Every 5 min": 300,
+                "Every 15 min": 900, "Every 30 min": 1800}
+_refresh_secs = _REFRESH_MAP.get(_refresh_label)
+
+if _refresh_secs:
+    @st.fragment(run_every=_refresh_secs)
+    def _auto_refresh():
+        st.cache_data.clear()
+        st.rerun()
+    _auto_refresh()
 
 # ── session trades strip (always visible — no need to hunt in Execute tab) ────
 _n_paper = len(st.session_state.paper_ledger)
