@@ -70,14 +70,20 @@ class KalshiBot:
     async def _execute_trade(
         self, market_id: str, direction: str, size_usd: float, price: float
     ) -> None:
-        # Kalshi counts contracts ($1 each); price in cents
-        count = max(1, int(size_usd))
-        limit_price_cents = int(round(price * 100))
+        # `price` is the YES price (0-1). A Kalshi contract costs the price of
+        # the SIDE you buy: yes→price, no→(1-price). size_usd is dollar
+        # exposure, so contracts = size_usd / per-contract cost (NOT size_usd,
+        # which would assume $1 contracts and under-deploy by 1/price).
+        side = direction.lower()  # "yes" | "no"
+        contract_price = price if side == "yes" else (1.0 - price)
+        contract_price = min(0.99, max(0.01, contract_price))
+        count = max(1, int(size_usd / contract_price))
+        limit_price_cents = min(99, max(1, int(round(contract_price * 100))))
 
         order = KalshiOrder(
             ticker=market_id,
             action="buy",
-            side=direction.lower(),  # "yes" | "no"
+            side=side,
             count=count,
             limit_price=limit_price_cents,
             client_order_id=f"bot_{int(time.time())}",
@@ -111,15 +117,22 @@ class KalshiBot:
                 await self._execute_exit(ticker, market.mid_price)
 
     async def _execute_exit(self, ticker: str, price: float) -> None:
-        pos = self._risk._positions.get(ticker)
+        pos = self._risk.get_position(ticker)
         if not pos:
             return
-        count = max(1, int(pos.size_usd))
-        limit_cents = int(round(price * 100))
+        side = pos.direction.lower()  # "yes" | "no"
+        # Sell exactly the number of contracts we hold: contracts were sized as
+        # size_usd / entry-contract-price, so recompute with the same basis.
+        entry_contract_price = pos.entry_price if side == "yes" else (1.0 - pos.entry_price)
+        entry_contract_price = min(0.99, max(0.01, entry_contract_price))
+        count = max(1, int(pos.size_usd / entry_contract_price))
+        # `price` is the current YES mid; limit is the current price of our side.
+        cur_contract_price = price if side == "yes" else (1.0 - price)
+        limit_cents = min(99, max(1, int(round(cur_contract_price * 100))))
         sell_order = KalshiOrder(
             ticker=ticker,
             action="sell",
-            side=pos.direction.lower(),
+            side=side,
             count=count,
             limit_price=limit_cents,
         )

@@ -610,7 +610,7 @@ class EnsemblePredictor:
 
             # Confidence: weighted average of all signal confidences,
             # discounted when directional signals disagree with each other.
-            total_w = sum(s.weight for s in all_signals)
+            total_w = max(sum(s.weight for s in all_signals), 1e-9)  # guard /0
             avg_conf = sum(s.weight * s.confidence for s in all_signals) / total_w
             dispersion = sum(
                 s.weight * s.confidence * abs(s.value - mean_value)
@@ -635,9 +635,12 @@ class EnsemblePredictor:
         """Adjust signal weight based on recent performance (online learning)."""
         if signal_name in self._weights:
             lr = 0.05
+            # Bounds MUST match LearningEngine's [_MIN_WEIGHT, _MAX_WEIGHT]
+            # (0.1, 8.0); otherwise a weight learned/persisted above 5.0 gets
+            # silently re-clamped here on the next online update.
             self._weights[signal_name] = max(
                 0.1,
-                min(5.0, self._weights[signal_name] + lr * performance_delta),
+                min(8.0, self._weights[signal_name] + lr * performance_delta),
             )
 
 

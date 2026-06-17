@@ -46,8 +46,11 @@ class TestPositionFromSignal:
         assert position_from_signal("m", "HOLD", 0.5, 0.5, 10) is None
 
     def test_clamps_probability(self):
+        # Clamped just below 1.0 to avoid certainty artifacts in the sim.
         p = position_from_signal("m", "BUY_YES", 0.5, 1.7, 10)
-        assert p.win_prob == 1.0
+        assert p.win_prob == pytest.approx(0.999)
+        p2 = position_from_signal("m", "BUY_NO", 0.5, 1.7, 10)
+        assert p2.win_prob == pytest.approx(0.001)
 
 
 class TestSimulationBasics:

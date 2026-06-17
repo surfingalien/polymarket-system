@@ -92,7 +92,11 @@ class FullMarketAnalysis:
         if self.ensemble:
             self.final_probability = self.ensemble.estimated_probability
             self.final_confidence = self.ensemble.confidence
-            self.kelly_fraction = self.ensemble.kelly_fraction
+            # Confidence-scaled Kelly: the point-estimate Kelly fraction ignores
+            # model uncertainty, so a barely-confident edge and a high-confidence
+            # edge of equal size would bet the same. Shrink the bet by the
+            # model's own confidence so uncertain signals deploy less capital.
+            self.kelly_fraction = self.ensemble.kelly_fraction * self.ensemble.confidence
             self.edge = self.ensemble.edge
             if abs(self.edge) < self.min_edge_threshold or self.final_confidence < 0.5:
                 self.signal = "HOLD"

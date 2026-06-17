@@ -29,6 +29,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 import numpy as np
+from scipy.special import ndtr  # standard-normal CDF (vectorised)
 
 
 @dataclass
@@ -77,7 +78,9 @@ def position_from_signal(
     if not (0.0 < p < 1.0) or stake <= 0:
         return None
     q = float(true_prob)
-    q = min(1.0, max(0.0, q))
+    # Clamp away from 0/1 so a stray "certain" estimate can't fabricate a
+    # risk-free bet (risk_of_ruin=0, infinite-looking EV) in the simulation.
+    q = min(0.999, max(0.001, q))
     if signal == "BUY_YES":
         return MCPosition(label, stake, win_prob=q, win_payoff_mult=(1.0 / p - 1.0))
     if signal == "BUY_NO":
@@ -131,16 +134,21 @@ class MonteCarloPortfolio:
         probs = np.array([p.win_prob for p in positions], dtype=float)
         payoffs = np.array([p.win_payoff_mult for p in positions], dtype=float)
 
-        # Per-position uniform draws, shape (n_sims, n_positions)
-        u = self._rng.random((self.n_sims, n))
-
+        # Per-position uniform draws, shape (n_sims, n_positions).
         if self.market_shock > 0:
-            # Blend each draw with one shared per-sim shock so positions become
-            # partially correlated: u' = (1-w)*u + w*shock. A low shared value
-            # makes many positions win at once (and vice-versa).
-            shock = self._rng.random((self.n_sims, 1))
-            w = self.market_shock
-            u = (1.0 - w) * u + w * shock
+            # Gaussian copula: correlate outcomes via a shared latent factor
+            # WITHOUT distorting each position's marginal win probability.
+            #   z_i = sqrt(1-rho)*eps_i + sqrt(rho)*Z_common   (each ~ N(0,1))
+            #   u_i = Phi(z_i)  is exactly Uniform(0,1), so P(u_i < p) == p.
+            # rho>0 makes positions tend to win/lose together → wider tails,
+            # but mean P&L and per-position win rates are unchanged.
+            rho = self.market_shock
+            eps = self._rng.standard_normal((self.n_sims, n))
+            common = self._rng.standard_normal((self.n_sims, 1))
+            z = np.sqrt(1.0 - rho) * eps + np.sqrt(rho) * common
+            u = ndtr(z)
+        else:
+            u = self._rng.random((self.n_sims, n))
 
         wins = u < probs  # broadcast over columns
         # P&L per position: win → stake*payoff, loss → -stake

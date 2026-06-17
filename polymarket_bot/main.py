@@ -90,14 +90,19 @@ class PolymarketBot:
             raise ValueError(f"Market {market_id} not found")
 
         token_id = market.yes_token_id if direction == "YES" else market.no_token_id
-        shares = size_usd / price if price > 0 else 0
+        # `price` is the YES price. A NO share is priced at (1 - yes_price); use
+        # that as both the limit price and the share-count basis, else a NO buy
+        # would be sized/priced against the wrong side.
+        token_price = price if direction == "YES" else (1.0 - price)
+        token_price = min(0.99, max(0.01, token_price))
+        shares = size_usd / token_price if token_price > 0 else 0
 
         order = ClobOrder(
             condition_id=market_id,
             token_id=token_id,
             side="BUY",
             size=round(shares, 4),
-            price=round(price, 4),
+            price=round(token_price, 4),
         )
         await self._client.place_order(order)
 
@@ -132,20 +137,25 @@ class PolymarketBot:
                 await self._execute_exit(market_id, market.mid_price)
 
     async def _execute_exit(self, market_id: str, price: float) -> None:
-        pos = self._risk._positions.get(market_id)
+        pos = self._risk.get_position(market_id)
         if not pos:
             return
         market = await self._client.get_market(market_id)
         if not market:
             return
         token_id = market.yes_token_id if pos.direction == "YES" else market.no_token_id
-        shares = pos.size_usd / pos.entry_price if pos.entry_price > 0 else 0
+        # Sell the contracts we hold: sized as size_usd / entry-token-price.
+        entry_token_price = pos.entry_price if pos.direction == "YES" else (1.0 - pos.entry_price)
+        entry_token_price = min(0.99, max(0.01, entry_token_price))
+        shares = pos.size_usd / entry_token_price if entry_token_price > 0 else 0
+        exit_token_price = price if pos.direction == "YES" else (1.0 - price)
+        exit_token_price = min(0.99, max(0.01, exit_token_price))
         order = ClobOrder(
             condition_id=market_id,
             token_id=token_id,
             side="SELL",
             size=round(shares, 4),
-            price=round(price, 4),
+            price=round(exit_token_price, 4),
         )
         await self._client.place_order(order)
         self._risk.close_position(market_id, price)

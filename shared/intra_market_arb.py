@@ -187,7 +187,8 @@ def _coerce_price(v) -> Optional[float]:
         f = float(v)
     except (TypeError, ValueError):
         return None
-    if f != f:  # NaN
+    import math
+    if not math.isfinite(f):  # reject NaN and ±inf
         return None
     return f
 

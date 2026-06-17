@@ -69,9 +69,12 @@ def _get_secret(name: str) -> str:
         return os.environ.get(name, "")
 
 
+_UNSET = object()  # sentinel: distinguishes "never set" from a real None/[] result
+
+
 def _run_coro_sync(coro, timeout: int = 30):
     """Run an async coroutine safely from a synchronous Streamlit context."""
-    result_box: list = [None]
+    result_box: list = [_UNSET]
     exc_box: list = [None]
 
     def _target():
@@ -87,9 +90,11 @@ def _run_coro_sync(coro, timeout: int = 30):
         raise TimeoutError(f"API request timed out after {timeout} s — the host may be unreachable")
     if exc_box[0]:
         raise exc_box[0]
-    if result_box[0] is None:
+    if result_box[0] is _UNSET:
+        # Thread finished without setting a result or raising — should be
+        # unreachable, but fail loudly rather than returning the sentinel.
         raise RuntimeError("API call returned no data")
-    return result_box[0]
+    return result_box[0]  # empty list / None are valid results
 
 
 def _live_ai_analysis(api_key: str, markets: list[dict]) -> dict[str, dict]:
@@ -190,7 +195,7 @@ def _best_ask(book: dict) -> float | None:
             p = float(a["price"]) if isinstance(a, dict) else float(a[0])
         except (KeyError, IndexError, TypeError, ValueError):
             continue
-        if p > 0:
+        if math.isfinite(p) and 0.0 < p < 1.0:
             prices.append(p)
     return min(prices) if prices else None
 
@@ -531,14 +536,17 @@ def _run_analysis(markets: list[dict], anthropic_key: str = "") -> tuple[list[di
         adj_conf  = float(adj_conf) * (0.5 + 0.5 * float(q_score))
         min_edge  = tmp.adjusted_min_edge(cat.adjusted_min_edge(mkt["question"], 0.03))
         edge      = float(adj_prob) - mkt["price"]
-        kf        = float(kelly.compute(float(adj_prob), mkt["price"]))
+        # Confidence-scaled Kelly: shrink the bet by model confidence so
+        # uncertain edges deploy less capital (matches market_analyzer).
+        kf        = float(kelly.compute(float(adj_prob), mkt["price"])) * float(adj_conf)
 
         signal = ("HOLD" if abs(edge) < min_edge or adj_conf < 0.50
                   else ("BUY_YES" if edge > 0 else "BUY_NO"))
 
         sigs = [
             {"name": str(s.name), "value": float(s.value),
-             "confidence": float(s.confidence), "weight": float(s.weight or 1.0)}
+             "confidence": float(s.confidence),
+             "weight": float(s.weight if s.weight is not None else 1.0)}
             for s in raw.signals if s.value != 0.0
         ]
 
@@ -649,6 +657,13 @@ analyses = [a for a in all_analyses if a["conf"] >= min_conf or a["signal"] == "
 
 # ── header ────────────────────────────────────────────────────────────────────
 st.markdown("## 📊 Polymarket + Kalshi AI Trading Dashboard")
+if not analyses:
+    st.warning(
+        "No markets pass the current **Min confidence** filter. Lower the "
+        "slider in the sidebar, or re-run the analysis."
+    )
+    st.stop()
+
 actionable = [a for a in analyses if a["signal"] != "HOLD"]
 avg_edge   = float(np.mean([abs(a["edge"]) for a in actionable])) if actionable else 0.0
 best       = max(analyses, key=lambda a: abs(a["edge"]))
@@ -892,7 +907,9 @@ with t4:
                    "yes_ask": a["price"]} for a in analyses if a["platform"] == "Kalshi"]
 
     try:
-        arb = CrossMarketCorrelator().find_arbitrage(poly_raw, kalshi_raw, min_spread=0.0)
+        # Only surface pairs whose spread actually clears fees (matches the
+        # explanatory text below); min_spread=0 would list non-actionable rows.
+        arb = CrossMarketCorrelator().find_arbitrage(poly_raw, kalshi_raw, min_spread=0.01)
     except Exception:
         arb = []
 

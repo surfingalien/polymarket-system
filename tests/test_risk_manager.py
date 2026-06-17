@@ -128,6 +128,30 @@ def test_open_close_position(risk):
     assert risk._daily_pnl > 0
 
 
+def test_no_side_pnl_uses_complementary_price(risk):
+    """A NO position holds the (1-yes) token; P&L must be computed on that
+    price, not on the raw YES price."""
+    from shared.risk_manager import Position
+    # Bought NO when YES=0.40 (NO cost 0.60). YES falls to 0.30 (NO now 0.70).
+    pos = Position(market_id="m", platform="kalshi", direction="NO",
+                   size_usd=60.0, entry_price=0.40, current_price=0.30)
+    # held: 0.60 -> 0.70  => +16.67% on capital, not the old (0.40/0.30-1)=33%
+    assert pos.pnl_pct == pytest.approx((0.70 - 0.60) / 0.60)
+    assert pos.pnl_usd == pytest.approx(60.0 * (0.10 / 0.60))
+    # And a NO position loses when YES rises.
+    pos_loss = Position(market_id="m", platform="kalshi", direction="NO",
+                        size_usd=60.0, entry_price=0.40, current_price=0.50)
+    assert pos_loss.pnl_pct < 0
+
+
+def test_yes_side_pnl_unchanged(risk):
+    from shared.risk_manager import Position
+    pos = Position(market_id="m", platform="poly", direction="YES",
+                   size_usd=50.0, entry_price=0.50, current_price=0.75)
+    assert pos.pnl_pct == pytest.approx(0.5)
+    assert pos.pnl_usd == pytest.approx(25.0)
+
+
 def test_stop_loss_trigger(risk):
     risk.open_position("sl_test", "poly", "YES", 50.0, entry_price=0.50)
     pos = risk._positions["sl_test"]

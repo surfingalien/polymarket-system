@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import time
 from dataclasses import dataclass, field
 from typing import Optional
@@ -283,13 +284,24 @@ class PolymarketClient:
                     yes_token = t.get("token_id", "")
                 elif outcome == "no":
                     no_token = t.get("token_id", "")
-            # Fallback: clobTokenIds is a flat list [yes_id, no_id]
+            # Fallback: clobTokenIds is [yes_id, no_id] — but the Gamma API
+            # often returns it as a JSON *string* ("[\"123\",\"456\"]"), not a
+            # list. Iterating a string would put single characters into the
+            # token ids → orders against garbage tokens. Parse it first.
             if not yes_token:
                 clob_ids = m.get("clobTokenIds") or []
-                if len(clob_ids) >= 1:
-                    yes_token = clob_ids[0]
-                if len(clob_ids) >= 2:
-                    no_token = clob_ids[1]
+                if isinstance(clob_ids, str):
+                    try:
+                        clob_ids = json.loads(clob_ids)
+                    except (json.JSONDecodeError, ValueError):
+                        clob_ids = []
+                if isinstance(clob_ids, list):
+                    if len(clob_ids) >= 1:
+                        yes_token = str(clob_ids[0])
+                    if len(clob_ids) >= 2:
+                        no_token = str(clob_ids[1])
+            yes_token = str(yes_token) if yes_token else ""
+            no_token = str(no_token) if no_token else ""
             prices = m.get("outcomePrices") or []
             try:
                 yes_price = float(prices[0]) if prices else 0.5

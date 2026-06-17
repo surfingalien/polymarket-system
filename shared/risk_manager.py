@@ -50,20 +50,27 @@ class Position:
     take_profit_price: float = 0.0
 
     @property
-    def pnl_usd(self) -> float:
+    def pnl_pct(self) -> float:
+        """Return on capital. current_price/entry_price are YES prices; a NO
+        position actually holds the complementary token priced at (1 - yes)."""
         if self.current_price == 0:
             return 0.0
         if self.direction == "YES":
-            return self.size_usd * (self.current_price / self.entry_price - 1.0)
-        return self.size_usd * (self.entry_price / self.current_price - 1.0)
+            if self.entry_price == 0:
+                return 0.0
+            return (self.current_price - self.entry_price) / self.entry_price
+        # NO: held price = 1 - yes_price
+        held_entry = 1.0 - self.entry_price
+        held_now = 1.0 - self.current_price
+        if held_entry == 0:
+            return 0.0
+        return (held_now - held_entry) / held_entry
 
     @property
-    def pnl_pct(self) -> float:
-        if self.entry_price == 0:
+    def pnl_usd(self) -> float:
+        if self.current_price == 0:
             return 0.0
-        if self.direction == "YES":
-            return (self.current_price - self.entry_price) / self.entry_price
-        return (self.entry_price - self.current_price) / self.entry_price
+        return self.size_usd * self.pnl_pct
 
 
 @dataclass
@@ -267,6 +274,10 @@ class RiskManager:
             take_profit=round(pos.take_profit_price, 3),
         )
         return pos
+
+    def get_position(self, market_id: str) -> Optional[Position]:
+        """Read-only accessor for an open position (avoids touching internals)."""
+        return self._positions.get(market_id)
 
     def update_position_price(self, market_id: str, current_price: float) -> Optional[str]:
         """
