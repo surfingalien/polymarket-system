@@ -326,8 +326,18 @@ class KalshiClient:
             ticker = m.get("ticker", "")
             if not ticker:
                 return None
-            yes_ask = m.get("yes_ask", 50) / 100.0
-            yes_bid = m.get("yes_bid", 50) / 100.0
+            # yes_ask/yes_bid are in cents (0–100); 0 means no order in book
+            raw_ask = m.get("yes_ask") or 0
+            raw_bid = m.get("yes_bid") or 0
+            # Fall back to 50 cents if both sides have no orders
+            if raw_ask == 0 and raw_bid == 0:
+                raw_ask, raw_bid = 51, 49
+            elif raw_ask == 0:
+                raw_ask = raw_bid + 2
+            elif raw_bid == 0:
+                raw_bid = raw_ask - 2
+            yes_ask = raw_ask / 100.0
+            yes_bid = raw_bid / 100.0
             return KalshiMarket(
                 ticker=ticker,
                 event_ticker=m.get("event_ticker", ""),

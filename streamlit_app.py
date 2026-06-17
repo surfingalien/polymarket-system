@@ -191,9 +191,9 @@ def _fetch_kalshi_markets_sync(api_key_id: str, pem_content: str, limit: int = 2
             result = []
             for m in raw:
                 mid = m.mid_price
-                if not (0.03 <= mid <= 0.97):
+                if not (0.02 <= mid <= 0.98):
                     continue
-                if m.volume < 500:
+                if m.volume < 50:
                     continue
                 result.append({
                     "id":        m.ticker,
@@ -386,17 +386,19 @@ def _history(mkt: dict, n: int = 30) -> list[float]:
 # ── full analysis pipeline — returns only plain primitives ────────────────────
 
 @st.cache_data(ttl=120, show_spinner=False)
-def _run_analysis(markets: list[dict], anthropic_key: str = "") -> tuple[list[dict], bool]:
+def _run_analysis(markets: list[dict], anthropic_key: str = "") -> tuple[list[dict], bool, str]:
     # Fetch AI probability estimates — live Claude when key is present, else mock
     live_ai: dict[str, dict] = {}
     using_live = False
+    ai_err = ""
     if anthropic_key:
         try:
             live_ai = _live_ai_analysis(anthropic_key, markets)
-            using_live = True
+            using_live = bool(live_ai)
         except Exception as _live_err:
             live_ai = {}
             using_live = False
+            ai_err = f"{type(_live_err).__name__}: {_live_err}"
 
     bay   = BayesianEstimator()
     kelly = KellyCriterion(max_fraction=0.15)
@@ -475,7 +477,7 @@ def _run_analysis(markets: list[dict], anthropic_key: str = "") -> tuple[list[di
             "yes_token_id": str(mkt.get("yes_token_id", "")),
             "no_token_id":  str(mkt.get("no_token_id", "")),
         })
-    return out, using_live
+    return out, using_live, ai_err
 
 
 # ── sidebar ───────────────────────────────────────────────────────────────────
@@ -538,7 +540,7 @@ try:
     with st.spinner("Fetching markets and running predictive models…"):
         _source_markets, _poly_live, _kalshi_live, _poly_err, _kalshi_err = \
             _get_markets(_poly_key, _kalshi_key, _kalshi_pem)
-        all_analyses, _live_ai_mode = _run_analysis(_source_markets, _anthropic_key)
+        all_analyses, _live_ai_mode, _ai_err = _run_analysis(_source_markets, _anthropic_key)
 except Exception as exc:
     st.error("Analysis pipeline failed — see details below.")
     st.exception(exc)
@@ -553,12 +555,14 @@ if _poly_key and not _poly_live:
 if _kalshi_key and not _kalshi_live:
     st.warning(
         f"**Kalshi live fetch failed** — using mock markets.  \n"
-        f"**Error:** `{_kalshi_err}`  \n"
-        "Note: `trading-api.kalshi.com` requires RSA auth even for market reads — "
-        "the dashboard may need a signed request."
+        f"**Error:** `{_kalshi_err}`"
     )
 if _anthropic_key and not _live_ai_mode:
-    st.warning("ANTHROPIC_API_KEY set but Claude AI call failed — using mock analysis. Check key validity.")
+    _ai_err_msg = f"  \n**Error:** `{_ai_err}`" if _ai_err else ""
+    st.warning(
+        "**ANTHROPIC_API_KEY set but Claude AI call failed** — using mock analysis.  \n"
+        f"Check key validity at console.anthropic.com.{_ai_err_msg}"
+    )
 
 analyses = [a for a in all_analyses if a["conf"] >= min_conf or a["signal"] == "HOLD"]
 
