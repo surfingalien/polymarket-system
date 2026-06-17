@@ -367,6 +367,44 @@ class MomentumAnalyzer:
                 confidence=0.65,
             ))
 
+        # --- Mean reversion: deviation from the historical average ---
+        # Distinct from RSI: compares the latest price to the mean of the
+        # *prior* history. A price stretched far above its mean is expected to
+        # revert down (bearish for YES), and vice-versa.
+        if len(prices) >= 5:
+            hist = prices[:-1]
+            avg_price = float(hist.mean())
+            if avg_price > 0:
+                dev_pct = (float(prices[-1]) - avg_price) / avg_price
+                if abs(dev_pct) > 0.10:
+                    signals.append(Signal(
+                        name="price_mean_reversion",
+                        # price above mean → negative (fade up-move), below → positive
+                        value=max(-1.0, min(1.0, -dev_pct * 3.0)),
+                        confidence=0.5,
+                        weight=0.6,
+                    ))
+
+        # --- Volume-price divergence: a price move on declining volume lacks
+        # conviction and is more likely to reverse. We fade the unconfirmed move.
+        if len(prices) >= 5 and volumes.sum() > 0:
+            window = min(5, len(prices))
+            recent_prices = prices[-window:]
+            recent_volumes = volumes[-window:]
+            price_trend = float(recent_prices[-1] - recent_prices[0])
+            avg_vol = float(recent_volumes.mean())
+            if avg_vol > 0 and abs(price_trend) > 0.02:
+                vol_ratio = float(recent_volumes[-1]) / avg_vol
+                if vol_ratio < 0.7:
+                    strength = min((1.0 - vol_ratio) * 2.0, 1.0)
+                    direction = -1.0 if price_trend > 0 else 1.0  # fade the move
+                    signals.append(Signal(
+                        name="volume_divergence",
+                        value=max(-1.0, min(1.0, direction * strength)),
+                        confidence=0.45,
+                        weight=0.4,
+                    ))
+
         return signals
 
     @staticmethod
@@ -540,6 +578,8 @@ class EnsemblePredictor:
         "rsi_mean_reversion": 0.6,
         "vwap_deviation": 0.4,
         "price_velocity": 0.8,
+        "price_mean_reversion": 0.6,
+        "volume_divergence": 0.4,
         "news_sentiment": 1.2,
     }
 

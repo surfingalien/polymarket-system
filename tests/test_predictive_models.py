@@ -150,6 +150,37 @@ class TestMomentumAnalyzer:
         names = {s.name for s in signals}
         assert "ema_momentum" in names
 
+    def test_mean_reversion_fades_spike_above_mean(self):
+        prices = [0.40, 0.41, 0.40, 0.42, 0.41, 0.65]
+        history = [PricePoint(price=p, volume=100.0, timestamp=float(i))
+                   for i, p in enumerate(prices)]
+        sig = next((s for s in MomentumAnalyzer().analyze(history)
+                    if s.name == "price_mean_reversion"), None)
+        assert sig is not None and sig.value < 0  # expect reversion down
+
+    def test_mean_reversion_lifts_drop_below_mean(self):
+        prices = [0.60, 0.61, 0.60, 0.62, 0.61, 0.35]
+        history = [PricePoint(price=p, volume=100.0, timestamp=float(i))
+                   for i, p in enumerate(prices)]
+        sig = next((s for s in MomentumAnalyzer().analyze(history)
+                    if s.name == "price_mean_reversion"), None)
+        assert sig is not None and sig.value > 0  # expect reversion up
+
+    def test_volume_divergence_fades_unsupported_rally(self):
+        data = [(0.40, 1000), (0.42, 1000), (0.45, 900), (0.48, 800), (0.52, 100)]
+        history = [PricePoint(price=p, volume=float(v), timestamp=float(i))
+                   for i, (p, v) in enumerate(data)]
+        sig = next((s for s in MomentumAnalyzer().analyze(history)
+                    if s.name == "volume_divergence"), None)
+        assert sig is not None and sig.value < 0  # fade the dead-volume rally
+
+    def test_no_volume_divergence_when_volume_healthy(self):
+        data = [(0.40, 1000), (0.42, 1100), (0.45, 1050), (0.48, 1200), (0.52, 1300)]
+        history = [PricePoint(price=p, volume=float(v), timestamp=float(i))
+                   for i, (p, v) in enumerate(data)]
+        names = {s.name for s in MomentumAnalyzer().analyze(history)}
+        assert "volume_divergence" not in names
+
 
 # --- EnsemblePredictor ---
 

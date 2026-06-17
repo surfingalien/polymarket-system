@@ -366,12 +366,41 @@ def _execute_live_polymarket_order(
 # ── CSS ───────────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
-.card { background:#1e1e2e; border-radius:10px; padding:14px 18px;
-        margin-bottom:10px; border-left:4px solid #6366f1; }
-.prob-big { font-size:3.2rem; font-weight:900; line-height:1.1; }
+/* Tighter top padding so content starts higher (feels faster/cleaner) */
+.block-container { padding-top: 2.2rem; padding-bottom: 3rem; }
+/* Hide Streamlit chrome for a cleaner app-like feel */
+#MainMenu, footer, header [data-testid="stToolbar"] { visibility: hidden; }
+
+/* Gradient hero banner */
+.hero {
+    background: linear-gradient(110deg,#6366f1 0%,#8b5cf6 45%,#ec4899 100%);
+    border-radius: 16px; padding: 22px 28px; margin-bottom: 18px;
+    box-shadow: 0 8px 28px rgba(99,102,241,.28);
+}
+.hero h1 { color:#fff; font-size:1.65rem; font-weight:800; margin:0; letter-spacing:-.02em; }
+.hero p  { color:#eef; font-size:.92rem; margin:.3rem 0 0; opacity:.92; }
+
+.card { background:#1e1e2e; border-radius:12px; padding:16px 20px;
+        margin-bottom:10px; border-left:4px solid #6366f1;
+        box-shadow: 0 2px 10px rgba(0,0,0,.18); }
+.prob-big { font-size:3.4rem; font-weight:900; line-height:1.05; letter-spacing:-.02em; }
 .signal-yes { color:#00d26a; font-weight:700; }
 .signal-no  { color:#ff4b4b; font-weight:700; }
 .signal-hold{ color:#888888; font-weight:600; }
+
+/* Metric cards: subtle panel + hover lift */
+div[data-testid="stMetric"] {
+    background:#1a1a28; border:1px solid #2a2a3c; border-radius:12px;
+    padding:14px 16px; transition: transform .12s ease, border-color .12s ease;
+}
+div[data-testid="stMetric"]:hover { transform: translateY(-2px); border-color:#6366f1; }
+
+/* Pill-style tabs */
+button[data-baseweb="tab"] { font-weight:600; }
+.stTabs [data-baseweb="tab-list"] { gap: 6px; }
+
+/* Rounder dataframes */
+div[data-testid="stDataFrame"] { border-radius:10px; overflow:hidden; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -656,7 +685,17 @@ if _anthropic_key and not _live_ai_mode:
 analyses = [a for a in all_analyses if a["conf"] >= min_conf or a["signal"] == "HOLD"]
 
 # ── header ────────────────────────────────────────────────────────────────────
-st.markdown("## 📊 Polymarket + Kalshi AI Trading Dashboard")
+_live_bits = []
+if _live_ai_mode: _live_bits.append("Claude AI")
+if _poly_live:    _live_bits.append("Polymarket")
+if _kalshi_live:  _live_bits.append("Kalshi")
+_hero_sub = ("🟢 Live: " + " · ".join(_live_bits)) if _live_bits else "🔵 Demo mode — mock data, no keys required"
+st.markdown(f"""
+<div class="hero">
+  <h1>📊 Polymarket + Kalshi AI Trading Dashboard</h1>
+  <p>Bayesian × Kelly × momentum × arbitrage, fused by a self-learning signal brain. &nbsp;|&nbsp; {_hero_sub}</p>
+</div>
+""", unsafe_allow_html=True)
 if not analyses:
     st.warning(
         "No markets pass the current **Min confidence** filter. Lower the "
@@ -690,17 +729,20 @@ t1, t2, t3, t4, t5, t6 = st.tabs([
 # ══════════════════════════════════════════════════════════════════════════════
 with t1:
     st.subheader("Live Market Scan")
+    st.caption("Sorted by absolute edge. The **30-Day Trend** sparkline is the live "
+               "price history — one fast render instead of a chart per market.")
 
     rows = []
     for a in sorted(analyses, key=lambda x: -abs(x["edge"])):
         rows.append({
             "Platform":  a["platform"],
             "Question":  a["question"][:65],
-            "Market":    f"{a['price']:.0%}",
-            "AI Est.":   f"{a['prob']:.0%}",
-            "Edge":      f"{a['edge']:+.1%}",
-            "Conf":      f"{a['conf']:.0%}",
-            "Kelly":     f"{a['kelly']:.1%}",
+            "30-Day Trend": a["history"],          # inline sparkline
+            "Market":    a["price"] * 100,         # NumberColumn formats raw value
+            "AI Est.":   a["prob"] * 100,
+            "Edge":      a["edge"] * 100,
+            "Conf":      a["conf"] * 100,
+            "Kelly":     a["kelly"] * 100,
             "Quality":   round(a["quality"], 2),
             "Signal":    SIGNAL_ICONS[a["signal"]],
             "Days":      a["days"],
@@ -709,26 +751,20 @@ with t1:
     st.dataframe(
         pd.DataFrame(rows), use_container_width=True, hide_index=True,
         column_config={
+            "30-Day Trend": st.column_config.LineChartColumn(
+                "30-Day Trend", width="small",
+            ),
+            "Market":  st.column_config.NumberColumn("Market", format="%.0f%%",
+                                                     help="Current market price"),
+            "AI Est.": st.column_config.NumberColumn("AI Est.", format="%.0f%%"),
+            "Edge":    st.column_config.NumberColumn("Edge", format="%+.1f%%"),
+            "Conf":    st.column_config.NumberColumn("Conf", format="%.0f%%"),
+            "Kelly":   st.column_config.NumberColumn("Kelly", format="%.1f%%"),
             "Quality": st.column_config.ProgressColumn(
                 "Quality", min_value=0.0, max_value=1.0, format="%.2f",
             ),
         },
     )
-
-    st.markdown("#### 30-Day Price Trend")
-    cols = st.columns(4)
-    for i, a in enumerate(analyses):
-        with cols[i % 4]:
-            lbl = f'<span class="{SIG_CSS[a["signal"]]}">{SIGNAL_ICONS[a["signal"]]}</span>'
-            st.markdown(
-                f"**{a['question'][:40]}**  \n"
-                f"mkt {a['price']:.0%} → AI {a['prob']:.0%} "
-                f"({a['edge']:+.1%}) {lbl}",
-                unsafe_allow_html=True,
-            )
-            # Pure Streamlit line chart — no Plotly
-            hist_df = pd.DataFrame({"price": a["history"]})
-            st.line_chart(hist_df, height=80, use_container_width=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
