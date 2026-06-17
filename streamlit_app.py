@@ -623,6 +623,23 @@ with st.sidebar:
     budget   = st.number_input("Paper budget ($)", value=100.0, min_value=10.0, step=10.0)
     min_conf = st.slider("Min confidence", 0.40, 0.90, 0.55, 0.05)
     st.divider()
+
+    # ── Bot Controls ────────────────────────────────────────────────────────
+    st.markdown("**🤖 Bot Controls**")
+    _any_key = bool(_poly_key or _kalshi_key or _anthropic_key)
+    demo_mode = st.toggle(
+        "🔵 Demo mode (mock data)",
+        value=not _any_key,
+        help="Use simulated data even when API keys are set. "
+             "Switch OFF to use your live API connections.",
+    )
+    auto_paper = st.toggle(
+        "📝 Auto-execute paper trades",
+        value=False,
+        help="Bot automatically logs a paper trade for every Buy signal "
+             "that passes your confidence filter on each analysis run.",
+    )
+    st.divider()
     if st.button("🔄 Re-run Analysis", use_container_width=True, key="rerun_sidebar"):
         st.cache_data.clear()
         st.rerun()
@@ -655,29 +672,48 @@ with st.sidebar:
         for _k in _missing:
             st.caption(f"  • {_k}")
 
+# ── effective keys: demo mode forces mock data regardless of key presence ─────
+_eff_anthropic  = "" if demo_mode else _anthropic_key
+_eff_poly       = "" if demo_mode else _poly_key
+_eff_kalshi     = "" if demo_mode else _kalshi_key
+_eff_kalshi_pem = "" if demo_mode else _kalshi_pem
+
+# ── Run Analysis button — main panel, always visible even if sidebar is closed ─
+_ra1, _ra2 = st.columns([5, 1])
+with _ra1:
+    _mode_txt = "🔵 **Demo mode** — using simulated markets & mock AI" if demo_mode else (
+        "🟢 **Live mode** — connected to real APIs" if (_eff_poly or _eff_kalshi or _eff_anthropic)
+        else "🔵 **Demo mode** — add API keys to go live"
+    )
+    st.caption(_mode_txt)
+with _ra2:
+    if st.button("▶️ Run", type="primary", use_container_width=True, key="run_top"):
+        st.cache_data.clear()
+        st.rerun()
+
 # ── load data ─────────────────────────────────────────────────────────────────
 try:
     with st.spinner("Fetching markets and running predictive models…"):
         _source_markets, _poly_live, _kalshi_live, _poly_err, _kalshi_err = \
-            _get_markets(_poly_key, _kalshi_key, _kalshi_pem)
-        all_analyses, _live_ai_mode, _ai_err = _run_analysis(_source_markets, _anthropic_key)
+            _get_markets(_eff_poly, _eff_kalshi, _eff_kalshi_pem)
+        all_analyses, _live_ai_mode, _ai_err = _run_analysis(_source_markets, _eff_anthropic)
 except Exception as exc:
     st.error("Analysis pipeline failed — see details below.")
     st.exception(exc)
     st.stop()
 
-if _poly_key and not _poly_live:
+if _eff_poly and not _poly_live:
     st.warning(
         f"**Polymarket live fetch failed** — using mock markets.  \n"
         f"**Error:** `{_poly_err}`  \n"
         "Common causes: API endpoint changed, network restriction, or invalid key format."
     )
-if _kalshi_key and not _kalshi_live:
+if _eff_kalshi and not _kalshi_live:
     st.warning(
         f"**Kalshi live fetch failed** — using mock markets.  \n"
         f"**Error:** `{_kalshi_err}`"
     )
-if _anthropic_key and not _live_ai_mode:
+if _eff_anthropic and not _live_ai_mode:
     _ai_err_msg = f"  \n**Error:** `{_ai_err}`" if _ai_err else ""
     st.warning(
         "**ANTHROPIC_API_KEY set but Claude AI call failed** — using mock analysis.  \n"
@@ -685,6 +721,39 @@ if _anthropic_key and not _live_ai_mode:
     )
 
 analyses = [a for a in all_analyses if a["conf"] >= min_conf or a["signal"] == "HOLD"]
+
+# ── auto paper trades (bot executes on every analysis run when toggle is on) ──
+if auto_paper:
+    _auto_added = 0
+    for _a in analyses:
+        if _a["signal"] == "HOLD" or _a["kelly"] <= 0:
+            continue
+        _size = round(min(float(budget) * _a["kelly"], float(budget) * 0.15), 2)
+        if _size < 1.0:
+            continue
+        _dir = "YES" if _a["signal"] == "BUY_YES" else "NO"
+        # Skip if this market+direction is already in the ledger (avoids duplicates on refresh)
+        if any(p.get("Question", "")[:40] == _a["question"][:40] and p.get("Dir") == _dir
+               for p in st.session_state.paper_ledger):
+            continue
+        st.session_state.paper_ledger.append({
+            "Platform": _a["platform"],
+            "Question": _a["question"][:50],
+            "Dir":      _dir,
+            "Size $":   _size,
+            "Entry":    f"{_a['price']:.0%}",
+            "AI Est.":  f"{_a['prob']:.0%}",
+            "Edge":     f"{_a['edge']:+.1%}",
+            "Conf":     f"{_a['conf']:.0%}",
+            "Time":     time.strftime("%H:%M:%S"),
+            "Mode":     "🤖 Auto",
+        })
+        _auto_added += 1
+    if _auto_added:
+        st.toast(
+            f"🤖 Bot auto-executed {_auto_added} paper trade{'s' if _auto_added != 1 else ''}",
+            icon="📝",
+        )
 
 # ── header ────────────────────────────────────────────────────────────────────
 _live_bits = []
