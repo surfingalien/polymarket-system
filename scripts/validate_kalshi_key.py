@@ -61,7 +61,7 @@ def _check_sign(key, key_id: str) -> dict:
 async def _check_api(headers: dict):
     import httpx
 
-    url = "https://trading-api.kalshi.com/trade-api/v2/markets"
+    url = "https://api.elections.kalshi.com/trade-api/v2/markets"
     async with httpx.AsyncClient(timeout=15) as client:
         resp = await client.get(url, params={"limit": 5, "status": "open"}, headers=headers)
     if resp.status_code == 200:
@@ -107,7 +107,7 @@ def main():
     headers = _check_sign(key, key_id or "test-key-id")
 
     if key_id:
-        print("Step 3: live API call to trading-api.kalshi.com")
+        print("Step 3: live API call to api.elections.kalshi.com")
         asyncio.run(_check_api(headers))
     else:
         print("Step 3: skipped (no KALSHI_API_KEY)")
