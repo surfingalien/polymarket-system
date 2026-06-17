@@ -190,11 +190,11 @@ def _fetch_kalshi_markets_sync(api_key_id: str, pem_content: str, limit: int = 2
         try:
             raw = await client.get_markets(limit=limit, status="open")
             result = []
+            drop_price = 0
             for m in raw:
                 mid = m.mid_price
                 if not (0.02 <= mid <= 0.98):
-                    continue
-                if m.volume < 50:
+                    drop_price += 1
                     continue
                 result.append({
                     "id":        m.ticker,
@@ -207,6 +207,17 @@ def _fetch_kalshi_markets_sync(api_key_id: str, pem_content: str, limit: int = 2
                     "category":  _guess_category(m.title),
                     "trend":     0.0,
                 })
+            # If the API returned markets but filters dropped them all, surface why
+            if raw and not result:
+                raise RuntimeError(
+                    f"API returned {len(raw)} markets but all filtered out on price "
+                    f"({drop_price} dropped). "
+                    f"Sample: {[(round(m.mid_price, 3), m.volume) for m in raw[:5]]}"
+                )
+            if not raw:
+                raise RuntimeError(
+                    "API returned 0 markets — check status param / response shape"
+                )
             return result
         finally:
             await client.close()
