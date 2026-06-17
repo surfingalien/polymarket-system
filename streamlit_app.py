@@ -614,14 +614,16 @@ if "live_ledger" not in st.session_state:
 
 with st.sidebar:
     st.title("🤖 Polymarket AI Bot")
-    st.markdown(("🟢 **LIVE CLAUDE AI**" if _anthropic_key else "🟡 Mock AI analysis"))
-    st.markdown(("🟢 **LIVE POLYMARKET**" if _poly_key      else "🟡 Mock Polymarket data"))
-    st.markdown(("🟢 **LIVE KALSHI**"     if (_kalshi_key and _kalshi_pem)    else "🟡 Mock Kalshi data"))
+    st.markdown("**API Keys**")
+    st.markdown("✅ Anthropic key set" if _anthropic_key  else "⚪ No Anthropic key → mock AI")
+    st.markdown("✅ Polymarket key set" if _poly_key       else "⚪ No Polymarket key → mock data")
+    st.markdown("✅ Kalshi keys set"    if (_kalshi_key and _kalshi_pem) else "⚪ No Kalshi keys → mock data")
+    st.caption("Live connection status is shown in the main panel →")
     st.divider()
     budget   = st.number_input("Paper budget ($)", value=100.0, min_value=10.0, step=10.0)
     min_conf = st.slider("Min confidence", 0.40, 0.90, 0.55, 0.05)
     st.divider()
-    if st.button("🔄 Re-run Analysis", use_container_width=True):
+    if st.button("🔄 Re-run Analysis", use_container_width=True, key="rerun_sidebar"):
         st.cache_data.clear()
         st.rerun()
 
@@ -696,10 +698,38 @@ st.markdown(f"""
   <p>Bayesian × Kelly × momentum × arbitrage, fused by a self-learning signal brain. &nbsp;|&nbsp; {_hero_sub}</p>
 </div>
 """, unsafe_allow_html=True)
+# ── connection status chips + Re-run (real status — available after data load) ─
+_CHIP = ("display:inline-block;border-radius:20px;padding:4px 16px;"
+         "font-size:.82rem;font-weight:600;margin:2px 6px 2px 0;"
+         "border:1px solid;white-space:nowrap;")
+
+def _conn_chip(connected: bool, has_key: bool, label: str) -> str:
+    if connected:
+        s = f"background:#052e16;color:#00d26a;border-color:#00d26a;"
+        return f'<span style="{_CHIP}{s}">🟢 {label} live</span>'
+    if has_key:
+        s = f"background:#422006;color:#fb923c;border-color:#fb923c;"
+        return f'<span style="{_CHIP}{s}">🟡 {label} — key set, connection failed</span>'
+    s = f"background:#0f172a;color:#64748b;border-color:#334155;"
+    return f'<span style="{_CHIP}{s}">⚫ {label} mock</span>'
+
+_chips = "".join([
+    _conn_chip(_live_ai_mode, bool(_anthropic_key), "Claude AI"),
+    _conn_chip(_poly_live,    bool(_poly_key),       "Polymarket"),
+    _conn_chip(_kalshi_live,  bool(_kalshi_key and _kalshi_pem), "Kalshi"),
+])
+_sc1, _sc2 = st.columns([5, 1])
+with _sc1:
+    st.markdown(f'<div style="padding:4px 0 10px">{_chips}</div>', unsafe_allow_html=True)
+with _sc2:
+    if st.button("🔄 Re-run", use_container_width=True, key="rerun_main"):
+        st.cache_data.clear()
+        st.rerun()
+
 if not analyses:
     st.warning(
-        "No markets pass the current **Min confidence** filter. Lower the "
-        "slider in the sidebar, or re-run the analysis."
+        "No markets pass the current **Min confidence** filter. "
+        "Lower the slider in the sidebar or click **Re-run**."
     )
     st.stop()
 
@@ -715,6 +745,42 @@ c4.metric("Best Edge",          f"{abs(best['edge']):.1%}", best["platform"])
 _any_live = _live_ai_mode or _poly_live or _kalshi_live
 _mode_str = "🟢 LIVE" if _any_live else "🔵 MOCK"
 c5.metric("Mode", _mode_str)
+
+# ── session trades strip (always visible — no need to hunt in Execute tab) ────
+_n_paper = len(st.session_state.paper_ledger)
+_n_live  = len(st.session_state.live_ledger)
+if _n_paper + _n_live > 0:
+    _badges: list[str] = []
+    if _n_paper: _badges.append(f"{_n_paper} paper trade{'s' if _n_paper != 1 else ''}")
+    if _n_live:  _badges.append(f"{_n_live} live trade{'s' if _n_live != 1 else ''} ⚠️")
+    with st.expander(f"📋 Today's Session — {' · '.join(_badges)}", expanded=_n_live > 0):
+        if _n_paper > 0 and _n_live > 0:
+            _tleft, _tright = st.columns(2)
+            with _tleft:
+                st.caption("📝 Paper trades (simulated, no real money)")
+                st.dataframe(pd.DataFrame(st.session_state.paper_ledger),
+                             use_container_width=True, hide_index=True)
+                if st.button("Clear paper trades", key="clear_paper_strip"):
+                    st.session_state.paper_ledger.clear()
+                    st.rerun()
+            with _tright:
+                st.caption("🚨 Live trades (real money spent)")
+                st.dataframe(pd.DataFrame(st.session_state.live_ledger),
+                             use_container_width=True, hide_index=True)
+        elif _n_paper:
+            st.caption("📝 Paper trades (simulated, no real money)")
+            st.dataframe(pd.DataFrame(st.session_state.paper_ledger),
+                         use_container_width=True, hide_index=True)
+            if st.button("Clear paper trades", key="clear_paper_strip"):
+                st.session_state.paper_ledger.clear()
+                st.rerun()
+        else:
+            st.caption("🚨 Live trades (real money spent)")
+            st.dataframe(pd.DataFrame(st.session_state.live_ledger),
+                         use_container_width=True, hide_index=True)
+else:
+    st.info("No trades recorded yet this session. Open **🚀 Execute** to paper-trade the current signals.")
+
 st.divider()
 
 # ── tabs ──────────────────────────────────────────────────────────────────────
@@ -1238,18 +1304,11 @@ with t6:
                                 except Exception as exc:
                                     st.error(f"Order failed: {exc}")
 
-    # ── ledgers ─────────────────────────────────────────────────────────────
-    if st.session_state.live_ledger:
-        st.markdown("#### 🚨 Live Orders This Session")
-        st.dataframe(pd.DataFrame(st.session_state.live_ledger),
-                     use_container_width=True, hide_index=True)
-    if st.session_state.paper_ledger:
-        st.markdown("#### 📝 Paper Orders This Session")
-        st.dataframe(pd.DataFrame(st.session_state.paper_ledger),
-                     use_container_width=True, hide_index=True)
-        if st.button("Clear paper ledger"):
-            st.session_state.paper_ledger = []
-            st.rerun()
+    # ── ledger link ──────────────────────────────────────────────────────────
+    _tot = len(st.session_state.paper_ledger) + len(st.session_state.live_ledger)
+    if _tot:
+        st.info(f"📋 **{_tot} trade(s) recorded** this session — see the "
+                "**Today's Session** strip above the tabs for the full ledger.")
 
 
 # ── footer ────────────────────────────────────────────────────────────────────
