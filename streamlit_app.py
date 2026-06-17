@@ -49,6 +49,7 @@ try:
         OrderBookSnapshot, PricePoint,
         ResolutionDecayModel,
     )
+    from shared.intra_market_arb import IntraMarketArbitrage
     from polymarket_bot.polymarket_client import PolymarketClient
     from polymarket_bot.order_signer import PolymarketOrderSigner, SigningUnavailable
     from kalshi_bot.kalshi_client import KalshiClient
@@ -177,6 +178,57 @@ def _fetch_polymarket_markets_sync(api_key: str, limit: int = 25) -> list[dict]:
             await client.close()
 
     return _run_coro_sync(_inner())
+
+
+def _best_ask(book: dict) -> float | None:
+    """Lowest ask price from a raw CLOB order book {asks: [{price,size}|[price,size]]}."""
+    asks = (book or {}).get("asks") or []
+    prices = []
+    for a in asks:
+        try:
+            p = float(a["price"]) if isinstance(a, dict) else float(a[0])
+        except (KeyError, IndexError, TypeError, ValueError):
+            continue
+        if p > 0:
+            prices.append(p)
+    return min(prices) if prices else None
+
+
+def _fetch_polymarket_arb_sync(api_key: str, markets: list[dict]) -> list[dict]:
+    """For each market, fetch REAL YES and NO order-book asks (intra-market arb input).
+
+    markets: live Polymarket dicts carrying yes_token_id / no_token_id.
+    Returns dicts with yes_ask / no_ask populated from live books.
+    """
+    async def _inner():
+        client = PolymarketClient(api_key=api_key)
+        try:
+            enriched = []
+            for m in markets:
+                yes_tid = m.get("yes_token_id", "")
+                no_tid = m.get("no_token_id", "")
+                if not yes_tid or not no_tid:
+                    continue
+                yes_book = await client.get_order_book(yes_tid)
+                no_book = await client.get_order_book(no_tid)
+                yes_ask = _best_ask(yes_book)
+                no_ask = _best_ask(no_book)
+                if yes_ask is None or no_ask is None:
+                    continue
+                enriched.append({
+                    "id":           m["id"],
+                    "condition_id": m["id"],
+                    "question":     m["question"],
+                    "yes_ask":      yes_ask,
+                    "no_ask":       no_ask,
+                    "yes_token_id": yes_tid,
+                    "no_token_id":  no_tid,
+                })
+            return enriched
+        finally:
+            await client.close()
+
+    return _run_coro_sync(_inner(), timeout=60)
 
 
 def _fetch_kalshi_markets_sync(api_key_id: str, pem_content: str, limit: int = 20) -> list[dict]:
@@ -862,6 +914,61 @@ with t4:
 - Flag pairs > 40% similar as covering the same event
 - Show only pairs where net spread (after fees) exceeds the threshold
 """)
+
+    # ── Intra-market arbitrage (single-platform, risk-free) ──────────────────
+    st.divider()
+    st.subheader("🎯 Intra-Market Arbitrage (Polymarket)")
+    st.markdown(
+        "Risk-free **binary bundle** arb: if `YES_ask + NO_ask < $1.00`, buying "
+        "both sides locks in profit no matter how the market resolves. Needs "
+        "**live order books** (real separate YES/NO asks), so this scans on demand."
+    )
+
+    _live_poly = [m for m in _source_markets
+                  if m["platform"] == "Polymarket" and m.get("yes_token_id")]
+
+    col_a, col_b = st.columns([1, 2])
+    with col_a:
+        fee_bps = st.number_input(
+            "Fee/gas buffer per share (¢)", value=0.0, min_value=0.0,
+            max_value=5.0, step=0.5,
+            help="Subtracted per leg. Polymarket CLOB currently has no taker fee.",
+        )
+        scan_n = st.slider("Markets to scan", 3, 25, 12,
+                           help="Each market = 2 order-book calls.")
+
+    if not _poly_live:
+        st.info("Connect a live Polymarket feed (POLYMARKET_API_KEY) to scan real "
+                "order books. Mock mids always sum to ~$1.00, so no arb appears.")
+    elif st.button("🔍 Scan live order books for arb", use_container_width=True):
+        with st.spinner(f"Fetching YES/NO books for {min(scan_n, len(_live_poly))} markets…"):
+            try:
+                enriched = _fetch_polymarket_arb_sync(_poly_key, _live_poly[:scan_n])
+                detector = IntraMarketArbitrage(
+                    fee_per_share=fee_bps / 100.0, min_net_profit=0.0
+                )
+                arbs = detector.find_binary_bundle(enriched)
+            except Exception as e:
+                arbs = []
+                st.error(f"Order-book scan failed: {type(e).__name__}: {e}")
+                enriched = []
+
+        if arbs:
+            st.success(f"Found {len(arbs)} binary-bundle arbitrage opportunit"
+                       f"{'y' if len(arbs) == 1 else 'ies'}!")
+            ia_rows = [{
+                "Question":   o.question[:60],
+                "YES ask":    f"{o.legs[0].ask:.1%}",
+                "NO ask":     f"{o.legs[1].ask:.1%}",
+                "Total cost": f"${o.total_cost:.4f}",
+                "Net profit": f"${o.net_profit:+.4f}",
+                "ROI":        f"{o.roi:+.2%}",
+                "Conf.":      f"{o.confidence:.0%}",
+            } for o in arbs]
+            st.dataframe(pd.DataFrame(ia_rows), use_container_width=True, hide_index=True)
+        elif enriched:
+            st.info(f"Scanned {len(enriched)} live markets — no bundle priced under "
+                    "$1.00 right now. These windows are brief; re-scan during volatility.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════

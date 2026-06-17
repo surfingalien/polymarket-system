@@ -30,6 +30,11 @@ from .advanced_signals import (
     CategoryProfile,
     CATEGORY_PROFILES,
 )
+from .intra_market_arb import (
+    IntraMarketArbitrage,
+    IntraMarketArb,
+    ArbLeg,
+)
 
 __all__ = [
     "ClaudeAgent", "MarketAnalysis",
@@ -46,4 +51,5 @@ __all__ = [
     "CategoryEdgeModel", "ExcessReturnTracker", "MarketQualityScorer",
     "QueryExpander", "SentimentDivergenceSignal",
     "TradeEvent", "CategoryProfile", "CATEGORY_PROFILES",
+    "IntraMarketArbitrage", "IntraMarketArb", "ArbLeg",
 ]
