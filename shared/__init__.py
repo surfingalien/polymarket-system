@@ -35,6 +35,12 @@ from .intra_market_arb import (
     IntraMarketArb,
     ArbLeg,
 )
+from .monte_carlo import (
+    MonteCarloPortfolio,
+    MonteCarloResult,
+    MCPosition,
+    position_from_signal,
+)
 
 __all__ = [
     "ClaudeAgent", "MarketAnalysis",
@@ -52,4 +58,6 @@ __all__ = [
     "QueryExpander", "SentimentDivergenceSignal",
     "TradeEvent", "CategoryProfile", "CATEGORY_PROFILES",
     "IntraMarketArbitrage", "IntraMarketArb", "ArbLeg",
+    "MonteCarloPortfolio", "MonteCarloResult", "MCPosition",
+    "position_from_signal",
 ]

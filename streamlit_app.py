@@ -50,6 +50,7 @@ try:
         ResolutionDecayModel,
     )
     from shared.intra_market_arb import IntraMarketArbitrage
+    from shared.monte_carlo import MonteCarloPortfolio, position_from_signal
     from polymarket_bot.polymarket_client import PolymarketClient
     from polymarket_bot.order_signer import PolymarketOrderSigner, SigningUnavailable
     from kalshi_bot.kalshi_client import KalshiClient
@@ -975,52 +976,111 @@ with t4:
 # TAB 5 — Portfolio
 # ══════════════════════════════════════════════════════════════════════════════
 with t5:
-    st.subheader("💼 Paper Portfolio Simulator")
-    st.info("**MOCK MODE** — all P&L is simulated, no real orders placed.")
+    st.subheader("💼 Monte Carlo Portfolio Simulator")
+    st.info("**MOCK MODE** — outcomes are simulated, no real orders placed.")
+    st.markdown(
+        "Each prediction-market position is a binary bet that wins (resolves "
+        "your way) or loses its full stake. Rather than one coin-flip per "
+        "position, this runs the **whole basket thousands of times** to show "
+        "the *distribution* of outcomes — including the probability of profit "
+        "and the **risk of ruin**."
+    )
 
-    rng_p = random.Random(42)
-    pos   = []
-    total = 0.0
-
+    # ── build positions from actionable signals ──────────────────────────────
+    mc_positions = []
+    pos_rows = []
     for a in analyses:
         if a["signal"] == "HOLD":
             continue
         size = min(budget * a["kelly"], budget * 0.15)
         if size < 1.0:
             continue
-        bias = 0.62 if (
-            (a["signal"] == "BUY_YES" and a["prob"] > a["price"]) or
-            (a["signal"] == "BUY_NO"  and a["prob"] < a["price"])
-        ) else 0.38
-        won  = rng_p.random() < bias
-        pnl  = size * (1.0 / a["price"] - 1.0) if won else -size
-        total += pnl
-        pos.append({
+        mcp = position_from_signal(
+            label=a["question"][:30],
+            signal=a["signal"],
+            market_price=a["price"],
+            true_prob=a["prob"],
+            stake=size,
+        )
+        if mcp is None:
+            continue
+        mc_positions.append(mcp)
+        ev = mcp.win_prob * mcp.stake * mcp.win_payoff_mult - (1 - mcp.win_prob) * mcp.stake
+        pos_rows.append({
             "Platform":  a["platform"],
-            "Question":  a["question"][:55],
+            "Question":  a["question"][:50],
             "Direction": a["signal"].replace("BUY_", ""),
-            "Size $":    round(size, 2),
+            "Stake $":   round(size, 2),
             "Entry":     f"{a['price']:.0%}",
             "AI Est.":   f"{a['prob']:.0%}",
+            "Win Prob":  f"{mcp.win_prob:.0%}",
             "Edge":      f"{a['edge']:+.1%}",
-            "P&L $":     round(pnl, 2),
-            "Result":    "✅ WIN" if won else "❌ LOSS",
+            "EV $":      round(ev, 2),
         })
 
-    if pos:
-        p1, p2, p3 = st.columns(3)
-        p1.metric("Simulated Trades", len(pos))
-        p2.metric("Net Mock P&L",     f"${total:+.2f}")
-        p3.metric("ROI",              f"{total / budget:.1%}")
-
-        pnl_df = pd.DataFrame(
-            {"P&L ($)": [p["P&L $"] for p in pos]},
-            index=[p["Question"][:30] for p in pos],
-        )
-        st.bar_chart(pnl_df, height=220, use_container_width=True)
-        st.dataframe(pd.DataFrame(pos), use_container_width=True, hide_index=True)
-    else:
+    if not mc_positions:
         st.info("No positions meet the current thresholds.")
+    else:
+        c1, c2 = st.columns([1, 1])
+        with c1:
+            n_sims = st.select_slider(
+                "Simulations", options=[1000, 5000, 10000, 25000, 50000],
+                value=10000,
+            )
+        with c2:
+            shock = st.slider(
+                "Market correlation", 0.0, 0.6, 0.0, 0.05,
+                help="0 = positions independent. Higher = outcomes move "
+                     "together (macro shock), widening the tails.",
+            )
+
+        mc = MonteCarloPortfolio(n_sims=n_sims, seed=42, market_shock=shock)
+        res = mc.simulate(mc_positions, bankroll=budget, ruin_fraction=0.5)
+
+        # headline metrics
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Positions", res.n_positions)
+        m2.metric("Total Staked", f"${res.total_staked:.0f}")
+        m3.metric("Expected P&L", f"${res.mean_pnl:+.2f}",
+                  f"{res.expected_roi:+.1%} ROI")
+        m4.metric("Prob. of Profit", f"{res.prob_profit:.0%}")
+
+        m5, m6, m7, m8 = st.columns(4)
+        m5.metric("Median P&L", f"${res.median_pnl:+.2f}")
+        m6.metric("P5 (downside)", f"${res.p5:+.2f}")
+        m7.metric("P95 (upside)", f"${res.p95:+.2f}")
+        m8.metric("Risk of Ruin", f"{res.risk_of_ruin:.1%}",
+                  help="Chance of losing ≥ 50% of the budget across the basket.")
+
+        if res.risk_of_ruin >= 0.10:
+            st.warning(
+                f"⚠️ **{res.risk_of_ruin:.0%} risk of ruin** — Kelly sizing may be "
+                "too aggressive for this basket. Consider lowering the budget or "
+                "raising the confidence threshold."
+            )
+
+        # fan chart: cumulative P&L percentile bands as bets are added
+        st.markdown("**Cumulative P&L fan chart** (P5 / Median / P95 across paths)")
+        fan_df = pd.DataFrame(
+            {"P5": res.band_p5, "Median": res.band_p50, "P95": res.band_p95},
+            index=res.step_labels,
+        )
+        st.line_chart(fan_df, height=260, use_container_width=True)
+
+        # final P&L distribution
+        st.markdown("**Final P&L distribution** (all simulated outcomes)")
+        hist_df = pd.DataFrame(
+            {"Frequency": res.hist_counts},
+            index=[f"${c:+.0f}" for c in res.hist_centers],
+        )
+        st.bar_chart(hist_df, height=220, use_container_width=True)
+
+        st.dataframe(pd.DataFrame(pos_rows), use_container_width=True, hide_index=True)
+        st.caption(
+            "Win probability uses the AI/ensemble estimate; payoff is the binary "
+            "market's mechanical $1 resolution. Outcomes assumed independent unless "
+            "you raise the market-correlation slider."
+        )
 
     st.divider()
     st.markdown("""
