@@ -144,6 +144,21 @@ pytest tests/ -v
 pytest tests/ --cov=shared --cov-report=term-missing
 ```
 
+## Keeping the dashboard awake
+
+Streamlit Community Cloud puts an app to sleep after ~7 days without traffic.
+Two ways to keep it always-on:
+
+1. **In-repo (included):** `.github/workflows/keep-alive.yml` pings the app
+   every 10 minutes. Set the app URL once under **Settings → Secrets and
+   variables → Actions → Variables**: add `STREAMLIT_APP_URL =
+   https://your-app.streamlit.app`. (GitHub disables scheduled workflows after
+   60 days of no repo activity — any push re-enables them.)
+2. **External monitor (most reliable):** point [UptimeRobot](https://uptimerobot.com)
+   or [cron-job.org](https://cron-job.org) at the same URL on a 5-minute
+   interval. This survives repo inactivity and also alerts you if the app is
+   actually down.
+
 ## Authentication Notes
 
 | Platform | Auth Method | Key Change |

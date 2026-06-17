@@ -1,0 +1,65 @@
+name: Keep Streamlit App Awake
+
+# Streamlit Community Cloud puts an app to sleep after ~7 days without
+# traffic. This workflow pings the app's health endpoint on a schedule so
+# the container stays warm and the app never shows the "Zzz / wake up" screen.
+#
+# SETUP (one time):
+#   1. Deploy the app and copy its public URL, e.g.
+#        https://your-app-name.streamlit.app
+#   2. In GitHub: Settings → Secrets and variables → Actions → Variables tab
+#      → New repository variable:
+#        Name:  STREAMLIT_APP_URL
+#        Value: https://your-app-name.streamlit.app   (no trailing slash)
+#   3. That's it. The job runs every 10 minutes.
+#
+# NOTE: GitHub disables scheduled workflows after 60 days of NO repo activity.
+# Any push re-enables them. For a hard guarantee of uptime, also add an
+# external monitor (UptimeRobot / cron-job.org) pointed at the same URL —
+# see the README section "Keeping the dashboard awake".
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"   # every 10 minutes
+  workflow_dispatch:          # allow manual runs from the Actions tab
+
+concurrency:
+  group: keep-alive
+  cancel-in-progress: true
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Ping Streamlit health endpoint
+        env:
+          APP_URL: ${{ vars.STREAMLIT_APP_URL }}
+        run: |
+          if [ -z "$APP_URL" ]; then
+            echo "::warning::STREAMLIT_APP_URL repository variable is not set — skipping ping."
+            echo "Add it under Settings → Secrets and variables → Actions → Variables."
+            exit 0
+          fi
+
+          BASE="${APP_URL%/}"
+          # Streamlit's lightweight health endpoint returns 'ok' when awake.
+          HEALTH="$BASE/_stcore/health"
+
+          echo "Pinging $HEALTH"
+          for attempt in 1 2 3; do
+            code=$(curl -sS -o /tmp/body -w "%{http_code}" --max-time 30 "$HEALTH" || echo "000")
+            echo "Attempt $attempt → HTTP $code"
+            if [ "$code" = "200" ]; then
+              echo "App is awake. Body: $(cat /tmp/body)"
+              exit 0
+            fi
+            # Also hit the root URL — a sleeping app needs a real page request
+            # to trigger the wake-up, which /_stcore/health alone may not do.
+            curl -sS -o /dev/null --max-time 60 "$BASE/" || true
+            sleep $((attempt * 5))
+          done
+
+          echo "::warning::Health endpoint did not return 200 after retries (app may be waking up)."
+          # Don't fail the workflow — a transient non-200 during wake-up is expected.
+          exit 0
