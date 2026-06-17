@@ -81,28 +81,57 @@ class PolymarketBot:
             bankroll_usd=1000.0,
         )
 
+    # Max slippage above mid price before rejecting the order
+    _MAX_SLIPPAGE = 0.03  # 3%
+
     async def _execute_trade(
         self, market_id: str, direction: str, size_usd: float, price: float
     ) -> None:
-        # Look up the YES token ID from cached markets
         market = await self._client.get_market(market_id)
         if not market:
             raise ValueError(f"Market {market_id} not found")
 
         token_id = market.yes_token_id if direction == "YES" else market.no_token_id
-        # `price` is the YES price. A NO share is priced at (1 - yes_price); use
-        # that as both the limit price and the share-count basis, else a NO buy
-        # would be sized/priced against the wrong side.
-        token_price = price if direction == "YES" else (1.0 - price)
-        token_price = min(0.99, max(0.01, token_price))
-        shares = size_usd / token_price if token_price > 0 else 0
+
+        # `price` is the YES mid price. For a NO buy the held token is (1 - YES).
+        mid_token_price = price if direction == "YES" else (1.0 - price)
+        mid_token_price = min(0.99, max(0.01, mid_token_price))
+
+        # Fetch real order book to get the true best ask (BUY) limit price.
+        limit_price = mid_token_price  # fallback if book is unavailable
+        if not self._client.mock_mode:
+            book = await self._client.get_order_book(token_id)
+            asks = book.get("asks", [])
+            bids = book.get("bids", [])
+            if direction == "YES" or direction == "BUY":
+                best_side = asks
+            else:
+                best_side = bids
+
+            # asks are sorted ascending, bids descending; best is first entry.
+            if best_side:
+                try:
+                    best_px = float(best_side[0].get("price", mid_token_price))
+                    slippage = abs(best_px - mid_token_price) / mid_token_price
+                    if slippage > self._MAX_SLIPPAGE:
+                        raise ValueError(
+                            f"Order book slippage {slippage:.1%} exceeds cap "
+                            f"{self._MAX_SLIPPAGE:.0%} for {market_id} "
+                            f"(best={best_px:.3f}, mid={mid_token_price:.3f})"
+                        )
+                    limit_price = best_px
+                except (TypeError, KeyError):
+                    pass  # malformed book entry — keep mid fallback
+
+        limit_price = min(0.99, max(0.01, limit_price))
+        shares = size_usd / limit_price if limit_price > 0 else 0
 
         order = ClobOrder(
             condition_id=market_id,
             token_id=token_id,
             side="BUY",
             size=round(shares, 4),
-            price=round(token_price, 4),
+            price=round(limit_price, 4),
         )
         await self._client.place_order(order)
 

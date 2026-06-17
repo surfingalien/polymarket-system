@@ -7,8 +7,6 @@ CLOB V2 orders no longer include feeRateBps (deprecated April 28, 2026).
 """
 from __future__ import annotations
 
-import hashlib
-import hmac
 import json
 import time
 from dataclasses import dataclass, field
@@ -210,13 +208,8 @@ class PolymarketClient:
         if self.mock_mode:
             return {"status": "MOCK_CANCELLED"}
 
-        headers = self._auth_headers("DELETE", f"/order/{order_id}", "")
         try:
-            resp = await self._http.delete(
-                f"{self._clob}/order/{order_id}", headers=headers
-            )
-            resp.raise_for_status()
-            return resp.json()
+            return await self._signer.cancel_order_async(order_id)
         except Exception as exc:
             log.error("cancel_order_failed", order_id=order_id, error=str(exc))
             raise
@@ -224,11 +217,8 @@ class PolymarketClient:
     async def get_positions(self) -> list[dict]:
         if not self._api_key:
             return []
-        headers = self._auth_headers("GET", "/positions", "")
         try:
-            resp = await self._http.get(f"{self._clob}/positions", headers=headers)
-            resp.raise_for_status()
-            return resp.json()
+            return await self._signer.get_positions_async()
         except Exception as exc:
             log.warning("get_positions_failed", error=str(exc))
             return []
@@ -236,12 +226,8 @@ class PolymarketClient:
     async def get_balance(self) -> float:
         if not self._api_key:
             return 0.0
-        headers = self._auth_headers("GET", "/balance", "")
         try:
-            resp = await self._http.get(f"{self._clob}/balance", headers=headers)
-            resp.raise_for_status()
-            data = resp.json()
-            return float(data.get("balance", 0.0))
+            return await self._signer.get_balance_async()
         except Exception as exc:
             log.warning("get_balance_failed", error=str(exc))
             return 0.0
@@ -249,22 +235,6 @@ class PolymarketClient:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
-
-    def _auth_headers(self, method: str, path: str, body: str) -> dict:
-        timestamp = str(int(time.time() * 1000))
-        message = timestamp + method.upper() + path + body
-        signature = hmac.new(
-            self._api_secret.encode(),
-            message.encode(),
-            hashlib.sha256,
-        ).hexdigest()
-        return {
-            "POLY-API-KEY": self._api_key,
-            "POLY-SIGNATURE": signature,
-            "POLY-TIMESTAMP": timestamp,
-            "POLY-PASSPHRASE": self._api_passphrase,
-            "Content-Type": "application/json",
-        }
 
     def _parse_market(self, m: dict) -> Optional[Market]:
         if not isinstance(m, dict):

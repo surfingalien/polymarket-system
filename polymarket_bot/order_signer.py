@@ -137,6 +137,39 @@ class PolymarketOrderSigner:
             self.place_order, token_id, price, size, side, order_type
         )
 
+    def cancel_order_sync(self, order_id: str) -> dict:
+        """Cancel an order using py-clob-client's L2 auth (correct HMAC)."""
+        client = self._get_client()
+        resp = client.cancel(order_id)
+        return resp if isinstance(resp, dict) else {}
+
+    async def cancel_order_async(self, order_id: str) -> dict:
+        return await asyncio.to_thread(self.cancel_order_sync, order_id)
+
+    def get_positions_sync(self) -> list[dict]:
+        """Fetch open orders/positions via py-clob-client L2 auth."""
+        from py_clob_client.clob_types import OpenOrderParams
+        client = self._get_client()
+        resp = client.get_orders(params=OpenOrderParams()) or []
+        if isinstance(resp, dict):
+            resp = resp.get("data", []) or []
+        return resp if isinstance(resp, list) else []
+
+    async def get_positions_async(self) -> list[dict]:
+        return await asyncio.to_thread(self.get_positions_sync)
+
+    def get_balance_sync(self) -> float:
+        """Fetch USDC collateral balance via py-clob-client L2 auth."""
+        from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
+        client = self._get_client()
+        resp = client.get_balance_allowance(
+            params=BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+        ) or {}
+        return float(resp.get("balance", 0.0))
+
+    async def get_balance_async(self) -> float:
+        return await asyncio.to_thread(self.get_balance_sync)
+
     # ------------------------------------------------------------------
     # Lazy py-clob-client construction
     # ------------------------------------------------------------------
