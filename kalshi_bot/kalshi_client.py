@@ -111,27 +111,30 @@ class KalshiClient:
     # Market data
     # ------------------------------------------------------------------
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=8))
+    @retry(stop=stop_after_attempt(2), wait=wait_exponential(multiplier=1, min=1, max=4))
     async def get_markets(
         self, limit: int = 20, status: str = "open"
     ) -> list[KalshiMarket]:
-        try:
-            resp = await self._http.get(
-                f"{self._base}/markets",
-                params={"limit": limit, "status": status},
-                headers=self._sign("GET", "/trade-api/v2/markets"),
+        if self.mock_mode:
+            return self._mock_markets()
+        if not self._private_key:
+            raise RuntimeError(
+                "Kalshi private key failed to parse — check KALSHI_PRIVATE_KEY_PEM format"
             )
-            resp.raise_for_status()
-            data = resp.json()
-            markets = []
-            for m in data.get("markets", []):
-                parsed = self._parse_market(m)
-                if parsed:
-                    markets.append(parsed)
-            return markets
-        except Exception as exc:
-            log.error("kalshi_get_markets_failed", error=str(exc))
-            return self._mock_markets() if self.mock_mode else []
+        resp = await self._http.get(
+            f"{self._base}/markets",
+            params={"limit": limit, "status": status},
+            headers=self._sign("GET", "/trade-api/v2/markets"),
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        markets = []
+        for m in data.get("markets", []):
+            parsed = self._parse_market(m)
+            if parsed:
+                markets.append(parsed)
+        log.info("kalshi_markets_fetched", count=len(markets))
+        return markets
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=8))
     async def get_market(self, ticker: str) -> Optional[KalshiMarket]:

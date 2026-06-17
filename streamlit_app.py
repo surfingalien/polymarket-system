@@ -67,7 +67,7 @@ def _get_secret(name: str) -> str:
         return os.environ.get(name, "")
 
 
-def _run_coro_sync(coro):
+def _run_coro_sync(coro, timeout: int = 30):
     """Run an async coroutine safely from a synchronous Streamlit context."""
     result_box: list = [None]
     exc_box: list = [None]
@@ -80,9 +80,9 @@ def _run_coro_sync(coro):
 
     t = threading.Thread(target=_target, daemon=True)
     t.start()
-    t.join(timeout=30)          # fail fast — don't let the UI hang
+    t.join(timeout=timeout)
     if t.is_alive():
-        raise TimeoutError("API request timed out after 30 s — the host may be unreachable")
+        raise TimeoutError(f"API request timed out after {timeout} s — the host may be unreachable")
     if exc_box[0]:
         raise exc_box[0]
     if result_box[0] is None:
@@ -93,11 +93,12 @@ def _run_coro_sync(coro):
 def _live_ai_analysis(api_key: str, markets: list[dict]) -> dict[str, dict]:
     """Batch-call Claude AI; returns {market_id: plain_dict}."""
     agent = ClaudeAgent(api_key=api_key, model="claude-opus-4-8")
+    # Cap at 8 markets (single batch) to keep latency under 90 s timeout
     batch_input = [
         {"id": m["id"], "question": m["question"], "price": m["price"]}
-        for m in markets
+        for m in markets[:8]
     ]
-    analyses = _run_coro_sync(agent.analyze_batch(batch_input))
+    analyses = _run_coro_sync(agent.analyze_batch(batch_input), timeout=90)
     return {
         a.market_id: {
             "prob":      float(a.estimated_probability),
