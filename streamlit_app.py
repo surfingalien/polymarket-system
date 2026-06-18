@@ -635,20 +635,7 @@ with st.sidebar:
 
     # ── Bot Controls ────────────────────────────────────────────────────────
     st.markdown("**🤖 Bot Controls**")
-    _refresh_label = st.selectbox(
-        "⏱ Auto-refresh",
-        ["Off", "Every 1 min", "Every 5 min", "Every 15 min", "Every 30 min"],
-        index=0,
-        help="Run the bot 24/7 — fetches fresh data and logs paper trades "
-             "automatically on the chosen interval.",
-    )
-    st.toggle(
-        "📝 Auto-execute paper trades",
-        value=False,
-        key="auto_paper",
-        help="Bot automatically logs a paper trade for every Buy signal "
-             "that passes your confidence filter on each analysis run.",
-    )
+    st.caption("⚙️ Auto-trade and refresh controls are in the main panel ↗")
     st.divider()
     if st.button("🔄 Re-run Analysis", use_container_width=True, key="rerun_sidebar"):
         st.cache_data.clear()
@@ -829,8 +816,14 @@ c5.metric("Mode", _mode_str)
 # ── bot status row ─────────────────────────────────────────────────────────────
 _bs1, _bs2, _bs3, _bs4 = st.columns(4)
 with _bs1:
-    _at_icon = "🟢" if auto_paper else "⚫"
-    st.info(f"{_at_icon} **Auto-trade:** {'ON — bot logs paper trades' if auto_paper else 'OFF'}")
+    st.toggle(
+        "📝 Auto-execute paper trades",
+        value=False,
+        key="auto_paper",
+        help="Bot automatically logs a paper trade for every Buy signal "
+             "that passes your confidence filter on each analysis run.",
+    )
+    auto_paper = st.session_state.get("auto_paper", False)
 with _bs2:
     if _poly_pk:
         _lt_new = st.toggle(
@@ -855,7 +848,13 @@ with _bs3:
         _trade_txt += f" / 🚨 Live: {_n_l}"
     st.info(f"**Trades today:** {_trade_txt}")
 with _bs4:
-    st.info(f"⏱ **Refresh:** {_refresh_label}")
+    _refresh_label = st.selectbox(
+        "⏱ Auto-refresh",
+        ["Off", "Every 1 min", "Every 5 min", "Every 15 min", "Every 30 min"],
+        index=0,
+        help="Run the bot 24/7 — fetches fresh data and logs paper trades "
+             "automatically on the chosen interval.",
+    )
 
 # ── 24/7 auto-refresh ─────────────────────────────────────────────────────────
 _REFRESH_MAP = {"Off": None, "Every 1 min": 60, "Every 5 min": 300,
