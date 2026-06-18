@@ -874,11 +874,13 @@ _REFRESH_MAP = {"Off": None, "Every 1 min": 60, "Every 5 min": 300,
 _refresh_secs = _REFRESH_MAP.get(_refresh_label)
 
 if _refresh_secs:
-    # Guard: record the time we first set up this refresh so the fragment's
-    # initial call (during the script run) doesn't immediately trigger st.rerun()
-    # and cause an infinite loop. Only rerun when the timer has actually elapsed.
-    if "_last_auto_refresh" not in st.session_state:
-        st.session_state._last_auto_refresh = time.time()
+    # Stamp the START of every full script run unconditionally.
+    # This resets the elapsed clock so the fragment's initial call (which runs
+    # as part of the main script) always sees elapsed ≈ 0 and never triggers
+    # st.rerun() immediately — preventing the infinite-loop.
+    # The timer fires ~N seconds after the fragment is registered; by then
+    # elapsed = N >= 0.8*N and the real refresh fires correctly.
+    st.session_state._last_auto_refresh = time.time()
 
     @st.fragment(run_every=_refresh_secs)
     def _auto_refresh():
