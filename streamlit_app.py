@@ -852,6 +852,7 @@ with _bs4:
         "⏱ Auto-refresh",
         ["Off", "Every 1 min", "Every 5 min", "Every 15 min", "Every 30 min"],
         index=0,
+        key="refresh_label",
         help="Run the bot 24/7 — fetches fresh data and logs paper trades "
              "automatically on the chosen interval.",
     )
@@ -862,10 +863,20 @@ _REFRESH_MAP = {"Off": None, "Every 1 min": 60, "Every 5 min": 300,
 _refresh_secs = _REFRESH_MAP.get(_refresh_label)
 
 if _refresh_secs:
+    # Guard: record the time we first set up this refresh so the fragment's
+    # initial call (during the script run) doesn't immediately trigger st.rerun()
+    # and cause an infinite loop. Only rerun when the timer has actually elapsed.
+    if "_last_auto_refresh" not in st.session_state:
+        st.session_state._last_auto_refresh = time.time()
+
     @st.fragment(run_every=_refresh_secs)
     def _auto_refresh():
-        st.cache_data.clear()
-        st.rerun()
+        _now = time.time()
+        _last = st.session_state.get("_last_auto_refresh", _now)
+        if _now - _last >= _refresh_secs * 0.8:
+            st.session_state._last_auto_refresh = _now
+            st.cache_data.clear()
+            st.rerun()
     _auto_refresh()
 
 # ── session trades strip (always visible — no need to hunt in Execute tab) ────
