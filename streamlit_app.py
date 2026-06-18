@@ -701,11 +701,22 @@ if _eff_kalshi and not _kalshi_live:
         f"**Error:** `{_kalshi_err}`"
     )
 if _eff_anthropic and not _live_ai_mode:
-    _ai_err_msg = f"  \n**Error:** `{_ai_err}`" if _ai_err else ""
-    st.warning(
-        "**ANTHROPIC_API_KEY set but Claude AI call failed** — using mock analysis.  \n"
-        f"Check key validity at console.anthropic.com.{_ai_err_msg}"
-    )
+    _err_low = _ai_err.lower()
+    if "usage limit" in _err_low or "api usage" in _err_low:
+        import re as _re
+        _reset = (_re.search(r'(\d{4}-\d{2}-\d{2})', _ai_err) or type("", (), {"group": lambda *a: "July 1"})()).group(1)
+        st.warning(
+            f"**Anthropic API monthly limit reached** — Claude AI unavailable until **{_reset}**.  \n"
+            "Analysis is running on Bayesian + momentum signals (no AI). "
+            "Switch to **Demo mode** (toggle below) to silence this warning.",
+            icon="💳",
+        )
+    else:
+        _ai_err_msg = f"  \n**Error:** `{_ai_err}`" if _ai_err else ""
+        st.warning(
+            "**ANTHROPIC_API_KEY set but Claude AI call failed** — using mock analysis.  \n"
+            f"Check key validity at console.anthropic.com.{_ai_err_msg}"
+        )
 
 analyses = [a for a in all_analyses if a["conf"] >= min_conf or a["signal"] == "HOLD"]
 
