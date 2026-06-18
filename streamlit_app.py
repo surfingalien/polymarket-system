@@ -720,6 +720,24 @@ if _eff_anthropic and not _live_ai_mode:
 
 analyses = [a for a in all_analyses if a["conf"] >= min_conf or a["signal"] == "HOLD"]
 
+# ── P&L helpers shared between trades strip and Execute tab ───────────────────
+_price_map = {a["question"][:50]: a["price"] for a in analyses}
+
+def _trade_pnl(row: dict) -> float:
+    """Unrealised P&L in dollars for a paper trade row."""
+    ep_yes = float(row.get("entry_num") or 0)
+    if ep_yes <= 0:
+        return 0.0
+    size  = float(row.get("Size $") or 0)
+    dir_  = str(row.get("Dir", "YES"))
+    ep    = ep_yes if dir_ == "YES" else (1.0 - ep_yes)
+    if ep <= 0:
+        return 0.0
+    q       = str(row.get("Question", ""))
+    yes_now = _price_map.get(q, ep_yes)
+    cp      = yes_now if dir_ == "YES" else (1.0 - yes_now)
+    return round((size / ep) * cp - size, 2)
+
 # ── auto paper trades (bot executes on every analysis run when toggle is on) ──
 if auto_paper:
     _auto_added = 0
@@ -735,16 +753,17 @@ if auto_paper:
                for p in st.session_state.paper_ledger):
             continue
         st.session_state.paper_ledger.append({
-            "Platform": _a["platform"],
-            "Question": _a["question"][:50],
-            "Dir":      _dir,
-            "Size $":   _size,
-            "Entry":    f"{_a['price']:.0%}",
-            "AI Est.":  f"{_a['prob']:.0%}",
-            "Edge":     f"{_a['edge']:+.1%}",
-            "Conf":     f"{_a['conf']:.0%}",
-            "Time":     time.strftime("%H:%M:%S"),
-            "Mode":     "🤖 Auto",
+            "Platform":  _a["platform"],
+            "Question":  _a["question"][:50],
+            "Dir":       _dir,
+            "Size $":    _size,
+            "entry_num": _a["price"],
+            "Entry":     f"{_a['price']:.0%}",
+            "AI Est.":   f"{_a['prob']:.0%}",
+            "Edge":      f"{_a['edge']:+.1%}",
+            "Conf":      f"{_a['conf']:.0%}",
+            "Time":      time.strftime("%H:%M:%S"),
+            "Mode":      "🤖 Auto",
         })
         _auto_added += 1
     if _auto_added:
@@ -895,37 +914,58 @@ if _refresh_secs:
 # ── session trades strip (always visible — no need to hunt in Execute tab) ────
 _n_paper = len(st.session_state.paper_ledger)
 _n_live  = len(st.session_state.live_ledger)
+
+def _render_paper_ledger(key_prefix: str = "") -> None:
+    """Render paper trades table with live P&L and summary totals."""
+    if not st.session_state.paper_ledger:
+        st.caption("No paper trades yet.")
+        return
+    df = pd.DataFrame(st.session_state.paper_ledger)
+    df["P&L $"] = [_trade_pnl(r) for r in st.session_state.paper_ledger]
+    df["ROI"] = df.apply(
+        lambda r: f"{r['P&L $'] / r['Size $']:+.1%}" if r["Size $"] else "—", axis=1
+    )
+    # Display columns (hide internal entry_num)
+    _show = [c for c in ["Platform","Question","Dir","Size $","Entry","AI Est.",
+                          "Edge","Conf","Time","Mode","P&L $","ROI"] if c in df.columns]
+    total_invested = df["Size $"].sum()
+    total_pnl      = df["P&L $"].sum()
+    roi_pct        = total_pnl / total_invested if total_invested else 0
+    _p1, _p2, _p3, _p4 = st.columns(4)
+    _p1.metric("Trades",   len(df))
+    _p2.metric("Invested", f"${total_invested:.2f}")
+    _p3.metric("Total P&L", f"${total_pnl:+.2f}",
+               delta_color="normal" if total_pnl >= 0 else "inverse")
+    _p4.metric("ROI", f"{roi_pct:+.1%}",
+               delta_color="normal" if roi_pct >= 0 else "inverse")
+    st.dataframe(
+        df[_show], use_container_width=True, hide_index=True,
+        column_config={
+            "P&L $": st.column_config.NumberColumn("P&L $", format="%+.2f"),
+            "Size $": st.column_config.NumberColumn("Size $", format="$%.2f"),
+        },
+    )
+    if st.button("Clear paper trades", key=f"clear_paper_{key_prefix}"):
+        st.session_state.paper_ledger.clear()
+        st.rerun()
+
 if _n_paper + _n_live > 0:
     _badges: list[str] = []
-    if _n_paper: _badges.append(f"{_n_paper} paper trade{'s' if _n_paper != 1 else ''}")
-    if _n_live:  _badges.append(f"{_n_live} live trade{'s' if _n_live != 1 else ''} ⚠️")
+    if _n_paper:
+        _strip_pnl = sum(_trade_pnl(r) for r in st.session_state.paper_ledger)
+        _badges.append(f"{_n_paper} paper · P&L ${_strip_pnl:+.2f}")
+    if _n_live:
+        _badges.append(f"{_n_live} live ⚠️")
     with st.expander(f"📋 Today's Session — {' · '.join(_badges)}", expanded=_n_live > 0):
-        if _n_paper > 0 and _n_live > 0:
-            _tleft, _tright = st.columns(2)
-            with _tleft:
-                st.caption("📝 Paper trades (simulated, no real money)")
-                st.dataframe(pd.DataFrame(st.session_state.paper_ledger),
-                             use_container_width=True, hide_index=True)
-                if st.button("Clear paper trades", key="clear_paper_strip"):
-                    st.session_state.paper_ledger.clear()
-                    st.rerun()
-            with _tright:
-                st.caption("🚨 Live trades (real money spent)")
-                st.dataframe(pd.DataFrame(st.session_state.live_ledger),
-                             use_container_width=True, hide_index=True)
-        elif _n_paper:
-            st.caption("📝 Paper trades (simulated, no real money)")
-            st.dataframe(pd.DataFrame(st.session_state.paper_ledger),
-                         use_container_width=True, hide_index=True)
-            if st.button("Clear paper trades", key="clear_paper_strip"):
-                st.session_state.paper_ledger.clear()
-                st.rerun()
-        else:
-            st.caption("🚨 Live trades (real money spent)")
+        if _n_paper:
+            st.caption("📝 Paper trades — unrealised P&L vs current market prices")
+            _render_paper_ledger("strip")
+        if _n_live:
+            st.caption("🚨 Live orders (real money)")
             st.dataframe(pd.DataFrame(st.session_state.live_ledger),
                          use_container_width=True, hide_index=True)
 else:
-    st.info("No trades recorded yet this session. Open **🚀 Execute** to paper-trade the current signals.")
+    st.info("No trades recorded yet this session. Enable **📝 Auto-execute** above, or open **🚀 Execute** to paper-trade signals manually.")
 
 st.divider()
 
@@ -1090,12 +1130,38 @@ with t3:
             "pending_markets": 0,
         }
 
+    _resolved = summ["resolved_markets"]
+    _pending  = summ.get("pending_markets", 0)
+    if _resolved == 0:
+        _lvl, _lvl_desc = "🌱 Fresh", "At default weights — no resolved markets yet"
+        _next_milestone, _progress = 1, 0.0
+    elif _resolved < 10:
+        _lvl, _lvl_desc = "📚 Learning", "Weights beginning to drift from early outcomes"
+        _next_milestone, _progress = 10, _resolved / 10
+    elif _resolved < 50:
+        _lvl, _lvl_desc = "🧠 Trained", "Reliable signal discrimination from resolved history"
+        _next_milestone, _progress = 50, _resolved / 50
+    else:
+        _lvl, _lvl_desc = "⚡ Expert", "Highly calibrated — deep resolved market history"
+        _next_milestone, _progress = _resolved, 1.0
+    st.markdown(f"### Brain State: {_lvl}")
+    st.caption(_lvl_desc)
+    if _resolved < 50:
+        st.progress(_progress, text=f"{_resolved} / {_next_milestone} resolved markets to next level")
+    st.markdown("")
+
     b1, b2, b3, b4 = st.columns(4)
-    b1.metric("Resolved Markets", summ["resolved_markets"])
-    b2.metric("Win Rate",  f"{summ['win_rate']:.0%}" if summ["resolved_markets"] else "N/A")
-    b3.metric("Pending",   summ.get("pending_markets", 0))
+    b1.metric("Resolved Markets", _resolved)
+    b2.metric("Win Rate",  f"{summ['win_rate']:.0%}" if _resolved else "N/A")
+    b3.metric("Pending",   _pending,
+              help="Markets with open trades not yet resolved — learning queued")
     b4.metric("Avg Brier Δ",
-              f"{summ['avg_brier_improvement']:+.4f}" if summ["resolved_markets"] else "N/A")
+              f"{summ['avg_brier_improvement']:+.4f}" if _resolved else "N/A",
+              help="Positive = bot's predictions beat the naïve 50/50 baseline")
+
+    if _pending:
+        st.info(f"📬 **{_pending} trade(s) pending resolution** — weights will update "
+                "automatically when those markets resolve.")
 
     st.markdown("#### Signal Weights")
     defaults = EnsemblePredictor.DEFAULT_WEIGHTS
@@ -1127,8 +1193,13 @@ with t3:
         height=200, use_container_width=True,
     )
 
-    if not summ["resolved_markets"]:
-        st.info("No resolved markets yet — brain is at defaults. Weights evolve as trades resolve.")
+    if not _resolved:
+        st.info(
+            "🌱 **Brain is fresh** — no resolved markets yet, signal weights are at defaults.  \n"
+            "**How to start learning:** enable Auto-execute paper trades above. As those markets "
+            "resolve on Polymarket/Kalshi, the bot will score each signal and adjust weights "
+            "automatically. After ~10 resolved markets you'll see meaningful drift."
+        )
 
     with st.expander("How the learning loop works"):
         st.markdown("""
@@ -1374,6 +1445,18 @@ with t6:
         st.info("🔵 **Paper mode** — buttons below simulate fills only. "
                 "No real orders are placed.")
 
+    # ── open positions with live P&L ─────────────────────────────────────────
+    if st.session_state.paper_ledger or st.session_state.live_ledger:
+        st.markdown("### 📊 Open Positions")
+        if st.session_state.paper_ledger:
+            _render_paper_ledger("exec")
+        if st.session_state.live_ledger:
+            st.caption("🚨 Live orders")
+            _ldf = pd.DataFrame(st.session_state.live_ledger)
+            st.dataframe(_ldf, use_container_width=True, hide_index=True)
+        st.divider()
+
+    st.markdown("### 🛒 Place New Trades")
     exec_signals = [a for a in actionable if a["kelly"] > 0]
     if not exec_signals:
         st.info("No actionable BUY signals at the current confidence threshold.")
@@ -1404,10 +1487,17 @@ with t6:
                     if st.button("📝 Paper Buy", key=f"paper_{a['id']}",
                                  use_container_width=True):
                         st.session_state.paper_ledger.append({
-                            "Platform": a["platform"], "Question": a["question"][:50],
-                            "Dir": direction, "Size $": round(size, 2),
-                            "Entry": f"{a['price']:.0%}", "Edge": f"{a['edge']:+.1%}",
-                            "Time": time.strftime("%H:%M:%S"),
+                            "Platform":  a["platform"],
+                            "Question":  a["question"][:50],
+                            "Dir":       direction,
+                            "Size $":    round(size, 2),
+                            "entry_num": a["price"],
+                            "Entry":     f"{a['price']:.0%}",
+                            "AI Est.":   f"{a['prob']:.0%}",
+                            "Edge":      f"{a['edge']:+.1%}",
+                            "Conf":      f"{a['conf']:.0%}",
+                            "Time":      time.strftime("%H:%M:%S"),
+                            "Mode":      "👆 Manual",
                         })
                         st.toast(f"Paper buy recorded: {a['question'][:30]}")
 
