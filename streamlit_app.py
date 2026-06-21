@@ -619,6 +619,31 @@ if "paper_ledger" not in st.session_state:
 if "live_ledger" not in st.session_state:
     st.session_state.live_ledger = []
 
+# ── AI brain singleton — one instance per browser session, survives reruns ────
+import types as _types
+if "_brain" not in st.session_state:
+    _brain_ens = EnsemblePredictor()
+    _brain_inst = LearningEngine(_brain_ens, state_file=Path("data/learning_state.json"))
+    _brain_inst.load()
+    st.session_state._brain = _brain_inst
+
+def _to_brain_input(a: dict):
+    """Wrap an analysis dict into the duck-typed object LearningEngine expects."""
+    sigs = [
+        _types.SimpleNamespace(
+            name=s["name"], value=float(s["value"]),
+            confidence=float(s["confidence"]),
+            weight=float(s.get("weight", 1.0)),
+        )
+        for s in a.get("signals", [])
+    ]
+    return _types.SimpleNamespace(
+        market_id=a["id"],
+        signal=a["signal"],
+        market_price=float(a["price"]),
+        ensemble=_types.SimpleNamespace(signals=sigs) if sigs else None,
+    )
+
 # ── demo_mode must be initialized before data loading (used for _eff_* keys) ──
 _any_key = bool(
     _get_secret("ANTHROPIC_API_KEY") or
@@ -1014,6 +1039,7 @@ def _live_dashboard():
                 "Time":      time.strftime("%H:%M:%S"),
                 "Mode":      "🤖 Auto",
             })
+            st.session_state._brain.on_trade_placed(_to_brain_input(_a))
             _auto_added += 1
         if _auto_added:
             st.toast(
@@ -1057,6 +1083,7 @@ def _live_dashboard():
                     "Time":     time.strftime("%H:%M:%S"),
                     "Mode":     "🤖 Auto-Live",
                 })
+                st.session_state._brain.on_trade_placed(_to_brain_input(_a))
                 _live_added += 1
             except Exception as _exc:
                 st.toast(f"Auto-live order failed: {_exc}", icon="❌")
@@ -1065,6 +1092,22 @@ def _live_dashboard():
                 f"🚨 Bot auto-placed {_live_added} LIVE order{'s' if _live_added != 1 else ''} on Polymarket",
                 icon="⚡",
             )
+
+    # ── brain: detect resolutions + decay + save ──────────────────────────────
+    _brain = st.session_state._brain
+    _brain_dirty = False
+    for _ma in all_analyses:
+        _mid = _ma["id"]
+        if _mid in _brain._memories and _brain._memories[_mid].resolved_outcome is None:
+            if _ma["price"] >= 0.99:
+                _brain.on_market_resolved(_mid, 1.0)
+                _brain_dirty = True
+            elif _ma["price"] <= 0.01:
+                _brain.on_market_resolved(_mid, 0.0)
+                _brain_dirty = True
+    _brain.apply_decay()
+    if _brain_dirty or _is_timer:
+        _brain.save()
 
     # ── markets filter guard ───────────────────────────────────────────────────
     if not analyses:
@@ -1257,10 +1300,7 @@ def _live_dashboard():
         )
 
         try:
-            _ens = EnsemblePredictor()
-            _eng = LearningEngine(_ens, state_file=Path("data/learning_state.json"))
-            _eng.load()
-            summ = _eng.performance_summary()
+            summ = st.session_state._brain.performance_summary()
         except Exception:
             summ = {
                 "resolved_markets": 0, "win_rate": 0.0,
@@ -1691,6 +1731,7 @@ Then **Reboot app**. The brain will immediately start persisting after the next 
                                 "Time":      time.strftime("%H:%M:%S"),
                                 "Mode":      "👆 Manual",
                             })
+                            st.session_state._brain.on_trade_placed(_to_brain_input(a))
                             st.toast(f"Paper buy recorded: {a['question'][:30]}")
 
                         # Live execution — heavily gated
@@ -1718,13 +1759,20 @@ Then **Reboot app**. The brain will immediately start persisting after the next 
                                                 funder=_poly_funder,
                                             )
                                         st.session_state.live_ledger.append({
-                                            "Platform": a["platform"],
-                                            "Question": a["question"][:50],
-                                            "Dir": direction, "Size $": round(size, 2),
-                                            "Order ID": res["order_id"],
-                                            "Status": res["status"],
-                                            "Time": time.strftime("%H:%M:%S"),
+                                            "Platform":  a["platform"],
+                                            "Question":  a["question"][:50],
+                                            "Dir":       direction,
+                                            "Size $":    round(size, 2),
+                                            "entry_num": a["price"],
+                                            "Entry":     f"{a['price']:.0%}",
+                                            "AI Est.":   f"{a['prob']:.0%}",
+                                            "Edge":      f"{a['edge']:+.1%}",
+                                            "Order ID":  res["order_id"],
+                                            "Status":    res["status"],
+                                            "Time":      time.strftime("%H:%M:%S"),
+                                            "Mode":      "👆 Manual-Live",
                                         })
+                                        st.session_state._brain.on_trade_placed(_to_brain_input(a))
                                         st.success(f"Order posted: {res['order_id']} "
                                                    f"({res['status']})")
                                     except SigningUnavailable as exc:
