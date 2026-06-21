@@ -651,7 +651,13 @@ with st.sidebar:
             st.caption("ℹ️ Reboot the app after saving secrets (Manage app → Reboot)")
     st.caption("Live connection status is shown in the main panel →")
     st.divider()
-    budget   = st.number_input("Paper budget ($)", value=100.0, min_value=10.0, step=10.0, key="sidebar_budget")
+    st.markdown("**💰 Trade Sizing**")
+    poly_budget   = st.number_input("Polymarket ($)", value=10.0, min_value=1.0, step=5.0,
+                                    key="poly_budget", help="Max $ per Polymarket trade")
+    kalshi_budget = st.number_input("Kalshi ($)",      value=10.0, min_value=1.0, step=5.0,
+                                    key="kalshi_budget", help="Max $ per Kalshi trade")
+    budget = poly_budget + kalshi_budget   # total for portfolio/Kelly calculations
+    st.caption(f"Total budget: **${budget:.0f}**")
     min_conf = st.slider("Min confidence", 0.40, 0.90, 0.55, 0.05, key="sidebar_min_conf")
     st.divider()
 
@@ -724,10 +730,10 @@ with _bar3:
         st.rerun()
 
 # ── bot status row (outside fragment — toggles must survive timer refresh) ─────
-_bs1, _bs2, _bs3, _bs4 = st.columns(4)
+_bs1, _bs2, _bs3, _bs4, _bs5 = st.columns(5)
 with _bs1:
     st.toggle(
-        "📝 Auto-execute paper trades",
+        "📝 Auto paper trades",
         value=False,
         key="auto_paper",
         help="Bot automatically logs a paper trade for every Buy signal "
@@ -740,28 +746,42 @@ with _bs2:
             value=st.session_state.get("live_trading", False),
             key="live_trading",
             help="Switch from Paper to real-money execution on Polymarket. "
-                 "Start with $5–$10. Both bots default mock_mode=true — never "
+                 "Start with $10. Both bots default mock_mode=true — never "
                  "enable without weeks of mock testing and verified API connections.",
         )
         if st.session_state.get("live_trading", False):
-            st.error("LIVE MODE — real funds at risk!", icon="🚨")
+            st.error("LIVE MODE ON", icon="🚨")
     else:
-        st.info("📝 **Paper mode** — add POLYMARKET_PRIVATE_KEY for live")
+        st.caption("📝 Paper only\n(add wallet key for live)")
 with _bs3:
+    _live_on = st.session_state.get("live_trading", False)
+    if _poly_pk and _live_on:
+        st.toggle(
+            "🤖 Auto-execute LIVE",
+            value=False,
+            key="auto_live",
+            help="Bot auto-places REAL Polymarket orders on every refresh cycle. "
+                 "Uses the Polymarket budget set in the sidebar.",
+        )
+        if st.session_state.get("auto_live", False):
+            st.error("Auto-LIVE ON", icon="⚡")
+    else:
+        st.caption("Enable Live trading\nto unlock auto-live")
+with _bs4:
     _n_p_outer = len(st.session_state.paper_ledger)
     _n_l_outer = len(st.session_state.live_ledger)
     _trade_txt = f"📋 Paper: {_n_p_outer}"
     if _n_l_outer:
-        _trade_txt += f" / 🚨 Live: {_n_l_outer}"
-    st.info(f"**Trades today:** {_trade_txt}")
-with _bs4:
+        _trade_txt += f" · 🚨 Live: {_n_l_outer}"
+    st.info(f"**Trades:** {_trade_txt}")
+with _bs5:
     st.selectbox(
         "⏱ Auto-refresh",
         ["Off", "Every 1 min", "Every 5 min", "Every 15 min", "Every 30 min"],
         index=0,
         key="refresh_label",
-        help="Run the bot 24/7 — fetches fresh data and logs paper trades "
-             "automatically on the chosen interval.",
+        help="Run the bot 24/7 — fetches fresh data and auto-executes trades "
+             "on the chosen interval.",
     )
 
 # ── refresh interval computation (outside fragment — drives run_every param) ──
@@ -780,7 +800,10 @@ def _live_dashboard():
     _dm    = st.session_state.get("demo_mode", True)
     _ap    = st.session_state.get("auto_paper", False)
     _lt    = st.session_state.get("live_trading", False)
-    budget = st.session_state.get("sidebar_budget", 100.0)
+    _al    = st.session_state.get("auto_live", False)
+    poly_budget   = st.session_state.get("poly_budget",   10.0)
+    kalshi_budget = st.session_state.get("kalshi_budget", 10.0)
+    budget        = poly_budget + kalshi_budget
     min_conf = st.session_state.get("sidebar_min_conf", 0.55)
 
     # Clear cache when this is a timer-fired re-execution (not the initial load)
@@ -806,26 +829,33 @@ def _live_dashboard():
         return
 
     # ── connection status chips ────────────────────────────────────────────────
-    _CHIP = ("display:inline-block;border-radius:20px;padding:4px 16px;"
-             "font-size:.82rem;font-weight:600;margin:2px 6px 2px 0;"
-             "border:1px solid;white-space:nowrap;")
+    if _dm:
+        st.info(
+            "🔵 **Demo mode** — all APIs intentionally bypassed, using simulated data. "
+            "Turn off the **Demo mode** toggle above to connect real APIs.",
+            icon="ℹ️",
+        )
+    else:
+        _CHIP = ("display:inline-block;border-radius:20px;padding:4px 16px;"
+                 "font-size:.82rem;font-weight:600;margin:2px 6px 2px 0;"
+                 "border:1px solid;white-space:nowrap;")
 
-    def _conn_chip(connected: bool, has_key: bool, label: str) -> str:
-        if connected:
-            s = "background:#052e16;color:#00d26a;border-color:#00d26a;"
-            return f'<span style="{_CHIP}{s}">🟢 {label} live</span>'
-        if has_key:
-            s = "background:#422006;color:#fb923c;border-color:#fb923c;"
-            return f'<span style="{_CHIP}{s}">🟡 {label} — key set, connection failed</span>'
-        s = "background:#0f172a;color:#64748b;border-color:#334155;"
-        return f'<span style="{_CHIP}{s}">⚫ {label} mock</span>'
+        def _conn_chip(connected: bool, has_key: bool, label: str) -> str:
+            if connected:
+                s = "background:#052e16;color:#00d26a;border-color:#00d26a;"
+                return f'<span style="{_CHIP}{s}">🟢 {label} live</span>'
+            if has_key:
+                s = "background:#422006;color:#fb923c;border-color:#fb923c;"
+                return f'<span style="{_CHIP}{s}">🟡 {label} — key set, connection failed</span>'
+            s = "background:#0f172a;color:#64748b;border-color:#334155;"
+            return f'<span style="{_CHIP}{s}">⚫ {label} — no API key</span>'
 
-    _chips = "".join([
-        _conn_chip(_live_ai_mode, bool(_anthropic_key), "Claude AI"),
-        _conn_chip(_poly_live,    bool(_poly_key),       "Polymarket"),
-        _conn_chip(_kalshi_live,  bool(_kalshi_key and _kalshi_pem), "Kalshi"),
-    ])
-    st.markdown(f'<div style="padding:4px 0 10px">{_chips}</div>', unsafe_allow_html=True)
+        _chips = "".join([
+            _conn_chip(_live_ai_mode, bool(_anthropic_key), "Claude AI"),
+            _conn_chip(_poly_live,    bool(_poly_key),       "Polymarket"),
+            _conn_chip(_kalshi_live,  bool(_kalshi_key and _kalshi_pem), "Kalshi"),
+        ])
+        st.markdown(f'<div style="padding:4px 0 10px">{_chips}</div>', unsafe_allow_html=True)
 
     # ── API / connection warnings ──────────────────────────────────────────────
     if _eff_poly and not _poly_live:
@@ -877,38 +907,85 @@ def _live_dashboard():
         cp      = yes_now if dir_ == "YES" else (1.0 - yes_now)
         return round((size / ep) * cp - size, 2)
 
-    def _render_paper_ledger(key_prefix: str = "") -> None:
-        """Render paper trades table with live P&L and summary totals."""
-        if not st.session_state.paper_ledger:
-            st.caption("No paper trades yet.")
+    def _render_order_book(key_prefix: str = "") -> None:
+        """Render unified order book: paper + live positions with live P&L."""
+        paper = st.session_state.paper_ledger
+        live  = st.session_state.live_ledger
+        if not paper and not live:
+            st.caption("No trades recorded yet.")
             return
-        df = pd.DataFrame(st.session_state.paper_ledger)
-        df["P&L $"] = [_trade_pnl(r) for r in st.session_state.paper_ledger]
-        df["ROI"] = df.apply(
-            lambda r: f"{r['P&L $'] / r['Size $']:+.1%}" if r["Size $"] else "—", axis=1
-        )
-        _show = [c for c in ["Platform","Question","Dir","Size $","Entry","AI Est.",
-                              "Edge","Conf","Time","Mode","P&L $","ROI"] if c in df.columns]
-        total_invested = df["Size $"].sum()
-        total_pnl      = df["P&L $"].sum()
-        roi_pct        = total_pnl / total_invested if total_invested else 0
-        _p1, _p2, _p3, _p4 = st.columns(4)
-        _p1.metric("Trades",   len(df))
-        _p2.metric("Invested", f"${total_invested:.2f}")
-        _p3.metric("Total P&L", f"${total_pnl:+.2f}",
-                   delta_color="normal" if total_pnl >= 0 else "inverse")
-        _p4.metric("ROI", f"{roi_pct:+.1%}",
-                   delta_color="normal" if roi_pct >= 0 else "inverse")
-        st.dataframe(
-            df[_show], use_container_width=True, hide_index=True,
-            column_config={
-                "P&L $": st.column_config.NumberColumn("P&L $", format="%+.2f"),
-                "Size $": st.column_config.NumberColumn("Size $", format="$%.2f"),
-            },
-        )
-        if st.button("Clear paper trades", key=f"clear_paper_{key_prefix}"):
-            st.session_state.paper_ledger.clear()
-            st.rerun()
+
+        # ── summary metrics ───────────────────────────────────────────────────
+        _p_invested = sum(float(r.get("Size $", 0)) for r in paper)
+        _p_pnl      = sum(_trade_pnl(r) for r in paper)
+        _l_invested = sum(float(r.get("Size $", 0)) for r in live)
+        _l_pnl      = sum(_trade_pnl(r) for r in live)
+        _tot_inv    = _p_invested + _l_invested
+        _tot_pnl    = _p_pnl + _l_pnl
+        _roi        = _tot_pnl / _tot_inv if _tot_inv else 0.0
+
+        _m1, _m2, _m3, _m4, _m5 = st.columns(5)
+        _m1.metric("Paper trades",  len(paper))
+        _m2.metric("Live orders",   len(live))
+        _m3.metric("Total invested", f"${_tot_inv:.2f}")
+        _m4.metric("Total P&L",     f"${_tot_pnl:+.2f}",
+                   delta_color="normal" if _tot_pnl >= 0 else "inverse")
+        _m5.metric("ROI",           f"{_roi:+.1%}",
+                   delta_color="normal" if _roi >= 0 else "inverse")
+
+        # ── paper positions ───────────────────────────────────────────────────
+        if paper:
+            st.markdown("**📝 Paper Positions**")
+            df_p = pd.DataFrame(paper)
+            df_p["P&L $"]    = [_trade_pnl(r) for r in paper]
+            df_p["Current %"] = df_p.apply(
+                lambda r: f"{_price_map.get(str(r.get('Question','')), float(r.get('entry_num',0))):.0%}",
+                axis=1,
+            )
+            df_p["ROI"] = df_p.apply(
+                lambda r: f"{r['P&L $'] / r['Size $']:+.1%}" if r["Size $"] else "—", axis=1
+            )
+            _show_p = [c for c in ["Platform","Question","Dir","Size $","Entry",
+                                    "Current %","AI Est.","Edge","P&L $","ROI","Time","Mode"]
+                       if c in df_p.columns]
+            st.dataframe(
+                df_p[_show_p], use_container_width=True, hide_index=True,
+                column_config={
+                    "P&L $":  st.column_config.NumberColumn("P&L $", format="%+.2f"),
+                    "Size $": st.column_config.NumberColumn("Size $", format="$%.2f"),
+                },
+            )
+            if st.button("Clear paper trades", key=f"clear_paper_{key_prefix}"):
+                st.session_state.paper_ledger.clear()
+                st.rerun()
+
+        # ── live positions ────────────────────────────────────────────────────
+        if live:
+            st.markdown("**🚨 Live Orders (real money)**")
+            df_l = pd.DataFrame(live)
+            if "entry_num" in df_l.columns:
+                df_l["P&L $"] = [_trade_pnl(r) for r in live]
+                df_l["Current %"] = df_l.apply(
+                    lambda r: f"{_price_map.get(str(r.get('Question','')), float(r.get('entry_num',0))):.0%}",
+                    axis=1,
+                )
+            _show_l = [c for c in ["Platform","Question","Dir","Size $","Entry",
+                                    "Current %","P&L $","Order ID","Status","Time","Mode"]
+                       if c in df_l.columns]
+            st.dataframe(
+                df_l[_show_l], use_container_width=True, hide_index=True,
+                column_config={
+                    "P&L $":  st.column_config.NumberColumn("P&L $", format="%+.2f"),
+                    "Size $": st.column_config.NumberColumn("Size $", format="$%.2f"),
+                },
+            )
+            if st.button("Clear live ledger", key=f"clear_live_{key_prefix}"):
+                st.session_state.live_ledger.clear()
+                st.rerun()
+
+    def _render_paper_ledger(key_prefix: str = "") -> None:
+        """Backwards-compat wrapper — renders the full order book."""
+        _render_order_book(key_prefix)
 
     # ── auto paper trades ─────────────────────────────────────────────────────
     if _ap:
@@ -916,7 +993,8 @@ def _live_dashboard():
         for _a in analyses:
             if _a["signal"] == "HOLD" or _a["kelly"] <= 0:
                 continue
-            _size = round(min(float(budget) * _a["kelly"], float(budget) * 0.15), 2)
+            _plat_budget = poly_budget if _a["platform"] == "Polymarket" else kalshi_budget
+            _size = round(min(float(_plat_budget) * _a["kelly"], float(_plat_budget) * 0.15), 2)
             if _size < 1.0:
                 continue
             _dir = "YES" if _a["signal"] == "BUY_YES" else "NO"
@@ -941,6 +1019,51 @@ def _live_dashboard():
             st.toast(
                 f"🤖 Bot auto-executed {_auto_added} paper trade{'s' if _auto_added != 1 else ''}",
                 icon="📝",
+            )
+
+    # ── auto LIVE trades (Polymarket only — gated behind live_trading toggle) ──
+    if _al and _lt and _poly_pk and not _dm:
+        _live_added = 0
+        for _a in analyses:
+            if _a["signal"] == "HOLD" or _a["kelly"] <= 0 or _a["platform"] != "Polymarket":
+                continue
+            _tok = _a.get("yes_token_id") if _a["signal"] == "BUY_YES" else _a.get("no_token_id")
+            if not _tok:
+                continue
+            _size = round(min(float(poly_budget) * _a["kelly"], float(poly_budget) * 0.15), 2)
+            if _size < 1.0:
+                continue
+            _dir = "YES" if _a["signal"] == "BUY_YES" else "NO"
+            if any(l.get("Question", "")[:40] == _a["question"][:40] and l.get("Dir") == _dir
+                   for l in st.session_state.live_ledger):
+                continue
+            try:
+                _res = _execute_live_polymarket_order(
+                    token_id=_tok, price=_a["price"], size_usd=_size,
+                    side="BUY", private_key=_poly_pk,
+                    sig_type=_poly_sig_type, funder=_poly_funder,
+                )
+                st.session_state.live_ledger.append({
+                    "Platform": "Polymarket",
+                    "Question": _a["question"][:50],
+                    "Dir":      _dir,
+                    "Size $":   round(_size, 2),
+                    "entry_num": _a["price"],
+                    "Entry":    f"{_a['price']:.0%}",
+                    "AI Est.":  f"{_a['prob']:.0%}",
+                    "Edge":     f"{_a['edge']:+.1%}",
+                    "Order ID": _res["order_id"],
+                    "Status":   _res["status"],
+                    "Time":     time.strftime("%H:%M:%S"),
+                    "Mode":     "🤖 Auto-Live",
+                })
+                _live_added += 1
+            except Exception as _exc:
+                st.toast(f"Auto-live order failed: {_exc}", icon="❌")
+        if _live_added:
+            st.toast(
+                f"🚨 Bot auto-placed {_live_added} LIVE order{'s' if _live_added != 1 else ''} on Polymarket",
+                icon="⚡",
             )
 
     # ── markets filter guard ───────────────────────────────────────────────────
@@ -968,27 +1091,22 @@ def _live_dashboard():
     # ── live trading warning (inside fragment so it reflects current toggle) ──
     live_trading = _lt
 
-    # ── session trades strip ──────────────────────────────────────────────────
+    # ── session trades strip / order book ─────────────────────────────────────
     _n_paper = len(st.session_state.paper_ledger)
     _n_live  = len(st.session_state.live_ledger)
 
     if _n_paper + _n_live > 0:
-        _badges: list[str] = []
-        if _n_paper:
-            _strip_pnl = sum(_trade_pnl(r) for r in st.session_state.paper_ledger)
-            _badges.append(f"{_n_paper} paper · P&L ${_strip_pnl:+.2f}")
+        _strip_pnl_p = sum(_trade_pnl(r) for r in st.session_state.paper_ledger)
+        _strip_pnl_l = sum(_trade_pnl(r) for r in st.session_state.live_ledger)
+        _strip_total_pnl = _strip_pnl_p + _strip_pnl_l
+        _badge = f"📋 Order Book & P&L — {_n_paper} paper"
         if _n_live:
-            _badges.append(f"{_n_live} live ⚠️")
-        with st.expander(f"📋 Today's Session — {' · '.join(_badges)}", expanded=_n_live > 0):
-            if _n_paper:
-                st.caption("📝 Paper trades — unrealised P&L vs current market prices")
-                _render_paper_ledger("strip")
-            if _n_live:
-                st.caption("🚨 Live orders (real money)")
-                st.dataframe(pd.DataFrame(st.session_state.live_ledger),
-                             use_container_width=True, hide_index=True)
+            _badge += f" · {_n_live} live 🚨"
+        _badge += f" · Total P&L ${_strip_total_pnl:+.2f}"
+        with st.expander(_badge, expanded=_n_live > 0):
+            _render_order_book("strip")
     else:
-        st.info("No trades recorded yet this session. Enable **📝 Auto-execute** above, or open **🚀 Execute** to paper-trade signals manually.")
+        st.info("No trades recorded yet. Enable **📝 Auto paper** above to start, or use **🚀 Execute** to place trades manually.")
 
     st.divider()
 
@@ -1524,16 +1642,10 @@ Then **Reboot app**. The brain will immediately start persisting after the next 
             st.info("🔵 **Paper mode** — buttons below simulate fills only. "
                     "No real orders are placed.")
 
-        # ── open positions with live P&L ─────────────────────────────────────
-        if st.session_state.paper_ledger or st.session_state.live_ledger:
-            st.markdown("### 📊 Open Positions")
-            if st.session_state.paper_ledger:
-                _render_paper_ledger("exec")
-            if st.session_state.live_ledger:
-                st.caption("🚨 Live orders")
-                _ldf = pd.DataFrame(st.session_state.live_ledger)
-                st.dataframe(_ldf, use_container_width=True, hide_index=True)
-            st.divider()
+        # ── order book with live P&L ──────────────────────────────────────────
+        st.markdown("### 📊 Order Book & P&L")
+        _render_order_book("exec")
+        st.divider()
 
         st.markdown("### 🛒 Place New Trades")
         exec_signals = [a for a in actionable if a["kelly"] > 0]
@@ -1541,10 +1653,11 @@ Then **Reboot app**. The brain will immediately start persisting after the next 
             st.info("No actionable BUY signals at the current confidence threshold.")
         else:
             st.caption(f"{len(exec_signals)} actionable signal(s). "
-                       "Suggested size = Kelly fraction × budget (capped at 15%).")
+                       "Size = Kelly fraction × platform budget (capped at 15%).")
 
             for a in sorted(exec_signals, key=lambda x: -abs(x["edge"])):
-                size = float(min(budget * a["kelly"], budget * 0.15))
+                _pb = poly_budget if a["platform"] == "Polymarket" else kalshi_budget
+                size = float(min(_pb * a["kelly"], _pb * 0.15))
                 direction = "YES" if a["signal"] == "BUY_YES" else "NO"
                 is_poly = a["platform"] == "Polymarket"
                 token_id = a["yes_token_id"] if direction == "YES" else a["no_token_id"]
