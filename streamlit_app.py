@@ -628,6 +628,10 @@ _any_key = bool(
 if "demo_mode" not in st.session_state:
     st.session_state.demo_mode = not _any_key
 
+# Stamp the start of every full script run so the fragment can detect timer-fires
+import time as _time_mod
+st.session_state._last_full_run = _time_mod.time()
+
 with st.sidebar:
     st.title("🤖 Polymarket AI Bot")
     st.markdown("**API Keys**")
@@ -647,8 +651,8 @@ with st.sidebar:
             st.caption("ℹ️ Reboot the app after saving secrets (Manage app → Reboot)")
     st.caption("Live connection status is shown in the main panel →")
     st.divider()
-    budget   = st.number_input("Paper budget ($)", value=100.0, min_value=10.0, step=10.0)
-    min_conf = st.slider("Min confidence", 0.40, 0.90, 0.55, 0.05)
+    budget   = st.number_input("Paper budget ($)", value=100.0, min_value=10.0, step=10.0, key="sidebar_budget")
+    min_conf = st.slider("Min confidence", 0.40, 0.90, 0.55, 0.05, key="sidebar_min_conf")
     st.divider()
 
     # ── Bot Controls ────────────────────────────────────────────────────────
