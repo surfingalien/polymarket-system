@@ -401,6 +401,27 @@ button[data-baseweb="tab"] { font-weight:600; }
 
 /* Rounder dataframes */
 div[data-testid="stDataFrame"] { border-radius:10px; overflow:hidden; }
+
+/* Sidebar toggle: always visible, branded colour, easy to click */
+button[data-testid="stSidebarCollapsedControl"],
+section[data-testid="stSidebarCollapsedControl"] {
+    background: #6366f1 !important;
+    border-radius: 0 10px 10px 0 !important;
+    width: 28px !important;
+    min-height: 56px !important;
+    opacity: 1 !important;
+    box-shadow: 2px 0 8px rgba(99,102,241,.45) !important;
+}
+button[data-testid="stSidebarCollapsedControl"]:hover,
+section[data-testid="stSidebarCollapsedControl"]:hover {
+    background: #4f46e5 !important;
+    box-shadow: 2px 0 14px rgba(99,102,241,.7) !important;
+}
+button[data-testid="stSidebarCollapsedControl"] svg,
+section[data-testid="stSidebarCollapsedControl"] svg {
+    fill: #fff !important;
+    stroke: #fff !important;
+}
 </style>
 """, unsafe_allow_html=True)
 
