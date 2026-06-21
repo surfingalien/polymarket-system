@@ -606,6 +606,13 @@ _kalshi_pem      = _get_secret("KALSHI_PRIVATE_KEY_PEM")
 _poly_pk         = _get_secret("POLYMARKET_PRIVATE_KEY")
 _poly_sig_type   = int(_get_secret("POLYMARKET_SIGNATURE_TYPE") or 0)
 _poly_funder     = _get_secret("POLYMARKET_FUNDER")
+_supabase_url    = _get_secret("SUPABASE_URL")
+_supabase_key    = _get_secret("SUPABASE_KEY")
+
+# Inject Supabase creds as env vars so shared/cloud_store.py (no streamlit import) can reach them
+import os as _os
+if _supabase_url: _os.environ["SUPABASE_URL"] = _supabase_url
+if _supabase_key: _os.environ["SUPABASE_KEY"] = _supabase_key
 
 if "paper_ledger" not in st.session_state:
     st.session_state.paper_ledger = []
@@ -627,6 +634,7 @@ with st.sidebar:
     st.markdown("✅ Anthropic key set" if _anthropic_key  else "⚪ No Anthropic key → mock AI")
     st.markdown("✅ Polymarket key set" if _poly_key       else "⚪ No Polymarket key → mock data")
     st.markdown("✅ Kalshi keys set"    if (_kalshi_key and _kalshi_pem) else "⚪ No Kalshi keys → mock data")
+    st.markdown("✅ Supabase connected" if (_supabase_url and _supabase_key) else "⚪ No Supabase → brain resets on restart")
     st.caption("Live connection status is shown in the main panel →")
     st.divider()
     budget   = st.number_input("Paper budget ($)", value=100.0, min_value=10.0, step=10.0)
@@ -660,6 +668,8 @@ with st.sidebar:
         "POLYMARKET_API_KEY": _poly_key,
         "KALSHI_API_KEY": _kalshi_key,
         "KALSHI_PRIVATE_KEY_PEM": _kalshi_pem,
+        "SUPABASE_URL": _supabase_url,
+        "SUPABASE_KEY": _supabase_key,
     }.items() if not v]
     if _missing:
         st.divider()
@@ -1200,6 +1210,51 @@ with t3:
             "resolve on Polymarket/Kalshi, the bot will score each signal and adjust weights "
             "automatically. After ~10 resolved markets you'll see meaningful drift."
         )
+
+    # ── cloud persistence status ──────────────────────────────────────────────
+    from shared.cloud_store import is_available as _cloud_ok
+    if _cloud_ok():
+        st.success("☁️ **Supabase connected** — brain state persists across restarts and deploys.",
+                   icon="✅")
+    else:
+        st.warning(
+            "☁️ **No Supabase** — brain resets to defaults every time Streamlit Cloud restarts.  \n"
+            "Add `SUPABASE_URL` and `SUPABASE_KEY` to your secrets to enable persistent learning.",
+            icon="💾",
+        )
+        with st.expander("🛠 How to set up Supabase persistence (free, 5 min)"):
+            st.markdown("""
+**Step 1 — Create a free Supabase project**
+1. Go to [supabase.com](https://supabase.com) → New project (free tier is fine)
+2. Choose a region close to you, set a DB password
+
+**Step 2 — Create the `bot_state` table**
+
+Open **SQL Editor** in your Supabase dashboard and run:
+```sql
+CREATE TABLE bot_state (
+    key        TEXT PRIMARY KEY,
+    value      JSONB NOT NULL,
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+ALTER TABLE bot_state DISABLE ROW LEVEL SECURITY;
+```
+
+**Step 3 — Copy your credentials**
+
+In Supabase → **Project Settings → API**:
+- `SUPABASE_URL` = **Project URL** (e.g. `https://xxxx.supabase.co`)
+- `SUPABASE_KEY` = **service_role** secret key (not the anon key)
+
+**Step 4 — Add to Streamlit secrets**
+
+In your Streamlit Cloud app → **Settings → Secrets**:
+```toml
+SUPABASE_URL = "https://xxxx.supabase.co"
+SUPABASE_KEY = "your-service-role-key"
+```
+Then **Reboot app**. The brain will immediately start persisting after the next resolved market.
+""")
 
     with st.expander("How the learning loop works"):
         st.markdown("""

@@ -207,7 +207,7 @@ class LearningEngine:
     # ------------------------------------------------------------------
 
     def save(self) -> None:
-        """Write current weights and trade memories to disk."""
+        """Write current weights and trade memories to disk and cloud (if configured)."""
         self._state_file.parent.mkdir(parents=True, exist_ok=True)
         cutoff = time.time() - _MEMORY_TTL_DAYS * 86400
         state = {
@@ -240,60 +240,80 @@ class LearningEngine:
         self._state_file.write_text(json.dumps(state, indent=2))
         log.info("learning_state_saved", file=str(self._state_file),
                  resolved=self._resolved_count)
+        # Mirror to cloud (best-effort — never blocks or raises)
+        try:
+            from .cloud_store import cloud_save
+            cloud_save("learning_state", state)
+        except Exception:
+            pass
+
+    def _load_from_dict(self, state: dict) -> None:
+        """Apply a state dict (from disk or cloud) to this engine instance."""
+        for name, w in state.get("weights", {}).items():
+            if name in self._ensemble._weights:
+                self._ensemble._weights[name] = max(
+                    _MIN_WEIGHT, min(_MAX_WEIGHT, float(w))
+                )
+        self._resolved_count = int(state.get("resolved_count", 0))
+        self._cumulative_brier_improvement = float(
+            state.get("cumulative_brier_improvement", 0.0)
+        )
+        for mid, m_data in state.get("memories", {}).items():
+            signals = [
+                SignalSnapshot(
+                    name=s["name"],
+                    value=s["value"],
+                    confidence=s["confidence"],
+                    weight_at_trade=s["weight_at_trade"],
+                )
+                for s in m_data.get("signals", [])
+            ]
+            self._memories[mid] = TradeMemory(
+                market_id=m_data["market_id"],
+                direction=m_data["direction"],
+                market_price_at_trade=m_data["market_price_at_trade"],
+                placed_at=m_data["placed_at"],
+                signals=signals,
+                resolved_outcome=m_data.get("resolved_outcome"),
+                pnl_sign=m_data.get("pnl_sign", 0.0),
+            )
 
     def load(self) -> bool:
         """
-        Restore weights and memories from disk.
+        Restore weights and memories.
 
-        Returns True if a state file was found and loaded, False otherwise.
+        Priority: local file → Supabase cloud → defaults.
+        Returns True if any state was restored.
         """
-        if not self._state_file.exists():
-            log.info("no_learning_state_found", file=str(self._state_file))
-            return False
+        if self._state_file.exists():
+            try:
+                state = json.loads(self._state_file.read_text())
+                self._load_from_dict(state)
+                log.info("learning_state_loaded_from_file",
+                         resolved=self._resolved_count,
+                         memories=len(self._memories))
+                return True
+            except Exception as exc:
+                log.warning("learning_state_load_failed", error=str(exc))
+
+        # Fall back to Supabase if local file missing (e.g. after Streamlit Cloud restart)
         try:
-            state = json.loads(self._state_file.read_text())
-
-            for name, w in state.get("weights", {}).items():
-                if name in self._ensemble._weights:
-                    self._ensemble._weights[name] = max(
-                        _MIN_WEIGHT, min(_MAX_WEIGHT, float(w))
-                    )
-
-            self._resolved_count = int(state.get("resolved_count", 0))
-            self._cumulative_brier_improvement = float(
-                state.get("cumulative_brier_improvement", 0.0)
-            )
-
-            for mid, m_data in state.get("memories", {}).items():
-                signals = [
-                    SignalSnapshot(
-                        name=s["name"],
-                        value=s["value"],
-                        confidence=s["confidence"],
-                        weight_at_trade=s["weight_at_trade"],
-                    )
-                    for s in m_data.get("signals", [])
-                ]
-                self._memories[mid] = TradeMemory(
-                    market_id=m_data["market_id"],
-                    direction=m_data["direction"],
-                    market_price_at_trade=m_data["market_price_at_trade"],
-                    placed_at=m_data["placed_at"],
-                    signals=signals,
-                    resolved_outcome=m_data.get("resolved_outcome"),
-                    pnl_sign=m_data.get("pnl_sign", 0.0),
-                )
-
-            log.info(
-                "learning_state_loaded",
-                resolved=self._resolved_count,
-                memories=len(self._memories),
-                weights=dict(self._ensemble._weights),
-            )
-            return True
+            from .cloud_store import cloud_load
+            state = cloud_load("learning_state")
+            if state:
+                self._load_from_dict(state)
+                # Write back to local file so subsequent loads are fast
+                self._state_file.parent.mkdir(parents=True, exist_ok=True)
+                self._state_file.write_text(json.dumps(state, indent=2))
+                log.info("learning_state_loaded_from_cloud",
+                         resolved=self._resolved_count,
+                         memories=len(self._memories))
+                return True
         except Exception as exc:
-            log.warning("learning_state_load_failed", error=str(exc))
-            return False
+            log.warning("cloud_load_error", error=str(exc))
+
+        log.info("no_learning_state_found", file=str(self._state_file))
+        return False
 
     # ------------------------------------------------------------------
     # Dashboard / reporting
