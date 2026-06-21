@@ -606,11 +606,43 @@ _kalshi_pem      = _get_secret("KALSHI_PRIVATE_KEY_PEM")
 _poly_pk         = _get_secret("POLYMARKET_PRIVATE_KEY")
 _poly_sig_type   = int(_get_secret("POLYMARKET_SIGNATURE_TYPE") or 0)
 _poly_funder     = _get_secret("POLYMARKET_FUNDER")
+_supabase_url    = _get_secret("SUPABASE_URL")
+_supabase_key    = _get_secret("SUPABASE_KEY")
+
+# Inject Supabase creds as env vars so shared/cloud_store.py (no streamlit import) can reach them
+import os as _os
+if _supabase_url: _os.environ["SUPABASE_URL"] = _supabase_url
+if _supabase_key: _os.environ["SUPABASE_KEY"] = _supabase_key
 
 if "paper_ledger" not in st.session_state:
     st.session_state.paper_ledger = []
 if "live_ledger" not in st.session_state:
     st.session_state.live_ledger = []
+
+# ── AI brain singleton — one instance per browser session, survives reruns ────
+import types as _types
+if "_brain" not in st.session_state:
+    _brain_ens = EnsemblePredictor()
+    _brain_inst = LearningEngine(_brain_ens, state_file=Path("data/learning_state.json"))
+    _brain_inst.load()
+    st.session_state._brain = _brain_inst
+
+def _to_brain_input(a: dict):
+    """Wrap an analysis dict into the duck-typed object LearningEngine expects."""
+    sigs = [
+        _types.SimpleNamespace(
+            name=s["name"], value=float(s["value"]),
+            confidence=float(s["confidence"]),
+            weight=float(s.get("weight", 1.0)),
+        )
+        for s in a.get("signals", [])
+    ]
+    return _types.SimpleNamespace(
+        market_id=a["id"],
+        signal=a["signal"],
+        market_price=float(a["price"]),
+        ensemble=_types.SimpleNamespace(signals=sigs) if sigs else None,
+    )
 
 # ── demo_mode must be initialized before data loading (used for _eff_* keys) ──
 _any_key = bool(
@@ -621,21 +653,30 @@ _any_key = bool(
 if "demo_mode" not in st.session_state:
     st.session_state.demo_mode = not _any_key
 
+# Stamp the start of every full script run so the fragment can detect timer-fires
+import time as _time_mod
+st.session_state._last_full_run = _time_mod.time()
+
 with st.sidebar:
     st.title("🤖 Polymarket AI Bot")
     st.markdown("**API Keys**")
     st.markdown("✅ Anthropic key set" if _anthropic_key  else "⚪ No Anthropic key → mock AI")
     st.markdown("✅ Polymarket key set" if _poly_key       else "⚪ No Polymarket key → mock data")
     st.markdown("✅ Kalshi keys set"    if (_kalshi_key and _kalshi_pem) else "⚪ No Kalshi keys → mock data")
+    st.markdown("✅ Supabase connected" if (_supabase_url and _supabase_key) else "⚪ No Supabase → brain resets on restart")
+    if not _supabase_url:
+        _raw_url = ""
+        try:
+            _raw_url = str(st.secrets.get("SUPABASE_URL", ""))
+        except Exception:
+            pass
+        if _raw_url:
+            st.caption(f"⚠️ Secret found but under wrong name. URL starts: `{_raw_url[:12]}…`")
+        else:
+            st.caption("ℹ️ Reboot the app after saving secrets (Manage app → Reboot)")
     st.caption("Live connection status is shown in the main panel →")
     st.divider()
-    budget   = st.number_input("Paper budget ($)", value=100.0, min_value=10.0, step=10.0)
-    min_conf = st.slider("Min confidence", 0.40, 0.90, 0.55, 0.05)
-    st.divider()
-
-    # ── Bot Controls ────────────────────────────────────────────────────────
-    st.markdown("**🤖 Bot Controls**")
-    st.caption("⚙️ Auto-trade and refresh controls are in the main panel ↗")
+    st.caption("💰 Budget, confidence & refresh controls are in the main panel ↗")
     st.divider()
     if st.button("🔄 Re-run Analysis", use_container_width=True, key="rerun_sidebar"):
         st.cache_data.clear()
@@ -660,6 +701,8 @@ with st.sidebar:
         "POLYMARKET_API_KEY": _poly_key,
         "KALSHI_API_KEY": _kalshi_key,
         "KALSHI_PRIVATE_KEY_PEM": _kalshi_pem,
+        "SUPABASE_URL": _supabase_url,
+        "SUPABASE_KEY": _supabase_key,
     }.items() if not v]
     if _missing:
         st.divider()
@@ -667,116 +710,33 @@ with st.sidebar:
         for _k in _missing:
             st.caption(f"  • {_k}")
 
-# ── read all bot state from session_state (set by widgets below) ──────────────
-demo_mode   = st.session_state.demo_mode
-auto_paper  = st.session_state.get("auto_paper", False)
-live_trading = st.session_state.get("live_trading", False)
-
-# ── effective keys: demo mode forces mock data regardless of key presence ─────
-_eff_anthropic  = "" if demo_mode else _anthropic_key
-_eff_poly       = "" if demo_mode else _poly_key
-_eff_kalshi     = "" if demo_mode else _kalshi_key
-_eff_kalshi_pem = "" if demo_mode else _kalshi_pem
-
-# ── load data ─────────────────────────────────────────────────────────────────
-try:
-    with st.spinner("Fetching markets and running predictive models…"):
-        _source_markets, _poly_live, _kalshi_live, _poly_err, _kalshi_err = \
-            _get_markets(_eff_poly, _eff_kalshi, _eff_kalshi_pem)
-        all_analyses, _live_ai_mode, _ai_err = _run_analysis(_source_markets, _eff_anthropic)
-except Exception as exc:
-    st.error("Analysis pipeline failed — see details below.")
-    st.exception(exc)
-    st.stop()
-
-if _eff_poly and not _poly_live:
-    st.warning(
-        f"**Polymarket live fetch failed** — using mock markets.  \n"
-        f"**Error:** `{_poly_err}`  \n"
-        "Common causes: API endpoint changed, network restriction, or invalid key format."
-    )
-if _eff_kalshi and not _kalshi_live:
-    st.warning(
-        f"**Kalshi live fetch failed** — using mock markets.  \n"
-        f"**Error:** `{_kalshi_err}`"
-    )
-if _eff_anthropic and not _live_ai_mode:
-    _ai_err_msg = f"  \n**Error:** `{_ai_err}`" if _ai_err else ""
-    st.warning(
-        "**ANTHROPIC_API_KEY set but Claude AI call failed** — using mock analysis.  \n"
-        f"Check key validity at console.anthropic.com.{_ai_err_msg}"
-    )
-
-analyses = [a for a in all_analyses if a["conf"] >= min_conf or a["signal"] == "HOLD"]
-
-# ── auto paper trades (bot executes on every analysis run when toggle is on) ──
-if auto_paper:
-    _auto_added = 0
-    for _a in analyses:
-        if _a["signal"] == "HOLD" or _a["kelly"] <= 0:
-            continue
-        _size = round(min(float(budget) * _a["kelly"], float(budget) * 0.15), 2)
-        if _size < 1.0:
-            continue
-        _dir = "YES" if _a["signal"] == "BUY_YES" else "NO"
-        # Skip if this market+direction is already in the ledger (avoids duplicates on refresh)
-        if any(p.get("Question", "")[:40] == _a["question"][:40] and p.get("Dir") == _dir
-               for p in st.session_state.paper_ledger):
-            continue
-        st.session_state.paper_ledger.append({
-            "Platform": _a["platform"],
-            "Question": _a["question"][:50],
-            "Dir":      _dir,
-            "Size $":   _size,
-            "Entry":    f"{_a['price']:.0%}",
-            "AI Est.":  f"{_a['prob']:.0%}",
-            "Edge":     f"{_a['edge']:+.1%}",
-            "Conf":     f"{_a['conf']:.0%}",
-            "Time":     time.strftime("%H:%M:%S"),
-            "Mode":     "🤖 Auto",
-        })
-        _auto_added += 1
-    if _auto_added:
-        st.toast(
-            f"🤖 Bot auto-executed {_auto_added} paper trade{'s' if _auto_added != 1 else ''}",
-            icon="📝",
-        )
-
-# ── header ────────────────────────────────────────────────────────────────────
-_live_bits = []
-if _live_ai_mode: _live_bits.append("Claude AI")
-if _poly_live:    _live_bits.append("Polymarket")
-if _kalshi_live:  _live_bits.append("Kalshi")
-_hero_sub = ("🟢 Live: " + " · ".join(_live_bits)) if _live_bits else "🔵 Demo mode — mock data, no keys required"
+# ── static hero banner (outside fragment — never disrupted by timer refresh) ───
+_dm_static = st.session_state.get("demo_mode", True)
+_hero_sub_static = (
+    "🔵 Demo mode — mock data, no keys required"
+    if _dm_static else
+    "🟢 Live mode — real API connections active"
+)
 st.markdown(f"""
 <div class="hero">
   <h1>📊 Polymarket + Kalshi AI Trading Dashboard</h1>
-  <p>Bayesian × Kelly × momentum × arbitrage, fused by a self-learning signal brain. &nbsp;|&nbsp; {_hero_sub}</p>
+  <p>Bayesian × Kelly × momentum × arbitrage, fused by a self-learning signal brain. &nbsp;|&nbsp; {_hero_sub_static}</p>
 </div>
 """, unsafe_allow_html=True)
-# ── connection status chips + Re-run (real status — available after data load) ─
-_CHIP = ("display:inline-block;border-radius:20px;padding:4px 16px;"
-         "font-size:.82rem;font-weight:600;margin:2px 6px 2px 0;"
-         "border:1px solid;white-space:nowrap;")
 
-def _conn_chip(connected: bool, has_key: bool, label: str) -> str:
-    if connected:
-        s = f"background:#052e16;color:#00d26a;border-color:#00d26a;"
-        return f'<span style="{_CHIP}{s}">🟢 {label} live</span>'
-    if has_key:
-        s = f"background:#422006;color:#fb923c;border-color:#fb923c;"
-        return f'<span style="{_CHIP}{s}">🟡 {label} — key set, connection failed</span>'
-    s = f"background:#0f172a;color:#64748b;border-color:#334155;"
-    return f'<span style="{_CHIP}{s}">⚫ {label} mock</span>'
-
-_chips = "".join([
-    _conn_chip(_live_ai_mode, bool(_anthropic_key), "Claude AI"),
-    _conn_chip(_poly_live,    bool(_poly_key),       "Polymarket"),
-    _conn_chip(_kalshi_live,  bool(_kalshi_key and _kalshi_pem), "Kalshi"),
-])
-_bar1, _bar2, _bar3 = st.columns([4, 2, 1])
+# ── demo toggle + run button (outside fragment — must not be disrupted) ────────
+_bar1, _bar2, _bar3 = st.columns([3, 2, 1])
 with _bar1:
-    st.markdown(f'<div style="padding:4px 0 10px">{_chips}</div>', unsafe_allow_html=True)
+    # Budget controls here so they're always visible (sidebar may be collapsed)
+    _bc1, _bc2, _bc3 = st.columns(3)
+    with _bc1:
+        st.number_input("Polymarket budget ($)", value=10.0, min_value=1.0, step=5.0,
+                        key="poly_budget", help="Max $ per Polymarket trade")
+    with _bc2:
+        st.number_input("Kalshi budget ($)", value=10.0, min_value=1.0, step=5.0,
+                        key="kalshi_budget", help="Max $ per Kalshi trade")
+    with _bc3:
+        st.slider("Min confidence", 0.40, 0.90, 0.55, 0.05, key="sidebar_min_conf")
 with _bar2:
     _demo_new = st.toggle(
         "🔵 Demo mode",
@@ -793,183 +753,469 @@ with _bar3:
         st.cache_data.clear()
         st.rerun()
 
-if not analyses:
-    st.warning(
-        "No markets pass the current **Min confidence** filter. "
-        "Lower the slider in the sidebar or click **Re-run**."
-    )
-    st.stop()
-
-actionable = [a for a in analyses if a["signal"] != "HOLD"]
-avg_edge   = float(np.mean([abs(a["edge"]) for a in actionable])) if actionable else 0.0
-best       = max(analyses, key=lambda a: abs(a["edge"]))
-
-c1, c2, c3, c4, c5 = st.columns(5)
-c1.metric("Markets Scanned",    len(analyses))
-c2.metric("Actionable Signals", len(actionable))
-c3.metric("Avg Edge",           f"{avg_edge:.1%}")
-c4.metric("Best Edge",          f"{abs(best['edge']):.1%}", best["platform"])
-_any_live = _live_ai_mode or _poly_live or _kalshi_live
-_mode_str = "🟢 LIVE" if _any_live else "🔵 MOCK"
-c5.metric("Mode", _mode_str)
-
-# ── bot status row ─────────────────────────────────────────────────────────────
-_bs1, _bs2, _bs3, _bs4 = st.columns(4)
+# ── bot status row (outside fragment — toggles must survive timer refresh) ─────
+_bs1, _bs2, _bs3, _bs4, _bs5 = st.columns(5)
 with _bs1:
     st.toggle(
-        "📝 Auto-execute paper trades",
+        "📝 Auto paper trades",
         value=False,
         key="auto_paper",
         help="Bot automatically logs a paper trade for every Buy signal "
              "that passes your confidence filter on each analysis run.",
     )
-    auto_paper = st.session_state.get("auto_paper", False)
 with _bs2:
     if _poly_pk:
-        _lt_new = st.toggle(
+        st.toggle(
             "🚨 Live trading (real $)",
             value=st.session_state.get("live_trading", False),
             key="live_trading",
             help="Switch from Paper to real-money execution on Polymarket. "
-                 "Start with $5–$10. Both bots default mock_mode=true — never "
+                 "Start with $10. Both bots default mock_mode=true — never "
                  "enable without weeks of mock testing and verified API connections.",
         )
-        live_trading = _lt_new
-        if _lt_new:
-            st.error("LIVE MODE — real funds at risk!", icon="🚨")
+        if st.session_state.get("live_trading", False):
+            st.error("LIVE MODE ON", icon="🚨")
     else:
-        st.info("📝 **Paper mode** — add POLYMARKET_PRIVATE_KEY for live")
-        live_trading = False
+        st.caption("📝 Paper only\n(add wallet key for live)")
 with _bs3:
-    _n_p = len(st.session_state.paper_ledger)
-    _n_l = len(st.session_state.live_ledger)
-    _trade_txt = f"📋 Paper: {_n_p}"
-    if _n_l:
-        _trade_txt += f" / 🚨 Live: {_n_l}"
-    st.info(f"**Trades today:** {_trade_txt}")
+    _live_on = st.session_state.get("live_trading", False)
+    if _poly_pk and _live_on:
+        st.toggle(
+            "🤖 Auto-execute LIVE",
+            value=False,
+            key="auto_live",
+            help="Bot auto-places REAL Polymarket orders on every refresh cycle. "
+                 "Uses the Polymarket budget set in the sidebar.",
+        )
+        if st.session_state.get("auto_live", False):
+            st.error("Auto-LIVE ON", icon="⚡")
+    else:
+        st.caption("Enable Live trading\nto unlock auto-live")
 with _bs4:
-    _refresh_label = st.selectbox(
+    _n_p_outer = len(st.session_state.paper_ledger)
+    _n_l_outer = len(st.session_state.live_ledger)
+    _trade_txt = f"📋 Paper: {_n_p_outer}"
+    if _n_l_outer:
+        _trade_txt += f" · 🚨 Live: {_n_l_outer}"
+    st.info(f"**Trades:** {_trade_txt}")
+with _bs5:
+    st.selectbox(
         "⏱ Auto-refresh",
         ["Off", "Every 1 min", "Every 5 min", "Every 15 min", "Every 30 min"],
         index=0,
-        help="Run the bot 24/7 — fetches fresh data and logs paper trades "
-             "automatically on the chosen interval.",
+        key="refresh_label",
+        help="Run the bot 24/7 — fetches fresh data and auto-executes trades "
+             "on the chosen interval.",
     )
 
-# ── 24/7 auto-refresh ─────────────────────────────────────────────────────────
+# ── refresh interval computation (outside fragment — drives run_every param) ──
 _REFRESH_MAP = {"Off": None, "Every 1 min": 60, "Every 5 min": 300,
                 "Every 15 min": 900, "Every 30 min": 1800}
-_refresh_secs = _REFRESH_MAP.get(_refresh_label)
+_refresh_secs = _REFRESH_MAP.get(st.session_state.get("refresh_label", "Off"))
 
-if _refresh_secs:
-    @st.fragment(run_every=_refresh_secs)
-    def _auto_refresh():
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DATA + DISPLAY FRAGMENT
+# Only this fragment re-executes on timer ticks — outer controls are untouched.
+# ══════════════════════════════════════════════════════════════════════════════
+@st.fragment(run_every=_refresh_secs)
+def _live_dashboard():
+    # Read control values from session_state (set by widgets rendered above)
+    _dm    = st.session_state.get("demo_mode", True)
+    _ap    = st.session_state.get("auto_paper", False)
+    _lt    = st.session_state.get("live_trading", False)
+    _al    = st.session_state.get("auto_live", False)
+    poly_budget   = st.session_state.get("poly_budget",   10.0)
+    kalshi_budget = st.session_state.get("kalshi_budget", 10.0)
+    budget        = poly_budget + kalshi_budget
+    min_conf = st.session_state.get("sidebar_min_conf", 0.55)
+
+    # Clear cache when this is a timer-fired re-execution (not the initial load)
+    _is_timer = time.time() - st.session_state.get("_last_full_run", 0) > 5
+    if _is_timer and _refresh_secs:
         st.cache_data.clear()
-        st.rerun()
-    _auto_refresh()
 
-# ── session trades strip (always visible — no need to hunt in Execute tab) ────
-_n_paper = len(st.session_state.paper_ledger)
-_n_live  = len(st.session_state.live_ledger)
-if _n_paper + _n_live > 0:
-    _badges: list[str] = []
-    if _n_paper: _badges.append(f"{_n_paper} paper trade{'s' if _n_paper != 1 else ''}")
-    if _n_live:  _badges.append(f"{_n_live} live trade{'s' if _n_live != 1 else ''} ⚠️")
-    with st.expander(f"📋 Today's Session — {' · '.join(_badges)}", expanded=_n_live > 0):
-        if _n_paper > 0 and _n_live > 0:
-            _tleft, _tright = st.columns(2)
-            with _tleft:
-                st.caption("📝 Paper trades (simulated, no real money)")
-                st.dataframe(pd.DataFrame(st.session_state.paper_ledger),
-                             use_container_width=True, hide_index=True)
-                if st.button("Clear paper trades", key="clear_paper_strip"):
-                    st.session_state.paper_ledger.clear()
-                    st.rerun()
-            with _tright:
-                st.caption("🚨 Live trades (real money spent)")
-                st.dataframe(pd.DataFrame(st.session_state.live_ledger),
-                             use_container_width=True, hide_index=True)
-        elif _n_paper:
-            st.caption("📝 Paper trades (simulated, no real money)")
-            st.dataframe(pd.DataFrame(st.session_state.paper_ledger),
-                         use_container_width=True, hide_index=True)
-            if st.button("Clear paper trades", key="clear_paper_strip"):
+    # Compute effective API keys (demo mode forces mock regardless of key presence)
+    _eff_anthropic  = "" if _dm else _anthropic_key
+    _eff_poly       = "" if _dm else _poly_key
+    _eff_kalshi     = "" if _dm else _kalshi_key
+    _eff_kalshi_pem = "" if _dm else _kalshi_pem
+
+    # ── load data ─────────────────────────────────────────────────────────────
+    try:
+        with st.spinner("Fetching markets and running predictive models…"):
+            _source_markets, _poly_live, _kalshi_live, _poly_err, _kalshi_err = \
+                _get_markets(_eff_poly, _eff_kalshi, _eff_kalshi_pem)
+            all_analyses, _live_ai_mode, _ai_err = _run_analysis(_source_markets, _eff_anthropic)
+    except Exception as exc:
+        st.error("Analysis pipeline failed — see details below.")
+        st.exception(exc)
+        return
+
+    # ── connection status chips ────────────────────────────────────────────────
+    if _dm:
+        st.info(
+            "🔵 **Demo mode** — all APIs intentionally bypassed, using simulated data. "
+            "Turn off the **Demo mode** toggle above to connect real APIs.",
+            icon="ℹ️",
+        )
+    else:
+        _CHIP = ("display:inline-block;border-radius:20px;padding:4px 16px;"
+                 "font-size:.82rem;font-weight:600;margin:2px 6px 2px 0;"
+                 "border:1px solid;white-space:nowrap;")
+
+        def _conn_chip(connected: bool, has_key: bool, label: str) -> str:
+            if connected:
+                s = "background:#052e16;color:#00d26a;border-color:#00d26a;"
+                return f'<span style="{_CHIP}{s}">🟢 {label} live</span>'
+            if has_key:
+                s = "background:#422006;color:#fb923c;border-color:#fb923c;"
+                return f'<span style="{_CHIP}{s}">🟡 {label} — key set, connection failed</span>'
+            s = "background:#0f172a;color:#64748b;border-color:#334155;"
+            return f'<span style="{_CHIP}{s}">⚫ {label} — no API key</span>'
+
+        _chips = "".join([
+            _conn_chip(_live_ai_mode, bool(_anthropic_key), "Claude AI"),
+            _conn_chip(_poly_live,    bool(_poly_key),       "Polymarket"),
+            _conn_chip(_kalshi_live,  bool(_kalshi_key and _kalshi_pem), "Kalshi"),
+        ])
+        st.markdown(f'<div style="padding:4px 0 10px">{_chips}</div>', unsafe_allow_html=True)
+
+    # ── API / connection warnings ──────────────────────────────────────────────
+    if _eff_poly and not _poly_live:
+        st.warning(
+            f"**Polymarket live fetch failed** — using mock markets.  \n"
+            f"**Error:** `{_poly_err}`  \n"
+            "Common causes: API endpoint changed, network restriction, or invalid key format."
+        )
+    if _eff_kalshi and not _kalshi_live:
+        st.warning(
+            f"**Kalshi live fetch failed** — using mock markets.  \n"
+            f"**Error:** `{_kalshi_err}`"
+        )
+    if _eff_anthropic and not _live_ai_mode:
+        _err_low = _ai_err.lower()
+        if "usage limit" in _err_low or "api usage" in _err_low:
+            import re as _re
+            _reset = (_re.search(r'(\d{4}-\d{2}-\d{2})', _ai_err) or type("", (), {"group": lambda *a: "July 1"})()).group(1)
+            st.warning(
+                f"**Anthropic API monthly limit reached** — Claude AI unavailable until **{_reset}**.  \n"
+                "Analysis is running on Bayesian + momentum signals (no AI). "
+                "Switch to **Demo mode** (toggle above) to silence this warning.",
+                icon="💳",
+            )
+        else:
+            _ai_err_msg = f"  \n**Error:** `{_ai_err}`" if _ai_err else ""
+            st.warning(
+                "**ANTHROPIC_API_KEY set but Claude AI call failed** — using mock analysis.  \n"
+                f"Check key validity at console.anthropic.com.{_ai_err_msg}"
+            )
+
+    analyses = [a for a in all_analyses if a["conf"] >= min_conf or a["signal"] == "HOLD"]
+
+    # ── P&L helpers ───────────────────────────────────────────────────────────
+    _price_map = {a["question"][:50]: a["price"] for a in analyses}
+
+    def _trade_pnl(row: dict) -> float:
+        """Unrealised P&L in dollars for a paper trade row."""
+        ep_yes = float(row.get("entry_num") or 0)
+        if ep_yes <= 0:
+            return 0.0
+        size  = float(row.get("Size $") or 0)
+        dir_  = str(row.get("Dir", "YES"))
+        ep    = ep_yes if dir_ == "YES" else (1.0 - ep_yes)
+        if ep <= 0:
+            return 0.0
+        q       = str(row.get("Question", ""))
+        yes_now = _price_map.get(q, ep_yes)
+        cp      = yes_now if dir_ == "YES" else (1.0 - yes_now)
+        return round((size / ep) * cp - size, 2)
+
+    def _render_order_book(key_prefix: str = "") -> None:
+        """Render unified order book: paper + live positions with live P&L."""
+        paper = st.session_state.paper_ledger
+        live  = st.session_state.live_ledger
+        if not paper and not live:
+            st.caption("No trades recorded yet.")
+            return
+
+        # ── summary metrics ───────────────────────────────────────────────────
+        _p_invested = sum(float(r.get("Size $", 0)) for r in paper)
+        _p_pnl      = sum(_trade_pnl(r) for r in paper)
+        _l_invested = sum(float(r.get("Size $", 0)) for r in live)
+        _l_pnl      = sum(_trade_pnl(r) for r in live)
+        _tot_inv    = _p_invested + _l_invested
+        _tot_pnl    = _p_pnl + _l_pnl
+        _roi        = _tot_pnl / _tot_inv if _tot_inv else 0.0
+
+        _m1, _m2, _m3, _m4, _m5 = st.columns(5)
+        _m1.metric("Paper trades",  len(paper))
+        _m2.metric("Live orders",   len(live))
+        _m3.metric("Total invested", f"${_tot_inv:.2f}")
+        _m4.metric("Total P&L",     f"${_tot_pnl:+.2f}",
+                   delta_color="normal" if _tot_pnl >= 0 else "inverse")
+        _m5.metric("ROI",           f"{_roi:+.1%}",
+                   delta_color="normal" if _roi >= 0 else "inverse")
+
+        # ── paper positions ───────────────────────────────────────────────────
+        if paper:
+            st.markdown("**📝 Paper Positions**")
+            df_p = pd.DataFrame(paper)
+            df_p["P&L $"]    = [_trade_pnl(r) for r in paper]
+            df_p["Current %"] = df_p.apply(
+                lambda r: f"{_price_map.get(str(r.get('Question','')), float(r.get('entry_num',0))):.0%}",
+                axis=1,
+            )
+            df_p["ROI"] = df_p.apply(
+                lambda r: f"{r['P&L $'] / r['Size $']:+.1%}" if r["Size $"] else "—", axis=1
+            )
+            _show_p = [c for c in ["Platform","Question","Dir","Size $","Entry",
+                                    "Current %","AI Est.","Edge","P&L $","ROI","Time","Mode"]
+                       if c in df_p.columns]
+            st.dataframe(
+                df_p[_show_p], use_container_width=True, hide_index=True,
+                column_config={
+                    "P&L $":  st.column_config.NumberColumn("P&L $", format="%+.2f"),
+                    "Size $": st.column_config.NumberColumn("Size $", format="$%.2f"),
+                },
+            )
+            if st.button("Clear paper trades", key=f"clear_paper_{key_prefix}"):
                 st.session_state.paper_ledger.clear()
                 st.rerun()
-        else:
-            st.caption("🚨 Live trades (real money spent)")
-            st.dataframe(pd.DataFrame(st.session_state.live_ledger),
-                         use_container_width=True, hide_index=True)
-else:
-    st.info("No trades recorded yet this session. Open **🚀 Execute** to paper-trade the current signals.")
 
-st.divider()
+        # ── live positions ────────────────────────────────────────────────────
+        if live:
+            st.markdown("**🚨 Live Orders (real money)**")
+            df_l = pd.DataFrame(live)
+            if "entry_num" in df_l.columns:
+                df_l["P&L $"] = [_trade_pnl(r) for r in live]
+                df_l["Current %"] = df_l.apply(
+                    lambda r: f"{_price_map.get(str(r.get('Question','')), float(r.get('entry_num',0))):.0%}",
+                    axis=1,
+                )
+            _show_l = [c for c in ["Platform","Question","Dir","Size $","Entry",
+                                    "Current %","P&L $","Order ID","Status","Time","Mode"]
+                       if c in df_l.columns]
+            st.dataframe(
+                df_l[_show_l], use_container_width=True, hide_index=True,
+                column_config={
+                    "P&L $":  st.column_config.NumberColumn("P&L $", format="%+.2f"),
+                    "Size $": st.column_config.NumberColumn("Size $", format="$%.2f"),
+                },
+            )
+            if st.button("Clear live ledger", key=f"clear_live_{key_prefix}"):
+                st.session_state.live_ledger.clear()
+                st.rerun()
 
-# ── tabs ──────────────────────────────────────────────────────────────────────
-t1, t2, t3, t4, t5, t6 = st.tabs([
-    "📡 Market Scanner", "🔬 Deep Analysis",
-    "🧠 Learning Brain", "⚡ Arbitrage", "💼 Portfolio", "🚀 Execute",
-])
+    def _render_paper_ledger(key_prefix: str = "") -> None:
+        """Backwards-compat wrapper — renders the full order book."""
+        _render_order_book(key_prefix)
+
+    # ── auto paper trades ─────────────────────────────────────────────────────
+    if _ap:
+        _auto_added = 0
+        for _a in analyses:
+            if _a["signal"] == "HOLD" or _a["kelly"] <= 0:
+                continue
+            _plat_budget = poly_budget if _a["platform"] == "Polymarket" else kalshi_budget
+            _size = round(min(float(_plat_budget) * _a["kelly"], float(_plat_budget) * 0.15), 2)
+            if _size < 1.0:
+                continue
+            _dir = "YES" if _a["signal"] == "BUY_YES" else "NO"
+            if any(p.get("Question", "")[:40] == _a["question"][:40] and p.get("Dir") == _dir
+                   for p in st.session_state.paper_ledger):
+                continue
+            st.session_state.paper_ledger.append({
+                "Platform":  _a["platform"],
+                "Question":  _a["question"][:50],
+                "Dir":       _dir,
+                "Size $":    _size,
+                "entry_num": _a["price"],
+                "Entry":     f"{_a['price']:.0%}",
+                "AI Est.":   f"{_a['prob']:.0%}",
+                "Edge":      f"{_a['edge']:+.1%}",
+                "Conf":      f"{_a['conf']:.0%}",
+                "Time":      time.strftime("%H:%M:%S"),
+                "Mode":      "🤖 Auto",
+            })
+            st.session_state._brain.on_trade_placed(_to_brain_input(_a))
+            _auto_added += 1
+        if _auto_added:
+            st.toast(
+                f"🤖 Bot auto-executed {_auto_added} paper trade{'s' if _auto_added != 1 else ''}",
+                icon="📝",
+            )
+
+    # ── auto LIVE trades (Polymarket only — gated behind live_trading toggle) ──
+    if _al and _lt and _poly_pk and not _dm:
+        _live_added = 0
+        for _a in analyses:
+            if _a["signal"] == "HOLD" or _a["kelly"] <= 0 or _a["platform"] != "Polymarket":
+                continue
+            _tok = _a.get("yes_token_id") if _a["signal"] == "BUY_YES" else _a.get("no_token_id")
+            if not _tok:
+                continue
+            _size = round(min(float(poly_budget) * _a["kelly"], float(poly_budget) * 0.15), 2)
+            if _size < 1.0:
+                continue
+            _dir = "YES" if _a["signal"] == "BUY_YES" else "NO"
+            if any(l.get("Question", "")[:40] == _a["question"][:40] and l.get("Dir") == _dir
+                   for l in st.session_state.live_ledger):
+                continue
+            try:
+                _res = _execute_live_polymarket_order(
+                    token_id=_tok, price=_a["price"], size_usd=_size,
+                    side="BUY", private_key=_poly_pk,
+                    sig_type=_poly_sig_type, funder=_poly_funder,
+                )
+                st.session_state.live_ledger.append({
+                    "Platform": "Polymarket",
+                    "Question": _a["question"][:50],
+                    "Dir":      _dir,
+                    "Size $":   round(_size, 2),
+                    "entry_num": _a["price"],
+                    "Entry":    f"{_a['price']:.0%}",
+                    "AI Est.":  f"{_a['prob']:.0%}",
+                    "Edge":     f"{_a['edge']:+.1%}",
+                    "Order ID": _res["order_id"],
+                    "Status":   _res["status"],
+                    "Time":     time.strftime("%H:%M:%S"),
+                    "Mode":     "🤖 Auto-Live",
+                })
+                st.session_state._brain.on_trade_placed(_to_brain_input(_a))
+                _live_added += 1
+            except Exception as _exc:
+                st.toast(f"Auto-live order failed: {_exc}", icon="❌")
+        if _live_added:
+            st.toast(
+                f"🚨 Bot auto-placed {_live_added} LIVE order{'s' if _live_added != 1 else ''} on Polymarket",
+                icon="⚡",
+            )
+
+    # ── brain: detect resolutions + decay + save ──────────────────────────────
+    _brain = st.session_state._brain
+    _brain_dirty = False
+    for _ma in all_analyses:
+        _mid = _ma["id"]
+        if _mid in _brain._memories and _brain._memories[_mid].resolved_outcome is None:
+            if _ma["price"] >= 0.99:
+                _brain.on_market_resolved(_mid, 1.0)
+                _brain_dirty = True
+            elif _ma["price"] <= 0.01:
+                _brain.on_market_resolved(_mid, 0.0)
+                _brain_dirty = True
+    _brain.apply_decay()
+    if _brain_dirty or _is_timer:
+        _brain.save()
+
+    # ── markets filter guard ───────────────────────────────────────────────────
+    if not analyses:
+        st.warning(
+            "No markets pass the current **Min confidence** filter. "
+            "Lower the slider in the sidebar or click **▶ Run**."
+        )
+        return
+
+    actionable = [a for a in analyses if a["signal"] != "HOLD"]
+    avg_edge   = float(np.mean([abs(a["edge"]) for a in actionable])) if actionable else 0.0
+    best       = max(analyses, key=lambda a: abs(a["edge"]))
+
+    # ── metrics row ───────────────────────────────────────────────────────────
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Markets Scanned",    len(analyses))
+    c2.metric("Actionable Signals", len(actionable))
+    c3.metric("Avg Edge",           f"{avg_edge:.1%}")
+    c4.metric("Best Edge",          f"{abs(best['edge']):.1%}", best["platform"])
+    _any_live = _live_ai_mode or _poly_live or _kalshi_live
+    _mode_str = "🟢 LIVE" if _any_live else "🔵 MOCK"
+    c5.metric("Mode", _mode_str)
+
+    # ── live trading warning (inside fragment so it reflects current toggle) ──
+    live_trading = _lt
+
+    # ── session trades strip / order book ─────────────────────────────────────
+    _n_paper = len(st.session_state.paper_ledger)
+    _n_live  = len(st.session_state.live_ledger)
+
+    if _n_paper + _n_live > 0:
+        _strip_pnl_p = sum(_trade_pnl(r) for r in st.session_state.paper_ledger)
+        _strip_pnl_l = sum(_trade_pnl(r) for r in st.session_state.live_ledger)
+        _strip_total_pnl = _strip_pnl_p + _strip_pnl_l
+        _badge = f"📋 Order Book & P&L — {_n_paper} paper"
+        if _n_live:
+            _badge += f" · {_n_live} live 🚨"
+        _badge += f" · Total P&L ${_strip_total_pnl:+.2f}"
+        with st.expander(_badge, expanded=_n_live > 0):
+            _render_order_book("strip")
+    else:
+        st.info("No trades recorded yet. Enable **📝 Auto paper** above to start, or use **🚀 Execute** to place trades manually.")
+
+    st.divider()
+
+    # ── tabs ──────────────────────────────────────────────────────────────────
+    t1, t2, t3, t4, t5, t6 = st.tabs([
+        "📡 Market Scanner", "🔬 Deep Analysis",
+        "🧠 Learning Brain", "⚡ Arbitrage", "💼 Portfolio", "🚀 Execute",
+    ])
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# TAB 1 — Market Scanner
-# ══════════════════════════════════════════════════════════════════════════════
-with t1:
-    st.subheader("Live Market Scan")
-    st.caption("Sorted by absolute edge. The **30-Day Trend** sparkline is the live "
-               "price history — one fast render instead of a chart per market.")
+    # ══════════════════════════════════════════════════════════════════════════
+    # TAB 1 — Market Scanner
+    # ══════════════════════════════════════════════════════════════════════════
+    with t1:
+        st.subheader("Live Market Scan")
+        st.caption("Sorted by absolute edge. The **30-Day Trend** sparkline is the live "
+                   "price history — one fast render instead of a chart per market.")
 
-    rows = []
-    for a in sorted(analyses, key=lambda x: -abs(x["edge"])):
-        rows.append({
-            "Platform":  a["platform"],
-            "Question":  a["question"][:65],
-            "30-Day Trend": a["history"],          # inline sparkline
-            "Market":    a["price"] * 100,         # NumberColumn formats raw value
-            "AI Est.":   a["prob"] * 100,
-            "Edge":      a["edge"] * 100,
-            "Conf":      a["conf"] * 100,
-            "Kelly":     a["kelly"] * 100,
-            "Quality":   round(a["quality"], 2),
-            "Signal":    SIGNAL_ICONS[a["signal"]],
-            "Days":      a["days"],
-        })
+        rows = []
+        for a in sorted(analyses, key=lambda x: -abs(x["edge"])):
+            rows.append({
+                "Platform":  a["platform"],
+                "Question":  a["question"][:65],
+                "30-Day Trend": a["history"],          # inline sparkline
+                "Market":    a["price"] * 100,         # NumberColumn formats raw value
+                "AI Est.":   a["prob"] * 100,
+                "Edge":      a["edge"] * 100,
+                "Conf":      a["conf"] * 100,
+                "Kelly":     a["kelly"] * 100,
+                "Quality":   round(a["quality"], 2),
+                "Signal":    SIGNAL_ICONS[a["signal"]],
+                "Days":      a["days"],
+            })
 
-    st.dataframe(
-        pd.DataFrame(rows), use_container_width=True, hide_index=True,
-        column_config={
-            "30-Day Trend": st.column_config.LineChartColumn(
-                "30-Day Trend", width="small",
-            ),
-            "Market":  st.column_config.NumberColumn("Market", format="%.0f%%",
-                                                     help="Current market price"),
-            "AI Est.": st.column_config.NumberColumn("AI Est.", format="%.0f%%"),
-            "Edge":    st.column_config.NumberColumn("Edge", format="%+.1f%%"),
-            "Conf":    st.column_config.NumberColumn("Conf", format="%.0f%%"),
-            "Kelly":   st.column_config.NumberColumn("Kelly", format="%.1f%%"),
-            "Quality": st.column_config.ProgressColumn(
-                "Quality", min_value=0.0, max_value=1.0, format="%.2f",
-            ),
-        },
-    )
+        st.dataframe(
+            pd.DataFrame(rows), use_container_width=True, hide_index=True,
+            column_config={
+                "30-Day Trend": st.column_config.LineChartColumn(
+                    "30-Day Trend", width="small",
+                ),
+                "Market":  st.column_config.NumberColumn("Market", format="%.0f%%",
+                                                         help="Current market price"),
+                "AI Est.": st.column_config.NumberColumn("AI Est.", format="%.0f%%"),
+                "Edge":    st.column_config.NumberColumn("Edge", format="%+.1f%%"),
+                "Conf":    st.column_config.NumberColumn("Conf", format="%.0f%%"),
+                "Kelly":   st.column_config.NumberColumn("Kelly", format="%.1f%%"),
+                "Quality": st.column_config.ProgressColumn(
+                    "Quality", min_value=0.0, max_value=1.0, format="%.2f",
+                ),
+            },
+        )
 
+    # ══════════════════════════════════════════════════════════════════════════
+    # TAB 2 — Deep Analysis
+    # ══════════════════════════════════════════════════════════════════════════
+    with t2:
+        st.subheader("Deep Market Analysis")
 
-# ══════════════════════════════════════════════════════════════════════════════
-# TAB 2 — Deep Analysis
-# ══════════════════════════════════════════════════════════════════════════════
-with t2:
-    st.subheader("Deep Market Analysis")
+        options = {f"{a['platform']} | {a['question'][:70]}": i for i, a in enumerate(analyses)}
+        chosen  = analyses[options[st.selectbox("Select a market", list(options.keys()))]]
 
-    options = {f"{a['platform']} | {a['question'][:70]}": i for i, a in enumerate(analyses)}
-    chosen  = analyses[options[st.selectbox("Select a market", list(options.keys()))]]
+        col_l, col_r = st.columns([3, 2])
 
-    col_l, col_r = st.columns([3, 2])
-
-    with col_l:
-        # Probability card
-        clr = SIG_COLOR[chosen["signal"]]
-        st.markdown(f"""
+        with col_l:
+            # Probability card
+            clr = SIG_COLOR[chosen["signal"]]
+            st.markdown(f"""
 <div class="card" style="text-align:center;">
   <div style="font-size:.8rem;color:#aaa;letter-spacing:.08em;">AI ESTIMATED PROBABILITY (YES)</div>
   <div class="prob-big" style="color:{clr};">{chosen['prob']:.1%}</div>
@@ -981,23 +1227,23 @@ with t2:
 </div>
 """, unsafe_allow_html=True)
 
-        # Probability comparison — native bar chart
-        prob_df = pd.DataFrame({
-            "Probability": [chosen["price"], chosen["prob"], chosen["bayesian"]],
-        }, index=["Market Price", "AI Estimate", "Bayesian Est."])
-        st.markdown("**Probability comparison**")
-        st.bar_chart(prob_df, height=180, use_container_width=True)
+            # Probability comparison — native bar chart
+            prob_df = pd.DataFrame({
+                "Probability": [chosen["price"], chosen["prob"], chosen["bayesian"]],
+            }, index=["Market Price", "AI Estimate", "Bayesian Est."])
+            st.markdown("**Probability comparison**")
+            st.bar_chart(prob_df, height=180, use_container_width=True)
 
-        # Price history — native line chart
-        hist_df = pd.DataFrame(
-            {"Market Price": chosen["history"],
-             "AI Estimate":  [chosen["prob"]] * len(chosen["history"])},
-        )
-        st.markdown("**30-Day price history**")
-        st.line_chart(hist_df, height=180, use_container_width=True)
+            # Price history — native line chart
+            hist_df = pd.DataFrame(
+                {"Market Price": chosen["history"],
+                 "AI Estimate":  [chosen["prob"]] * len(chosen["history"])},
+            )
+            st.markdown("**30-Day price history**")
+            st.line_chart(hist_df, height=180, use_container_width=True)
 
-    with col_r:
-        st.markdown(f"""
+        with col_r:
+            st.markdown(f"""
 <div class="card">
 <b>Signal:</b> <span class="{SIG_CSS[chosen['signal']]}">{SIGNAL_ICONS[chosen['signal']]}</span><br>
 <b>Edge:</b> {chosen['edge']:+.2%} &nbsp;(min ±{chosen['min_edge']:.2%})<br>
@@ -1009,105 +1255,192 @@ with t2:
 </div>
 """, unsafe_allow_html=True)
 
-        st.markdown("**🤖 Claude AI Reasoning**")
-        st.info(chosen["ai_reasoning"])
+            st.markdown("**🤖 Claude AI Reasoning**")
+            st.info(chosen["ai_reasoning"])
 
-        st.markdown("**✅ Key Factors**")
-        for f in chosen["ai_factors"]:
-            st.markdown(f"- {f}")
+            st.markdown("**✅ Key Factors**")
+            for f in chosen["ai_factors"]:
+                st.markdown(f"- {f}")
 
-        st.markdown("**⚠️ Uncertainty Flags**")
-        for f in chosen["ai_flags"]:
-            st.markdown(f"- {f}")
+            st.markdown("**⚠️ Uncertainty Flags**")
+            for f in chosen["ai_flags"]:
+                st.markdown(f"- {f}")
 
-    # Signal breakdown table + bar chart
-    st.markdown("#### Signal Breakdown")
-    sigs = chosen["signals"]
-    if sigs:
-        sig_df = pd.DataFrame([{
-            "Signal":     s["name"].replace("_", " ").title(),
-            "Value":      round(s["value"], 3),
-            "Confidence": round(s["confidence"], 2),
-            "Weight":     round(s["weight"], 2),
-            "Direction":  "🟢 Bullish" if s["value"] > 0 else "🔴 Bearish",
-        } for s in sigs])
-        st.dataframe(sig_df, use_container_width=True, hide_index=True)
+        # Signal breakdown table + bar chart
+        st.markdown("#### Signal Breakdown")
+        sigs = chosen["signals"]
+        if sigs:
+            sig_df = pd.DataFrame([{
+                "Signal":     s["name"].replace("_", " ").title(),
+                "Value":      round(s["value"], 3),
+                "Confidence": round(s["confidence"], 2),
+                "Weight":     round(s["weight"], 2),
+                "Direction":  "🟢 Bullish" if s["value"] > 0 else "🔴 Bearish",
+            } for s in sigs])
+            st.dataframe(sig_df, use_container_width=True, hide_index=True)
 
-        chart_df = pd.DataFrame(
-            {"Signal Value": [s["value"] for s in sigs]},
-            index=[s["name"].replace("_", " ").title() for s in sigs],
+            chart_df = pd.DataFrame(
+                {"Signal Value": [s["value"] for s in sigs]},
+                index=[s["name"].replace("_", " ").title() for s in sigs],
+            )
+            st.bar_chart(chart_df, height=200, use_container_width=True)
+        else:
+            st.info("No directional signals — all signals are neutral for this market.")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # TAB 3 — Learning Brain
+    # ══════════════════════════════════════════════════════════════════════════
+    with t3:
+        st.subheader("🧠 Self-Learning Signal Weight Brain")
+        st.markdown(
+            "Weights update automatically as real markets resolve using Brier-score "
+            "credit assignment. After ~50 resolved markets the weights will meaningfully "
+            "diverge from defaults. State saved to `data/learning_state.json`."
         )
-        st.bar_chart(chart_df, height=200, use_container_width=True)
-    else:
-        st.info("No directional signals — all signals are neutral for this market.")
 
+        try:
+            summ = st.session_state._brain.performance_summary()
+        except Exception:
+            summ = {
+                "resolved_markets": 0, "win_rate": 0.0,
+                "avg_brier_improvement": 0.0, "weight_drift": {},
+                "current_weights": dict(EnsemblePredictor.DEFAULT_WEIGHTS),
+                "pending_markets": 0,
+            }
 
-# ══════════════════════════════════════════════════════════════════════════════
-# TAB 3 — Learning Brain
-# ══════════════════════════════════════════════════════════════════════════════
-with t3:
-    st.subheader("🧠 Self-Learning Signal Weight Brain")
-    st.markdown(
-        "Weights update automatically as real markets resolve using Brier-score "
-        "credit assignment. After ~50 resolved markets the weights will meaningfully "
-        "diverge from defaults. State saved to `data/learning_state.json`."
-    )
+        _resolved = summ["resolved_markets"]
+        _pending  = summ.get("pending_markets", 0)
+        if _resolved == 0:
+            _lvl, _lvl_desc = "🌱 Fresh", "At default weights — no resolved markets yet"
+            _next_milestone, _progress = 1, 0.0
+        elif _resolved < 10:
+            _lvl, _lvl_desc = "📚 Learning", "Weights beginning to drift from early outcomes"
+            _next_milestone, _progress = 10, _resolved / 10
+        elif _resolved < 50:
+            _lvl, _lvl_desc = "🧠 Trained", "Reliable signal discrimination from resolved history"
+            _next_milestone, _progress = 50, _resolved / 50
+        else:
+            _lvl, _lvl_desc = "⚡ Expert", "Highly calibrated — deep resolved market history"
+            _next_milestone, _progress = _resolved, 1.0
+        st.markdown(f"### Brain State: {_lvl}")
+        st.caption(_lvl_desc)
+        if _resolved < 50:
+            st.progress(_progress, text=f"{_resolved} / {_next_milestone} resolved markets to next level")
+        st.markdown("")
 
-    try:
-        _ens = EnsemblePredictor()
-        _eng = LearningEngine(_ens, state_file=Path("data/learning_state.json"))
-        _eng.load()
-        summ = _eng.performance_summary()
-    except Exception:
-        summ = {
-            "resolved_markets": 0, "win_rate": 0.0,
-            "avg_brier_improvement": 0.0, "weight_drift": {},
-            "current_weights": dict(EnsemblePredictor.DEFAULT_WEIGHTS),
-            "pending_markets": 0,
-        }
+        b1, b2, b3, b4 = st.columns(4)
+        b1.metric("Resolved Markets", _resolved)
+        b2.metric("Win Rate",  f"{summ['win_rate']:.0%}" if _resolved else "N/A")
+        b3.metric("Pending",   _pending,
+                  help="Markets with open trades not yet resolved — learning queued")
+        b4.metric("Avg Brier Δ",
+                  f"{summ['avg_brier_improvement']:+.4f}" if _resolved else "N/A",
+                  help="Positive = bot's predictions beat the naïve 50/50 baseline")
 
-    b1, b2, b3, b4 = st.columns(4)
-    b1.metric("Resolved Markets", summ["resolved_markets"])
-    b2.metric("Win Rate",  f"{summ['win_rate']:.0%}" if summ["resolved_markets"] else "N/A")
-    b3.metric("Pending",   summ.get("pending_markets", 0))
-    b4.metric("Avg Brier Δ",
-              f"{summ['avg_brier_improvement']:+.4f}" if summ["resolved_markets"] else "N/A")
+        if _pending:
+            st.info(f"📬 **{_pending} trade(s) pending resolution** — weights will update "
+                    "automatically when those markets resolve.")
 
-    st.markdown("#### Signal Weights")
-    defaults = EnsemblePredictor.DEFAULT_WEIGHTS
-    cur_w    = summ.get("current_weights", defaults)
-    drift    = summ.get("weight_drift", {})
+        st.markdown("#### Signal Weights")
+        defaults = EnsemblePredictor.DEFAULT_WEIGHTS
+        cur_w    = summ.get("current_weights", defaults)
+        drift    = summ.get("weight_drift", {})
 
-    w_rows = [{
-        "Signal":   n.replace("_", " ").title(),
-        "Default":  round(float(defaults[n]), 3),
-        "Current":  round(float(cur_w.get(n, defaults[n])), 3),
-        "Drift":    f"{float(drift.get(n, 0.0)):+.3f}",
-        "Weight":   float(cur_w.get(n, defaults[n])),
-    } for n in defaults]
+        w_rows = [{
+            "Signal":   n.replace("_", " ").title(),
+            "Default":  round(float(defaults[n]), 3),
+            "Current":  round(float(cur_w.get(n, defaults[n])), 3),
+            "Drift":    f"{float(drift.get(n, 0.0)):+.3f}",
+            "Weight":   float(cur_w.get(n, defaults[n])),
+        } for n in defaults]
 
-    st.dataframe(
-        pd.DataFrame(w_rows),
-        use_container_width=True, hide_index=True,
-        column_config={
-            "Weight": st.column_config.ProgressColumn(
-                "Current Weight", min_value=0.0, max_value=8.0, format="%.2f",
-            ),
-        },
-    )
+        st.dataframe(
+            pd.DataFrame(w_rows),
+            use_container_width=True, hide_index=True,
+            column_config={
+                "Weight": st.column_config.ProgressColumn(
+                    "Current Weight", min_value=0.0, max_value=8.0, format="%.2f",
+                ),
+            },
+        )
 
-    drift_vals = {n.replace("_", " ").title(): float(drift.get(n, 0.0)) for n in defaults}
-    st.markdown("#### Weight Drift from Default")
-    st.bar_chart(
-        pd.DataFrame.from_dict({"Drift": drift_vals}, orient="columns"),
-        height=200, use_container_width=True,
-    )
+        drift_vals = {n.replace("_", " ").title(): float(drift.get(n, 0.0)) for n in defaults}
+        st.markdown("#### Weight Drift from Default")
+        st.bar_chart(
+            pd.DataFrame.from_dict({"Drift": drift_vals}, orient="columns"),
+            height=200, use_container_width=True,
+        )
 
-    if not summ["resolved_markets"]:
-        st.info("No resolved markets yet — brain is at defaults. Weights evolve as trades resolve.")
+        if not _resolved:
+            st.info(
+                "🌱 **Brain is fresh** — no resolved markets yet, signal weights are at defaults.  \n"
+                "**How to start learning:** enable Auto-execute paper trades above. As those markets "
+                "resolve on Polymarket/Kalshi, the bot will score each signal and adjust weights "
+                "automatically. After ~10 resolved markets you'll see meaningful drift."
+            )
 
-    with st.expander("How the learning loop works"):
-        st.markdown("""
+        # ── cloud persistence status ──────────────────────────────────────────
+        from shared.cloud_store import is_available as _cloud_ok
+        if _cloud_ok():
+            st.success("☁️ **Supabase connected** — brain state persists across restarts and deploys.",
+                       icon="✅")
+        else:
+            _has_url = bool(_supabase_url)
+            _has_key = bool(_supabase_key)
+            if _has_url or _has_key:
+                st.error(
+                    f"☁️ **Supabase credentials partially received** — URL: {'✅' if _has_url else '❌'}, "
+                    f"Key: {'✅' if _has_key else '❌'}.  \n"
+                    "If both are ✅ but still not connected, try **Manage app → Reboot** in Streamlit Cloud.",
+                    icon="⚠️",
+                )
+            else:
+                st.warning(
+                    "☁️ **No Supabase** — brain resets to defaults every time Streamlit Cloud restarts.  \n"
+                    "Add `SUPABASE_URL` and `SUPABASE_KEY` to your secrets to enable persistent learning.",
+                    icon="💾",
+                )
+            with st.expander("🛠 How to set up Supabase persistence (free, 5 min)"):
+                st.markdown("""
+**Step 1 — Create a free Supabase project**
+1. Go to [supabase.com](https://supabase.com) → New project (free tier is fine)
+2. Choose a region close to you, set a DB password
+
+**Step 2 — Create the `bot_state` table**
+
+Open **SQL Editor** in your Supabase dashboard and run each statement separately:
+
+*Statement 1 — create table:*
+```sql
+CREATE TABLE bot_state (
+    key        TEXT PRIMARY KEY,
+    value      JSONB NOT NULL,
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+```
+*Statement 2 — disable RLS (run after statement 1 succeeds):*
+```sql
+ALTER TABLE bot_state DISABLE ROW LEVEL SECURITY;
+```
+
+**Step 3 — Copy your credentials**
+
+In Supabase → **Project Settings → API**:
+- `SUPABASE_URL` = **Project URL** (e.g. `https://xxxx.supabase.co`)
+- `SUPABASE_KEY` = **service_role** secret key (not the anon key)
+
+**Step 4 — Add to Streamlit secrets**
+
+In your Streamlit Cloud app → **Settings → Secrets**:
+```toml
+SUPABASE_URL = "https://xxxx.supabase.co"
+SUPABASE_KEY = "your-service-role-key"
+```
+Then **Reboot app**. The brain will immediately start persisting after the next resolved market.
+""")
+
+        with st.expander("How the learning loop works"):
+            st.markdown("""
 | Step | Action |
 |---|---|
 | Trade placed | Snapshot signals (value, confidence, weight) at decision time |
@@ -1117,214 +1450,212 @@ with t3:
 | Persist | Saved to `data/learning_state.json` |
 """)
 
+    # ══════════════════════════════════════════════════════════════════════════
+    # TAB 4 — Arbitrage
+    # ══════════════════════════════════════════════════════════════════════════
+    with t4:
+        st.subheader("⚡ Cross-Platform Arbitrage Scanner")
+        st.markdown("Jaccard word-set similarity matching between Polymarket and Kalshi markets.")
 
-# ══════════════════════════════════════════════════════════════════════════════
-# TAB 4 — Arbitrage
-# ══════════════════════════════════════════════════════════════════════════════
-with t4:
-    st.subheader("⚡ Cross-Platform Arbitrage Scanner")
-    st.markdown("Jaccard word-set similarity matching between Polymarket and Kalshi markets.")
+        poly_raw   = [{"condition_id": a["id"], "question": a["question"],
+                       "best_ask": a["price"]} for a in analyses if a["platform"] == "Polymarket"]
+        kalshi_raw = [{"ticker": a["id"], "title": a["question"],
+                       "yes_ask": a["price"]} for a in analyses if a["platform"] == "Kalshi"]
 
-    poly_raw   = [{"condition_id": a["id"], "question": a["question"],
-                   "best_ask": a["price"]} for a in analyses if a["platform"] == "Polymarket"]
-    kalshi_raw = [{"ticker": a["id"], "title": a["question"],
-                   "yes_ask": a["price"]} for a in analyses if a["platform"] == "Kalshi"]
+        try:
+            # Only surface pairs whose spread actually clears fees (matches the
+            # explanatory text below); min_spread=0 would list non-actionable rows.
+            arb = CrossMarketCorrelator().find_arbitrage(poly_raw, kalshi_raw, min_spread=0.01)
+        except Exception:
+            arb = []
 
-    try:
-        # Only surface pairs whose spread actually clears fees (matches the
-        # explanatory text below); min_spread=0 would list non-actionable rows.
-        arb = CrossMarketCorrelator().find_arbitrage(poly_raw, kalshi_raw, min_spread=0.01)
-    except Exception:
-        arb = []
-
-    if arb:
-        arb_rows = [{
-            "Polymarket":    o.poly_question[:55],
-            "Kalshi":        o.kalshi_question[:55],
-            "Poly":          f"{o.polymarket_yes_price:.1%}",
-            "Kalshi Price":  f"{o.kalshi_yes_price:.1%}",
-            "Gross Spread":  f"{o.spread:+.1%}",
-            "Net Spread":    f"{o.net_spread:+.1%}",
-            "Direction":     o.direction,
-        } for o in arb]
-        st.dataframe(pd.DataFrame(arb_rows), use_container_width=True, hide_index=True)
-    else:
-        st.info("No arb opportunities in the current mock dataset.")
-        st.markdown("""
+        if arb:
+            arb_rows = [{
+                "Polymarket":    o.poly_question[:55],
+                "Kalshi":        o.kalshi_question[:55],
+                "Poly":          f"{o.polymarket_yes_price:.1%}",
+                "Kalshi Price":  f"{o.kalshi_yes_price:.1%}",
+                "Gross Spread":  f"{o.spread:+.1%}",
+                "Net Spread":    f"{o.net_spread:+.1%}",
+                "Direction":     o.direction,
+            } for o in arb]
+            st.dataframe(pd.DataFrame(arb_rows), use_container_width=True, hide_index=True)
+        else:
+            st.info("No arb opportunities in the current mock dataset.")
+            st.markdown("""
 **How it works:**
 - Compare all Poly × Kalshi market pairs using Jaccard word similarity
 - Flag pairs > 40% similar as covering the same event
 - Show only pairs where net spread (after fees) exceeds the threshold
 """)
 
-    # ── Intra-market arbitrage (single-platform, risk-free) ──────────────────
-    st.divider()
-    st.subheader("🎯 Intra-Market Arbitrage (Polymarket)")
-    st.markdown(
-        "Risk-free **binary bundle** arb: if `YES_ask + NO_ask < $1.00`, buying "
-        "both sides locks in profit no matter how the market resolves. Needs "
-        "**live order books** (real separate YES/NO asks), so this scans on demand."
-    )
-
-    _live_poly = [m for m in _source_markets
-                  if m["platform"] == "Polymarket" and m.get("yes_token_id")]
-
-    col_a, col_b = st.columns([1, 2])
-    with col_a:
-        fee_bps = st.number_input(
-            "Fee/gas buffer per share (¢)", value=0.0, min_value=0.0,
-            max_value=5.0, step=0.5,
-            help="Subtracted per leg. Polymarket CLOB currently has no taker fee.",
+        # ── Intra-market arbitrage (single-platform, risk-free) ──────────────
+        st.divider()
+        st.subheader("🎯 Intra-Market Arbitrage (Polymarket)")
+        st.markdown(
+            "Risk-free **binary bundle** arb: if `YES_ask + NO_ask < $1.00`, buying "
+            "both sides locks in profit no matter how the market resolves. Needs "
+            "**live order books** (real separate YES/NO asks), so this scans on demand."
         )
-        scan_n = st.slider("Markets to scan", 3, 25, 12,
-                           help="Each market = 2 order-book calls.")
 
-    if not _poly_live:
-        st.info("Connect a live Polymarket feed (POLYMARKET_API_KEY) to scan real "
-                "order books. Mock mids always sum to ~$1.00, so no arb appears.")
-    elif st.button("🔍 Scan live order books for arb", use_container_width=True):
-        with st.spinner(f"Fetching YES/NO books for {min(scan_n, len(_live_poly))} markets…"):
-            try:
-                enriched = _fetch_polymarket_arb_sync(_poly_key, _live_poly[:scan_n])
-                detector = IntraMarketArbitrage(
-                    fee_per_share=fee_bps / 100.0, min_net_profit=0.0
+        _live_poly = [m for m in _source_markets
+                      if m["platform"] == "Polymarket" and m.get("yes_token_id")]
+
+        col_a, col_b = st.columns([1, 2])
+        with col_a:
+            fee_bps = st.number_input(
+                "Fee/gas buffer per share (¢)", value=0.0, min_value=0.0,
+                max_value=5.0, step=0.5,
+                help="Subtracted per leg. Polymarket CLOB currently has no taker fee.",
+            )
+            scan_n = st.slider("Markets to scan", 3, 25, 12,
+                               help="Each market = 2 order-book calls.")
+
+        if not _poly_live:
+            st.info("Connect a live Polymarket feed (POLYMARKET_API_KEY) to scan real "
+                    "order books. Mock mids always sum to ~$1.00, so no arb appears.")
+        elif st.button("🔍 Scan live order books for arb", use_container_width=True):
+            with st.spinner(f"Fetching YES/NO books for {min(scan_n, len(_live_poly))} markets…"):
+                try:
+                    enriched = _fetch_polymarket_arb_sync(_poly_key, _live_poly[:scan_n])
+                    detector = IntraMarketArbitrage(
+                        fee_per_share=fee_bps / 100.0, min_net_profit=0.0
+                    )
+                    arbs = detector.find_binary_bundle(enriched)
+                except Exception as e:
+                    arbs = []
+                    st.error(f"Order-book scan failed: {type(e).__name__}: {e}")
+                    enriched = []
+
+            if arbs:
+                st.success(f"Found {len(arbs)} binary-bundle arbitrage opportunit"
+                           f"{'y' if len(arbs) == 1 else 'ies'}!")
+                ia_rows = [{
+                    "Question":   o.question[:60],
+                    "YES ask":    f"{o.legs[0].ask:.1%}",
+                    "NO ask":     f"{o.legs[1].ask:.1%}",
+                    "Total cost": f"${o.total_cost:.4f}",
+                    "Net profit": f"${o.net_profit:+.4f}",
+                    "ROI":        f"{o.roi:+.2%}",
+                    "Conf.":      f"{o.confidence:.0%}",
+                } for o in arbs]
+                st.dataframe(pd.DataFrame(ia_rows), use_container_width=True, hide_index=True)
+            elif enriched:
+                st.info(f"Scanned {len(enriched)} live markets — no bundle priced under "
+                        "$1.00 right now. These windows are brief; re-scan during volatility.")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # TAB 5 — Portfolio
+    # ══════════════════════════════════════════════════════════════════════════
+    with t5:
+        st.subheader("💼 Monte Carlo Portfolio Simulator")
+        st.info("**MOCK MODE** — outcomes are simulated, no real orders placed.")
+        st.markdown(
+            "Each prediction-market position is a binary bet that wins (resolves "
+            "your way) or loses its full stake. Rather than one coin-flip per "
+            "position, this runs the **whole basket thousands of times** to show "
+            "the *distribution* of outcomes — including the probability of profit "
+            "and the **risk of ruin**."
+        )
+
+        # ── build positions from actionable signals ──────────────────────────
+        mc_positions = []
+        pos_rows = []
+        for a in analyses:
+            if a["signal"] == "HOLD":
+                continue
+            size = min(budget * a["kelly"], budget * 0.15)
+            if size < 1.0:
+                continue
+            mcp = position_from_signal(
+                label=a["question"][:30],
+                signal=a["signal"],
+                market_price=a["price"],
+                true_prob=a["prob"],
+                stake=size,
+            )
+            if mcp is None:
+                continue
+            mc_positions.append(mcp)
+            ev = mcp.win_prob * mcp.stake * mcp.win_payoff_mult - (1 - mcp.win_prob) * mcp.stake
+            pos_rows.append({
+                "Platform":  a["platform"],
+                "Question":  a["question"][:50],
+                "Direction": a["signal"].replace("BUY_", ""),
+                "Stake $":   round(size, 2),
+                "Entry":     f"{a['price']:.0%}",
+                "AI Est.":   f"{a['prob']:.0%}",
+                "Win Prob":  f"{mcp.win_prob:.0%}",
+                "Edge":      f"{a['edge']:+.1%}",
+                "EV $":      round(ev, 2),
+            })
+
+        if not mc_positions:
+            st.info("No positions meet the current thresholds.")
+        else:
+            c1, c2 = st.columns([1, 1])
+            with c1:
+                n_sims = st.select_slider(
+                    "Simulations", options=[1000, 5000, 10000, 25000, 50000],
+                    value=10000,
                 )
-                arbs = detector.find_binary_bundle(enriched)
-            except Exception as e:
-                arbs = []
-                st.error(f"Order-book scan failed: {type(e).__name__}: {e}")
-                enriched = []
+            with c2:
+                shock = st.slider(
+                    "Market correlation", 0.0, 0.6, 0.0, 0.05,
+                    help="0 = positions independent. Higher = outcomes move "
+                         "together (macro shock), widening the tails.",
+                )
 
-        if arbs:
-            st.success(f"Found {len(arbs)} binary-bundle arbitrage opportunit"
-                       f"{'y' if len(arbs) == 1 else 'ies'}!")
-            ia_rows = [{
-                "Question":   o.question[:60],
-                "YES ask":    f"{o.legs[0].ask:.1%}",
-                "NO ask":     f"{o.legs[1].ask:.1%}",
-                "Total cost": f"${o.total_cost:.4f}",
-                "Net profit": f"${o.net_profit:+.4f}",
-                "ROI":        f"{o.roi:+.2%}",
-                "Conf.":      f"{o.confidence:.0%}",
-            } for o in arbs]
-            st.dataframe(pd.DataFrame(ia_rows), use_container_width=True, hide_index=True)
-        elif enriched:
-            st.info(f"Scanned {len(enriched)} live markets — no bundle priced under "
-                    "$1.00 right now. These windows are brief; re-scan during volatility.")
+            mc = MonteCarloPortfolio(n_sims=n_sims, seed=42, market_shock=shock)
+            res = mc.simulate(mc_positions, bankroll=budget, ruin_fraction=0.5)
 
+            # headline metrics
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Positions", res.n_positions)
+            m2.metric("Total Staked", f"${res.total_staked:.0f}")
+            m3.metric("Expected P&L", f"${res.mean_pnl:+.2f}",
+                      f"{res.expected_roi:+.1%} ROI")
+            m4.metric("Prob. of Profit", f"{res.prob_profit:.0%}")
 
-# ══════════════════════════════════════════════════════════════════════════════
-# TAB 5 — Portfolio
-# ══════════════════════════════════════════════════════════════════════════════
-with t5:
-    st.subheader("💼 Monte Carlo Portfolio Simulator")
-    st.info("**MOCK MODE** — outcomes are simulated, no real orders placed.")
-    st.markdown(
-        "Each prediction-market position is a binary bet that wins (resolves "
-        "your way) or loses its full stake. Rather than one coin-flip per "
-        "position, this runs the **whole basket thousands of times** to show "
-        "the *distribution* of outcomes — including the probability of profit "
-        "and the **risk of ruin**."
-    )
+            m5, m6, m7, m8 = st.columns(4)
+            m5.metric("Median P&L", f"${res.median_pnl:+.2f}")
+            m6.metric("P5 (downside)", f"${res.p5:+.2f}")
+            m7.metric("P95 (upside)", f"${res.p95:+.2f}")
+            m8.metric("Risk of Ruin", f"{res.risk_of_ruin:.1%}",
+                      help="Chance of losing ≥ 50% of the budget across the basket.")
 
-    # ── build positions from actionable signals ──────────────────────────────
-    mc_positions = []
-    pos_rows = []
-    for a in analyses:
-        if a["signal"] == "HOLD":
-            continue
-        size = min(budget * a["kelly"], budget * 0.15)
-        if size < 1.0:
-            continue
-        mcp = position_from_signal(
-            label=a["question"][:30],
-            signal=a["signal"],
-            market_price=a["price"],
-            true_prob=a["prob"],
-            stake=size,
-        )
-        if mcp is None:
-            continue
-        mc_positions.append(mcp)
-        ev = mcp.win_prob * mcp.stake * mcp.win_payoff_mult - (1 - mcp.win_prob) * mcp.stake
-        pos_rows.append({
-            "Platform":  a["platform"],
-            "Question":  a["question"][:50],
-            "Direction": a["signal"].replace("BUY_", ""),
-            "Stake $":   round(size, 2),
-            "Entry":     f"{a['price']:.0%}",
-            "AI Est.":   f"{a['prob']:.0%}",
-            "Win Prob":  f"{mcp.win_prob:.0%}",
-            "Edge":      f"{a['edge']:+.1%}",
-            "EV $":      round(ev, 2),
-        })
+            if res.risk_of_ruin >= 0.10:
+                st.warning(
+                    f"⚠️ **{res.risk_of_ruin:.0%} risk of ruin** — Kelly sizing may be "
+                    "too aggressive for this basket. Consider lowering the budget or "
+                    "raising the confidence threshold."
+                )
 
-    if not mc_positions:
-        st.info("No positions meet the current thresholds.")
-    else:
-        c1, c2 = st.columns([1, 1])
-        with c1:
-            n_sims = st.select_slider(
-                "Simulations", options=[1000, 5000, 10000, 25000, 50000],
-                value=10000,
+            # fan chart: cumulative P&L percentile bands as bets are added
+            st.markdown("**Cumulative P&L fan chart** (P5 / Median / P95 across paths)")
+            fan_df = pd.DataFrame(
+                {"P5": res.band_p5, "Median": res.band_p50, "P95": res.band_p95},
+                index=res.step_labels,
             )
-        with c2:
-            shock = st.slider(
-                "Market correlation", 0.0, 0.6, 0.0, 0.05,
-                help="0 = positions independent. Higher = outcomes move "
-                     "together (macro shock), widening the tails.",
+            st.line_chart(fan_df, height=260, use_container_width=True)
+
+            # final P&L distribution
+            st.markdown("**Final P&L distribution** (all simulated outcomes)")
+            hist_df = pd.DataFrame(
+                {"Frequency": res.hist_counts},
+                index=[f"${c:+.0f}" for c in res.hist_centers],
+            )
+            st.bar_chart(hist_df, height=220, use_container_width=True)
+
+            st.dataframe(pd.DataFrame(pos_rows), use_container_width=True, hide_index=True)
+            st.caption(
+                "Win probability uses the AI/ensemble estimate; payoff is the binary "
+                "market's mechanical $1 resolution. Outcomes assumed independent unless "
+                "you raise the market-correlation slider."
             )
 
-        mc = MonteCarloPortfolio(n_sims=n_sims, seed=42, market_shock=shock)
-        res = mc.simulate(mc_positions, bankroll=budget, ruin_fraction=0.5)
-
-        # headline metrics
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Positions", res.n_positions)
-        m2.metric("Total Staked", f"${res.total_staked:.0f}")
-        m3.metric("Expected P&L", f"${res.mean_pnl:+.2f}",
-                  f"{res.expected_roi:+.1%} ROI")
-        m4.metric("Prob. of Profit", f"{res.prob_profit:.0%}")
-
-        m5, m6, m7, m8 = st.columns(4)
-        m5.metric("Median P&L", f"${res.median_pnl:+.2f}")
-        m6.metric("P5 (downside)", f"${res.p5:+.2f}")
-        m7.metric("P95 (upside)", f"${res.p95:+.2f}")
-        m8.metric("Risk of Ruin", f"{res.risk_of_ruin:.1%}",
-                  help="Chance of losing ≥ 50% of the budget across the basket.")
-
-        if res.risk_of_ruin >= 0.10:
-            st.warning(
-                f"⚠️ **{res.risk_of_ruin:.0%} risk of ruin** — Kelly sizing may be "
-                "too aggressive for this basket. Consider lowering the budget or "
-                "raising the confidence threshold."
-            )
-
-        # fan chart: cumulative P&L percentile bands as bets are added
-        st.markdown("**Cumulative P&L fan chart** (P5 / Median / P95 across paths)")
-        fan_df = pd.DataFrame(
-            {"P5": res.band_p5, "Median": res.band_p50, "P95": res.band_p95},
-            index=res.step_labels,
-        )
-        st.line_chart(fan_df, height=260, use_container_width=True)
-
-        # final P&L distribution
-        st.markdown("**Final P&L distribution** (all simulated outcomes)")
-        hist_df = pd.DataFrame(
-            {"Frequency": res.hist_counts},
-            index=[f"${c:+.0f}" for c in res.hist_centers],
-        )
-        st.bar_chart(hist_df, height=220, use_container_width=True)
-
-        st.dataframe(pd.DataFrame(pos_rows), use_container_width=True, hide_index=True)
-        st.caption(
-            "Win probability uses the AI/ensemble estimate; payoff is the binary "
-            "market's mechanical $1 resolution. Outcomes assumed independent unless "
-            "you raise the market-correlation slider."
-        )
-
-    st.divider()
-    st.markdown("""
+        st.divider()
+        st.markdown("""
 #### Pre-live checklist
 - [ ] Run in mock mode for **≥ 2 weeks**, review each decision manually
 - [ ] `python scripts/quickstart.py` — verify all API connections
@@ -1333,112 +1664,137 @@ with t5:
 - [ ] Only then: set `MOCK_MODE=false` in `.env`
 """)
 
-# ══════════════════════════════════════════════════════════════════════════════
-# TAB 6 — Execute
-# ══════════════════════════════════════════════════════════════════════════════
-with t6:
-    st.subheader("🚀 Execute Trades")
+    # ══════════════════════════════════════════════════════════════════════════
+    # TAB 6 — Execute
+    # ══════════════════════════════════════════════════════════════════════════
+    with t6:
+        st.subheader("🚀 Execute Trades")
 
-    if live_trading:
-        st.error("🚨 **LIVE TRADING ENABLED** — buttons below place REAL orders with "
-                 "REAL money on Polygon. Each requires an explicit confirmation.")
-        st.caption("Note: live execution requires `py-clob-client` to be installed in "
-                   "this environment. If you see a 'SigningUnavailable' error, use the "
-                   "local bot (`MOCK_MODE=false python main.py`) instead — it includes "
-                   "the full signing toolchain via requirements.txt.")
-    else:
-        st.info("🔵 **Paper mode** — buttons below simulate fills only. "
-                "No real orders are placed.")
+        if live_trading:
+            st.error("🚨 **LIVE TRADING ENABLED** — buttons below place REAL orders with "
+                     "REAL money on Polygon. Each requires an explicit confirmation.")
+            st.caption("Note: live execution requires `py-clob-client` to be installed in "
+                       "this environment. If you see a 'SigningUnavailable' error, use the "
+                       "local bot (`MOCK_MODE=false python main.py`) instead — it includes "
+                       "the full signing toolchain via requirements.txt.")
+        else:
+            st.info("🔵 **Paper mode** — buttons below simulate fills only. "
+                    "No real orders are placed.")
 
-    exec_signals = [a for a in actionable if a["kelly"] > 0]
-    if not exec_signals:
-        st.info("No actionable BUY signals at the current confidence threshold.")
-    else:
-        st.caption(f"{len(exec_signals)} actionable signal(s). "
-                   "Suggested size = Kelly fraction × budget (capped at 15%).")
+        # ── order book with live P&L ──────────────────────────────────────────
+        st.markdown("### 📊 Order Book & P&L")
+        _render_order_book("exec")
+        st.divider()
 
-        for a in sorted(exec_signals, key=lambda x: -abs(x["edge"])):
-            size = float(min(budget * a["kelly"], budget * 0.15))
-            direction = "YES" if a["signal"] == "BUY_YES" else "NO"
-            is_poly = a["platform"] == "Polymarket"
-            token_id = a["yes_token_id"] if direction == "YES" else a["no_token_id"]
-            can_live = bool(live_trading and is_poly and token_id and _poly_pk)
+        st.markdown("### 🛒 Place New Trades")
+        exec_signals = [a for a in actionable if a["kelly"] > 0]
+        if not exec_signals:
+            st.info("No actionable BUY signals at the current confidence threshold.")
+        else:
+            st.caption(f"{len(exec_signals)} actionable signal(s). "
+                       "Size = Kelly fraction × platform budget (capped at 15%).")
 
-            with st.container(border=True):
-                cL, cR = st.columns([3, 2])
-                with cL:
-                    st.markdown(
-                        f"**{a['platform']}** · {a['question'][:70]}  \n"
-                        f"{SIGNAL_ICONS[a['signal']]} · entry **{a['price']:.0%}** · "
-                        f"AI **{a['prob']:.0%}** · edge **{a['edge']:+.1%}** · "
-                        f"conf **{a['conf']:.0%}**"
-                    )
-                    st.caption(f"Suggested size: **${size:.2f}** "
-                               f"(≈{(size / a['price']) if a['price'] else 0:.1f} shares @ {a['price']:.0%})")
-                with cR:
-                    # Paper trade — always available
-                    if st.button("📝 Paper Buy", key=f"paper_{a['id']}",
-                                 use_container_width=True):
-                        st.session_state.paper_ledger.append({
-                            "Platform": a["platform"], "Question": a["question"][:50],
-                            "Dir": direction, "Size $": round(size, 2),
-                            "Entry": f"{a['price']:.0%}", "Edge": f"{a['edge']:+.1%}",
-                            "Time": time.strftime("%H:%M:%S"),
-                        })
-                        st.toast(f"Paper buy recorded: {a['question'][:30]}")
+            for a in sorted(exec_signals, key=lambda x: -abs(x["edge"])):
+                _pb = poly_budget if a["platform"] == "Polymarket" else kalshi_budget
+                size = float(min(_pb * a["kelly"], _pb * 0.15))
+                direction = "YES" if a["signal"] == "BUY_YES" else "NO"
+                is_poly = a["platform"] == "Polymarket"
+                token_id = a["yes_token_id"] if direction == "YES" else a["no_token_id"]
+                can_live = bool(live_trading and is_poly and token_id and _poly_pk)
 
-                    # Live execution — heavily gated
-                    if live_trading:
-                        if not is_poly:
-                            st.caption("⚠️ Live execution from the dashboard supports "
-                                       "Polymarket only. Use the bot for Kalshi.")
-                        elif not token_id:
-                            st.caption("⚠️ No token id (mock market) — paper only.")
-                        elif can_live:
-                            confirm = st.checkbox(
-                                f"Confirm REAL ${size:.2f} order",
-                                key=f"confirm_{a['id']}",
-                            )
-                            if st.button("🚨 EXECUTE LIVE", key=f"live_{a['id']}",
-                                         type="primary", use_container_width=True,
-                                         disabled=not confirm):
-                                try:
-                                    with st.spinner("Signing & posting order…"):
-                                        res = _execute_live_polymarket_order(
-                                            token_id=token_id, price=a["price"],
-                                            size_usd=size, side="BUY",
-                                            private_key=_poly_pk,
-                                            sig_type=_poly_sig_type,
-                                            funder=_poly_funder,
-                                        )
-                                    st.session_state.live_ledger.append({
-                                        "Platform": a["platform"],
-                                        "Question": a["question"][:50],
-                                        "Dir": direction, "Size $": round(size, 2),
-                                        "Order ID": res["order_id"],
-                                        "Status": res["status"],
-                                        "Time": time.strftime("%H:%M:%S"),
-                                    })
-                                    st.success(f"Order posted: {res['order_id']} "
-                                               f"({res['status']})")
-                                except SigningUnavailable as exc:
-                                    st.error(f"Live signing unavailable: {exc}")
-                                except Exception as exc:
-                                    st.error(f"Order failed: {exc}")
+                with st.container(border=True):
+                    cL, cR = st.columns([3, 2])
+                    with cL:
+                        st.markdown(
+                            f"**{a['platform']}** · {a['question'][:70]}  \n"
+                            f"{SIGNAL_ICONS[a['signal']]} · entry **{a['price']:.0%}** · "
+                            f"AI **{a['prob']:.0%}** · edge **{a['edge']:+.1%}** · "
+                            f"conf **{a['conf']:.0%}**"
+                        )
+                        st.caption(f"Suggested size: **${size:.2f}** "
+                                   f"(≈{(size / a['price']) if a['price'] else 0:.1f} shares @ {a['price']:.0%})")
+                    with cR:
+                        # Paper trade — always available
+                        if st.button("📝 Paper Buy", key=f"paper_{a['id']}",
+                                     use_container_width=True):
+                            st.session_state.paper_ledger.append({
+                                "Platform":  a["platform"],
+                                "Question":  a["question"][:50],
+                                "Dir":       direction,
+                                "Size $":    round(size, 2),
+                                "entry_num": a["price"],
+                                "Entry":     f"{a['price']:.0%}",
+                                "AI Est.":   f"{a['prob']:.0%}",
+                                "Edge":      f"{a['edge']:+.1%}",
+                                "Conf":      f"{a['conf']:.0%}",
+                                "Time":      time.strftime("%H:%M:%S"),
+                                "Mode":      "👆 Manual",
+                            })
+                            st.session_state._brain.on_trade_placed(_to_brain_input(a))
+                            st.toast(f"Paper buy recorded: {a['question'][:30]}")
 
-    # ── ledger link ──────────────────────────────────────────────────────────
-    _tot = len(st.session_state.paper_ledger) + len(st.session_state.live_ledger)
-    if _tot:
-        st.info(f"📋 **{_tot} trade(s) recorded** this session — see the "
-                "**Today's Session** strip above the tabs for the full ledger.")
+                        # Live execution — heavily gated
+                        if live_trading:
+                            if not is_poly:
+                                st.caption("⚠️ Live execution from the dashboard supports "
+                                           "Polymarket only. Use the bot for Kalshi.")
+                            elif not token_id:
+                                st.caption("⚠️ No token id (mock market) — paper only.")
+                            elif can_live:
+                                confirm = st.checkbox(
+                                    f"Confirm REAL ${size:.2f} order",
+                                    key=f"confirm_{a['id']}",
+                                )
+                                if st.button("🚨 EXECUTE LIVE", key=f"live_{a['id']}",
+                                             type="primary", use_container_width=True,
+                                             disabled=not confirm):
+                                    try:
+                                        with st.spinner("Signing & posting order…"):
+                                            res = _execute_live_polymarket_order(
+                                                token_id=token_id, price=a["price"],
+                                                size_usd=size, side="BUY",
+                                                private_key=_poly_pk,
+                                                sig_type=_poly_sig_type,
+                                                funder=_poly_funder,
+                                            )
+                                        st.session_state.live_ledger.append({
+                                            "Platform":  a["platform"],
+                                            "Question":  a["question"][:50],
+                                            "Dir":       direction,
+                                            "Size $":    round(size, 2),
+                                            "entry_num": a["price"],
+                                            "Entry":     f"{a['price']:.0%}",
+                                            "AI Est.":   f"{a['prob']:.0%}",
+                                            "Edge":      f"{a['edge']:+.1%}",
+                                            "Order ID":  res["order_id"],
+                                            "Status":    res["status"],
+                                            "Time":      time.strftime("%H:%M:%S"),
+                                            "Mode":      "👆 Manual-Live",
+                                        })
+                                        st.session_state._brain.on_trade_placed(_to_brain_input(a))
+                                        st.success(f"Order posted: {res['order_id']} "
+                                                   f"({res['status']})")
+                                    except SigningUnavailable as exc:
+                                        st.error(f"Live signing unavailable: {exc}")
+                                    except Exception as exc:
+                                        st.error(f"Order failed: {exc}")
+
+        # ── ledger link ──────────────────────────────────────────────────────
+        _tot = len(st.session_state.paper_ledger) + len(st.session_state.live_ledger)
+        if _tot:
+            st.info(f"📋 **{_tot} trade(s) recorded** this session — see the "
+                    "**Today's Session** strip above the tabs for the full ledger.")
+
+    # ── footer (inside fragment so mode indicators stay current) ─────────────
+    st.divider()
+    _parts = []
+    if _poly_live:    _parts.append("Live Polymarket")
+    if _kalshi_live:  _parts.append("Live Kalshi")
+    if _live_ai_mode: _parts.append("Live Claude AI")
+    if not _parts:    _parts.append("Mock mode")
+    _parts.append("🚨 LIVE TRADING" if live_trading else "Paper trades only")
+    st.caption(f"🤖 Polymarket AI Bot | {' · '.join(_parts)} | {time.strftime('%H:%M UTC', time.gmtime())}")
 
 
-# ── footer ────────────────────────────────────────────────────────────────────
-st.divider()
-_parts = []
-if _poly_live:    _parts.append("Live Polymarket")
-if _kalshi_live:  _parts.append("Live Kalshi")
-if _live_ai_mode: _parts.append("Live Claude AI")
-if not _parts:    _parts.append("Mock mode")
-_parts.append("🚨 LIVE TRADING" if live_trading else "Paper trades only")
-st.caption(f"🤖 Polymarket AI Bot | {' · '.join(_parts)} | {time.strftime('%H:%M UTC', time.gmtime())}")
+# ── call the fragment ──────────────────────────────────────────────────────────
+_live_dashboard()

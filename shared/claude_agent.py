@@ -272,7 +272,12 @@ class ClaudeAgent:
                 results[orig_idx] = analysis
 
         except Exception as exc:
-            log.error("batch_analysis_failed", error=str(exc))
+            err_str = str(exc)
+            # Hard errors (usage limits, auth) should propagate so callers can
+            # correctly mark AI as unavailable instead of silently returning fallbacks.
+            if "usage limit" in err_str.lower() or "401" in err_str or "authentication" in err_str.lower():
+                raise
+            log.error("batch_analysis_failed", error=err_str)
             for orig_idx, m in zip(uncached_indices, uncached):
                 results[orig_idx] = self._fallback(
                     m["id"], m.get("question", ""), float(m.get("price", 0.5))
