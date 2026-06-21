@@ -401,6 +401,27 @@ button[data-baseweb="tab"] { font-weight:600; }
 
 /* Rounder dataframes */
 div[data-testid="stDataFrame"] { border-radius:10px; overflow:hidden; }
+
+/* Sidebar toggle: always visible, branded colour, easy to click */
+button[data-testid="stSidebarCollapsedControl"],
+section[data-testid="stSidebarCollapsedControl"] {
+    background: #6366f1 !important;
+    border-radius: 0 10px 10px 0 !important;
+    width: 28px !important;
+    min-height: 56px !important;
+    opacity: 1 !important;
+    box-shadow: 2px 0 8px rgba(99,102,241,.45) !important;
+}
+button[data-testid="stSidebarCollapsedControl"]:hover,
+section[data-testid="stSidebarCollapsedControl"]:hover {
+    background: #4f46e5 !important;
+    box-shadow: 2px 0 14px rgba(99,102,241,.7) !important;
+}
+button[data-testid="stSidebarCollapsedControl"] svg,
+section[data-testid="stSidebarCollapsedControl"] svg {
+    fill: #fff !important;
+    stroke: #fff !important;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -676,19 +697,7 @@ with st.sidebar:
             st.caption("ℹ️ Reboot the app after saving secrets (Manage app → Reboot)")
     st.caption("Live connection status is shown in the main panel →")
     st.divider()
-    st.markdown("**💰 Trade Sizing**")
-    poly_budget   = st.number_input("Polymarket ($)", value=10.0, min_value=1.0, step=5.0,
-                                    key="poly_budget", help="Max $ per Polymarket trade")
-    kalshi_budget = st.number_input("Kalshi ($)",      value=10.0, min_value=1.0, step=5.0,
-                                    key="kalshi_budget", help="Max $ per Kalshi trade")
-    budget = poly_budget + kalshi_budget   # total for portfolio/Kelly calculations
-    st.caption(f"Total budget: **${budget:.0f}**")
-    min_conf = st.slider("Min confidence", 0.40, 0.90, 0.55, 0.05, key="sidebar_min_conf")
-    st.divider()
-
-    # ── Bot Controls ────────────────────────────────────────────────────────
-    st.markdown("**🤖 Bot Controls**")
-    st.caption("⚙️ Auto-trade and refresh controls are in the main panel ↗")
+    st.caption("💰 Budget, confidence & refresh controls are in the main panel ↗")
     st.divider()
     if st.button("🔄 Re-run Analysis", use_container_width=True, key="rerun_sidebar"):
         st.cache_data.clear()
@@ -737,7 +746,18 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 # ── demo toggle + run button (outside fragment — must not be disrupted) ────────
-_bar2, _bar3 = st.columns([5, 1])
+_bar1, _bar2, _bar3 = st.columns([3, 2, 1])
+with _bar1:
+    # Budget controls here so they're always visible (sidebar may be collapsed)
+    _bc1, _bc2, _bc3 = st.columns(3)
+    with _bc1:
+        st.number_input("Polymarket budget ($)", value=10.0, min_value=1.0, step=5.0,
+                        key="poly_budget", help="Max $ per Polymarket trade")
+    with _bc2:
+        st.number_input("Kalshi budget ($)", value=10.0, min_value=1.0, step=5.0,
+                        key="kalshi_budget", help="Max $ per Kalshi trade")
+    with _bc3:
+        st.slider("Min confidence", 0.40, 0.90, 0.55, 0.05, key="sidebar_min_conf")
 with _bar2:
     _demo_new = st.toggle(
         "🔵 Demo mode",
