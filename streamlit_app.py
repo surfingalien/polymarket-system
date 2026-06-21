@@ -635,6 +635,16 @@ with st.sidebar:
     st.markdown("✅ Polymarket key set" if _poly_key       else "⚪ No Polymarket key → mock data")
     st.markdown("✅ Kalshi keys set"    if (_kalshi_key and _kalshi_pem) else "⚪ No Kalshi keys → mock data")
     st.markdown("✅ Supabase connected" if (_supabase_url and _supabase_key) else "⚪ No Supabase → brain resets on restart")
+    if not _supabase_url:
+        _raw_url = ""
+        try:
+            _raw_url = str(st.secrets.get("SUPABASE_URL", ""))
+        except Exception:
+            pass
+        if _raw_url:
+            st.caption(f"⚠️ Secret found but under wrong name. URL starts: `{_raw_url[:12]}…`")
+        else:
+            st.caption("ℹ️ Reboot the app after saving secrets (Manage app → Reboot)")
     st.caption("Live connection status is shown in the main panel →")
     st.divider()
     budget   = st.number_input("Paper budget ($)", value=100.0, min_value=10.0, step=10.0)
@@ -1217,11 +1227,21 @@ with t3:
         st.success("☁️ **Supabase connected** — brain state persists across restarts and deploys.",
                    icon="✅")
     else:
-        st.warning(
-            "☁️ **No Supabase** — brain resets to defaults every time Streamlit Cloud restarts.  \n"
-            "Add `SUPABASE_URL` and `SUPABASE_KEY` to your secrets to enable persistent learning.",
-            icon="💾",
-        )
+        _has_url = bool(_supabase_url)
+        _has_key = bool(_supabase_key)
+        if _has_url or _has_key:
+            st.error(
+                f"☁️ **Supabase credentials partially received** — URL: {'✅' if _has_url else '❌'}, "
+                f"Key: {'✅' if _has_key else '❌'}.  \n"
+                "If both are ✅ but still not connected, try **Manage app → Reboot** in Streamlit Cloud.",
+                icon="⚠️",
+            )
+        else:
+            st.warning(
+                "☁️ **No Supabase** — brain resets to defaults every time Streamlit Cloud restarts.  \n"
+                "Add `SUPABASE_URL` and `SUPABASE_KEY` to your secrets to enable persistent learning.",
+                icon="💾",
+            )
         with st.expander("🛠 How to set up Supabase persistence (free, 5 min)"):
             st.markdown("""
 **Step 1 — Create a free Supabase project**
