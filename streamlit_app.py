@@ -1230,13 +1230,18 @@ with t3:
 
 **Step 2 — Create the `bot_state` table**
 
-Open **SQL Editor** in your Supabase dashboard and run:
+Open **SQL Editor** in your Supabase dashboard and run each statement separately:
+
+*Statement 1 — create table:*
 ```sql
 CREATE TABLE bot_state (
     key        TEXT PRIMARY KEY,
     value      JSONB NOT NULL,
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
+```
+*Statement 2 — disable RLS (run after statement 1 succeeds):*
+```sql
 ALTER TABLE bot_state DISABLE ROW LEVEL SECURITY;
 ```
 

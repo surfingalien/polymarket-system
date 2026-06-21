@@ -53,9 +53,9 @@ def cloud_load(key: str) -> dict | None:
     if c is None:
         return None
     try:
-        res = c.table("bot_state").select("value").eq("key", key).maybe_single().execute()
+        res = c.table("bot_state").select("value").eq("key", key).limit(1).execute()
         if res and res.data:
-            return res.data["value"]
+            return res.data[0]["value"]
     except Exception as exc:
         log.warning("cloud_load_failed", key=key, error=str(exc))
     return None
