@@ -402,27 +402,60 @@ button[data-baseweb="tab"] { font-weight:600; }
 /* Rounder dataframes */
 div[data-testid="stDataFrame"] { border-radius:10px; overflow:hidden; }
 
-/* Sidebar toggle: always visible, branded colour, easy to click */
+/* Sidebar toggle: always visible, branded colour — covers div/button/section
+   across Streamlit versions (1.35 uses button, 1.58+ uses div) */
+div[data-testid="stSidebarCollapsedControl"],
 button[data-testid="stSidebarCollapsedControl"],
-section[data-testid="stSidebarCollapsedControl"] {
+section[data-testid="stSidebarCollapsedControl"],
+div[data-testid="collapsedControl"],
+button[data-testid="collapsedControl"] {
     background: #6366f1 !important;
     border-radius: 0 10px 10px 0 !important;
-    width: 28px !important;
+    min-width: 26px !important;
     min-height: 56px !important;
     opacity: 1 !important;
-    box-shadow: 2px 0 8px rgba(99,102,241,.45) !important;
+    box-shadow: 2px 0 10px rgba(99,102,241,.6) !important;
+    z-index: 9999 !important;
+    display: flex !important;
+    align-items: center !important;
+    justify-content: center !important;
 }
+div[data-testid="stSidebarCollapsedControl"]:hover,
 button[data-testid="stSidebarCollapsedControl"]:hover,
-section[data-testid="stSidebarCollapsedControl"]:hover {
+div[data-testid="collapsedControl"]:hover {
     background: #4f46e5 !important;
-    box-shadow: 2px 0 14px rgba(99,102,241,.7) !important;
+    box-shadow: 2px 0 18px rgba(99,102,241,.85) !important;
 }
+div[data-testid="stSidebarCollapsedControl"] svg,
 button[data-testid="stSidebarCollapsedControl"] svg,
-section[data-testid="stSidebarCollapsedControl"] svg {
+div[data-testid="collapsedControl"] svg {
     fill: #fff !important;
     stroke: #fff !important;
 }
 </style>
+<script>
+(function patchSidebarToggle() {
+    function applyStyle() {
+        ["stSidebarCollapsedControl", "collapsedControl"].forEach(function(id) {
+            var el = document.querySelector('[data-testid="' + id + '"]');
+            if (!el) return;
+            el.style.background = "#6366f1";
+            el.style.borderRadius = "0 10px 10px 0";
+            el.style.minWidth = "26px";
+            el.style.minHeight = "56px";
+            el.style.boxShadow = "2px 0 10px rgba(99,102,241,.6)";
+            el.style.zIndex = "9999";
+            el.style.display = "flex";
+            el.style.alignItems = "center";
+            el.style.justifyContent = "center";
+            var svg = el.querySelector("svg");
+            if (svg) { svg.style.fill = "#fff"; svg.style.stroke = "#fff"; }
+        });
+    }
+    applyStyle();
+    new MutationObserver(applyStyle).observe(document.body, { childList: true, subtree: true });
+})();
+</script>
 """, unsafe_allow_html=True)
 
 SIGNAL_ICONS = {"BUY_YES": "🟢 BUY YES", "BUY_NO": "🔴 BUY NO", "HOLD": "⚪ HOLD"}
