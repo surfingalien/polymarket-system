@@ -757,7 +757,12 @@ with st.sidebar:
     st.markdown("**API Keys**")
     st.markdown("✅ Anthropic key set" if _anthropic_key  else "⚪ No Anthropic key → mock AI")
     st.markdown("✅ Polymarket key set" if _poly_key       else "⚪ No Polymarket key → mock data")
-    st.markdown("✅ Kalshi keys set"    if (_kalshi_key and _kalshi_pem) else "⚪ No Kalshi keys → mock data")
+    if _kalshi_key and _kalshi_pem:
+        st.markdown("✅ Kalshi keys set (API key + RSA PEM)")
+    elif _kalshi_key:
+        st.markdown("⚠️ Kalshi API key set but **RSA PEM missing** → add `KALSHI_PRIVATE_KEY_PEM`")
+    else:
+        st.markdown("⚪ No Kalshi keys → mock data")
     st.markdown("✅ Supabase connected" if (_supabase_url and _supabase_key) else "⚪ No Supabase → brain resets on restart")
     if not _supabase_url:
         _raw_url = ""
@@ -780,16 +785,26 @@ with st.sidebar:
     # ── live trading gate (DANGER) ──────────────────────────────────────────
     st.divider()
     st.markdown("### ⚠️ Live Trading")
-    if not _poly_pk:
-        st.caption("📝 Paper mode only — add `POLYMARKET_PRIVATE_KEY` to secrets "
-                   "to unlock live execution (never paste keys into chat).")
-        st.caption("Toggle visible in the main panel once wallet key is set.")
-    else:
-        st.caption("Wallet key detected. Toggle Live trading in the main panel ↗")
+    if _has_live_creds:
+        _live_plat_list = []
+        if _poly_pk:            _live_plat_list.append("Polymarket")
+        if _kalshi_live_creds:  _live_plat_list.append("Kalshi")
+        st.caption(f"✅ Live-trading credentials detected for: **{', '.join(_live_plat_list)}**. "
+                   "Toggle in the main panel ↗")
         if st.session_state.get("live_trading", False):
             st.error("⚡ LIVE MODE ACTIVE — real money at risk!")
-            st.caption(f"Wallet sig type: {_poly_sig_type} "
-                       f"({'EOA' if _poly_sig_type == 0 else 'proxy/safe'})")
+    elif _kalshi_key and not _kalshi_pem:
+        st.caption("🔑 `KALSHI_API_KEY` found but `KALSHI_PRIVATE_KEY_PEM` is missing. "
+                   "Add the RSA private key PEM to secrets to unlock live Kalshi trading.")
+        st.caption("Generate one locally: `python scripts/setup_kalshi_keys.py`, "
+                   "upload the public key to kalshi.com/profile/api, then paste the "
+                   "private key PEM into Streamlit secrets as `KALSHI_PRIVATE_KEY_PEM`.")
+    else:
+        st.caption("📝 Paper mode only. To unlock live trading add one of:  \n"
+                   "• **Kalshi** (US-OK): `KALSHI_API_KEY` + `KALSHI_PRIVATE_KEY_PEM`  \n"
+                   "• **Polymarket** (non-US): `POLYMARKET_PRIVATE_KEY`  \n"
+                   "(Never paste keys into chat.)")
+        st.caption("Toggle visible in the main panel once credentials are saved + app rebooted.")
 
     _missing = [k for k, v in {
         "ANTHROPIC_API_KEY": _anthropic_key,
@@ -878,7 +893,10 @@ with _bs2:
         if st.session_state.get("live_trading", False):
             st.error("LIVE MODE ON", icon="🚨")
     else:
-        st.caption("📝 Paper only\n(add keys for live)")
+        if _kalshi_key and not _kalshi_pem:
+            st.caption("📝 Paper only\n(add `KALSHI_PRIVATE_KEY_PEM`)")
+        else:
+            st.caption("📝 Paper only\n(add Kalshi or Polymarket keys)")
 with _bs3:
     # Always render so Streamlit never drops the auto_live state. Disable it
     # (rather than hide) when live trading is off or no live creds are present.
