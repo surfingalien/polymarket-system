@@ -772,31 +772,38 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 # ── demo toggle + run button (outside fragment — must not be disrupted) ────────
+# IMPORTANT: every control below binds DIRECTLY to its session_state key with no
+# conflicting `value=`/default. Passing both a `value=` and a key that is already
+# in session_state makes Streamlit re-seed the widget on some reruns, which is
+# what caused "▶ Run" to silently reset Demo / Live / Auto-execute. Likewise,
+# auto_live is ALWAYS rendered (disabled when unavailable) — a hidden keyed
+# widget has its state dropped by Streamlit, which broke auto-execution.
+def _on_demo_change():
+    # Demo flips force a fresh data fetch under the new mode.
+    st.cache_data.clear()
+
 _bar1, _bar2, _bar3 = st.columns([3, 2, 1])
 with _bar1:
     # Budget controls here so they're always visible (sidebar may be collapsed)
     _bc1, _bc2, _bc3 = st.columns(3)
     with _bc1:
-        st.number_input("Polymarket budget ($)", value=10.0, min_value=1.0, step=5.0,
+        st.number_input("Polymarket budget ($)", min_value=1.0, step=5.0,
                         key="poly_budget", help="Max $ per Polymarket trade")
     with _bc2:
-        st.number_input("Kalshi budget ($)", value=10.0, min_value=1.0, step=5.0,
+        st.number_input("Kalshi budget ($)", min_value=1.0, step=5.0,
                         key="kalshi_budget", help="Max $ per Kalshi trade")
     with _bc3:
-        st.slider("Min confidence", 0.40, 0.90, 0.55, 0.05, key="sidebar_min_conf")
+        st.slider("Min confidence", 0.40, 0.90, step=0.05, key="sidebar_min_conf")
 with _bar2:
-    _demo_new = st.toggle(
+    st.toggle(
         "🔵 Demo mode",
-        value=st.session_state.demo_mode,
-        key="demo_main",
+        key="demo_mode",
+        on_change=_on_demo_change,
         help="ON = safe simulated data. OFF = live API connections.",
     )
-    if _demo_new != st.session_state.demo_mode:
-        st.session_state.demo_mode = _demo_new
-        st.cache_data.clear()
-        st.rerun()
 with _bar3:
     if st.button("▶ Run", type="primary", use_container_width=True, key="run_main"):
+        # Only refresh data — never touch widget state.
         st.cache_data.clear()
         st.rerun()
 
@@ -805,7 +812,6 @@ _bs1, _bs2, _bs3, _bs4, _bs5 = st.columns(5)
 with _bs1:
     st.toggle(
         "📝 Auto paper trades",
-        value=False,
         key="auto_paper",
         help="Bot automatically logs a paper trade for every Buy signal "
              "that passes your confidence filter on each analysis run.",
@@ -814,7 +820,6 @@ with _bs2:
     if _poly_pk:
         st.toggle(
             "🚨 Live trading (real $)",
-            value=st.session_state.get("live_trading", False),
             key="live_trading",
             help="Switch from Paper to real-money execution on Polymarket. "
                  "Start with $10. Both bots default mock_mode=true — never "
@@ -825,19 +830,21 @@ with _bs2:
     else:
         st.caption("📝 Paper only\n(add wallet key for live)")
 with _bs3:
+    # Always render so Streamlit never drops the auto_live state. Disable it
+    # (rather than hide) when live trading is off or no wallet key is present.
     _live_on = st.session_state.get("live_trading", False)
-    if _poly_pk and _live_on:
-        st.toggle(
-            "🤖 Auto-execute LIVE",
-            value=st.session_state.get("auto_live", False),
-            key="auto_live",
-            help="Bot auto-places REAL Polymarket orders on every refresh cycle. "
-                 "Uses the Polymarket budget set in the sidebar. Stays ON across "
-                 "browser refreshes — disable it manually to stop the bot.",
-        )
-        if st.session_state.get("auto_live", False):
-            st.error("Auto-LIVE ON", icon="⚡")
-    else:
+    _al_ready = bool(_poly_pk and _live_on)
+    st.toggle(
+        "🤖 Auto-execute LIVE",
+        key="auto_live",
+        disabled=not _al_ready,
+        help="Bot auto-places REAL Polymarket orders on every refresh cycle. "
+             "Uses the Polymarket budget above. Stays ON across browser "
+             "refreshes — disable it manually to stop the bot.",
+    )
+    if _al_ready and st.session_state.get("auto_live", False):
+        st.error("Auto-LIVE ON", icon="⚡")
+    elif not _al_ready:
         st.caption("Enable Live trading\nto unlock auto-live")
 with _bs4:
     _n_p_outer = len(st.session_state.paper_ledger)
@@ -850,7 +857,6 @@ with _bs5:
     st.selectbox(
         "⏱ Auto-refresh",
         ["Off", "Every 1 min", "Every 5 min", "Every 15 min", "Every 30 min"],
-        index=0,
         key="refresh_label",
         help="Run the bot 24/7 — fetches fresh data and auto-executes trades "
              "on the chosen interval.",
