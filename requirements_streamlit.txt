@@ -1,6 +1,5 @@
-# Minimal requirements for Streamlit Cloud deployment.
-# No Plotly — uses only Streamlit's built-in charts to guarantee
-# compatibility across Python 3.10–3.14 and all Streamlit versions.
+# Streamlit Cloud deployment requirements.
+# Pinned to Python 3.11 via runtime.txt — all C extensions have wheels.
 anthropic>=0.40.0
 supabase>=2.3.0
 httpx>=0.27.0
@@ -14,10 +13,4 @@ scipy>=1.13.0
 pandas>=2.2.0
 streamlit>=1.35.0
 cryptography>=42.0.0
-
-# py-clob-client is intentionally NOT listed here.
-# It pulls in ckzg/cytoolz/bitarray (C extensions) that may lack Python 3.14
-# wheels and would break the entire Streamlit Cloud deploy. The signing is
-# lazy-imported: demo + paper trading work without it. Live order execution
-# from the dashboard requires adding py-clob-client to a custom environment
-# or running the local bot (main.py) which uses the full requirements.txt.
+py-clob-client>=0.34.0
