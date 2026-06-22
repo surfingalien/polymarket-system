@@ -22,6 +22,7 @@ import httpx
 import numpy as np
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as _stcomp
 
 # ── page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -402,8 +403,7 @@ button[data-baseweb="tab"] { font-weight:600; }
 /* Rounder dataframes */
 div[data-testid="stDataFrame"] { border-radius:10px; overflow:hidden; }
 
-/* Sidebar toggle: always visible, branded colour — covers div/button/section
-   across Streamlit versions (1.35 uses button, 1.58+ uses div) */
+/* Sidebar expand button (shown when sidebar is collapsed) — prominent indigo pill */
 div[data-testid="stSidebarCollapsedControl"],
 button[data-testid="stSidebarCollapsedControl"],
 section[data-testid="stSidebarCollapsedControl"],
@@ -411,52 +411,76 @@ div[data-testid="collapsedControl"],
 button[data-testid="collapsedControl"] {
     background: #6366f1 !important;
     border-radius: 0 10px 10px 0 !important;
-    min-width: 26px !important;
-    min-height: 56px !important;
+    min-width: 28px !important;
+    min-height: 60px !important;
     opacity: 1 !important;
-    box-shadow: 2px 0 10px rgba(99,102,241,.6) !important;
+    box-shadow: 2px 0 12px rgba(99,102,241,.7) !important;
     z-index: 9999 !important;
     display: flex !important;
     align-items: center !important;
     justify-content: center !important;
+    cursor: pointer !important;
 }
 div[data-testid="stSidebarCollapsedControl"]:hover,
 button[data-testid="stSidebarCollapsedControl"]:hover,
 div[data-testid="collapsedControl"]:hover {
     background: #4f46e5 !important;
-    box-shadow: 2px 0 18px rgba(99,102,241,.85) !important;
+    box-shadow: 2px 0 20px rgba(99,102,241,.9) !important;
 }
 div[data-testid="stSidebarCollapsedControl"] svg,
 button[data-testid="stSidebarCollapsedControl"] svg,
-div[data-testid="collapsedControl"] svg {
+div[data-testid="collapsedControl"] svg,
+div[data-testid="stSidebarCollapsedControl"] button svg,
+div[data-testid="collapsedControl"] button svg {
     fill: #fff !important;
     stroke: #fff !important;
+    color: #fff !important;
 }
-</style>
+/* Also style inner button if the control is a wrapper div */
+div[data-testid="stSidebarCollapsedControl"] button,
+div[data-testid="collapsedControl"] button {
+    background: transparent !important;
+    min-width: 28px !important;
+    min-height: 60px !important;
+    width: 100% !important;
+    height: 100% !important;
+}
+""", unsafe_allow_html=True)
+
+# JS via components.html so it actually executes (st.markdown strips <script> tags).
+# Uses window.parent.document to reach the main page DOM from inside the iframe.
+_stcomp.html("""
 <script>
-(function patchSidebarToggle() {
-    function applyStyle() {
-        ["stSidebarCollapsedControl", "collapsedControl"].forEach(function(id) {
-            var el = document.querySelector('[data-testid="' + id + '"]');
+(function() {
+    var doc = window.parent.document;
+    function styleToggle() {
+        var ids = ["stSidebarCollapsedControl", "collapsedControl"];
+        ids.forEach(function(id) {
+            var el = doc.querySelector('[data-testid="' + id + '"]');
             if (!el) return;
             el.style.background = "#6366f1";
             el.style.borderRadius = "0 10px 10px 0";
-            el.style.minWidth = "26px";
-            el.style.minHeight = "56px";
-            el.style.boxShadow = "2px 0 10px rgba(99,102,241,.6)";
+            el.style.minWidth = "28px";
+            el.style.minHeight = "60px";
+            el.style.boxShadow = "2px 0 12px rgba(99,102,241,.7)";
             el.style.zIndex = "9999";
             el.style.display = "flex";
             el.style.alignItems = "center";
             el.style.justifyContent = "center";
-            var svg = el.querySelector("svg");
-            if (svg) { svg.style.fill = "#fff"; svg.style.stroke = "#fff"; }
+            el.style.cursor = "pointer";
+            var btn = el.querySelector("button") || el;
+            [el, btn].forEach(function(e) {
+                var svg = e.querySelector ? e.querySelector("svg") : null;
+                if (svg) { svg.style.fill="#fff"; svg.style.stroke="#fff"; }
+            });
         });
     }
-    applyStyle();
-    new MutationObserver(applyStyle).observe(document.body, { childList: true, subtree: true });
+    styleToggle();
+    new MutationObserver(styleToggle)
+        .observe(doc.body, { childList: true, subtree: true });
 })();
 </script>
-""", unsafe_allow_html=True)
+""", height=0, scrolling=False)
 
 SIGNAL_ICONS = {"BUY_YES": "🟢 BUY YES", "BUY_NO": "🔴 BUY NO", "HOLD": "⚪ HOLD"}
 SIG_CSS      = {"BUY_YES": "signal-yes",  "BUY_NO": "signal-no",  "HOLD": "signal-hold"}
