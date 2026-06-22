@@ -403,84 +403,19 @@ button[data-baseweb="tab"] { font-weight:600; }
 /* Rounder dataframes */
 div[data-testid="stDataFrame"] { border-radius:10px; overflow:hidden; }
 
-/* Sidebar expand button (shown when sidebar is collapsed) — prominent indigo pill */
+/* ── Remove sidebar collapse/expand entirely ──────────────────────────────────
+   Hide every variant of the collapse toggle across Streamlit versions so the
+   sidebar is permanently visible and can never be accidentally hidden. */
 div[data-testid="stSidebarCollapsedControl"],
 button[data-testid="stSidebarCollapsedControl"],
 section[data-testid="stSidebarCollapsedControl"],
 div[data-testid="collapsedControl"],
-button[data-testid="collapsedControl"] {
-    background: #6366f1 !important;
-    border-radius: 0 10px 10px 0 !important;
-    min-width: 28px !important;
-    min-height: 60px !important;
-    opacity: 1 !important;
-    box-shadow: 2px 0 12px rgba(99,102,241,.7) !important;
-    z-index: 9999 !important;
-    display: flex !important;
-    align-items: center !important;
-    justify-content: center !important;
-    cursor: pointer !important;
-}
-div[data-testid="stSidebarCollapsedControl"]:hover,
-button[data-testid="stSidebarCollapsedControl"]:hover,
-div[data-testid="collapsedControl"]:hover {
-    background: #4f46e5 !important;
-    box-shadow: 2px 0 20px rgba(99,102,241,.9) !important;
-}
-div[data-testid="stSidebarCollapsedControl"] svg,
-button[data-testid="stSidebarCollapsedControl"] svg,
-div[data-testid="collapsedControl"] svg,
-div[data-testid="stSidebarCollapsedControl"] button svg,
-div[data-testid="collapsedControl"] button svg {
-    fill: #fff !important;
-    stroke: #fff !important;
-    color: #fff !important;
-}
-/* Also style inner button if the control is a wrapper div */
-div[data-testid="stSidebarCollapsedControl"] button,
-div[data-testid="collapsedControl"] button {
-    background: transparent !important;
-    min-width: 28px !important;
-    min-height: 60px !important;
-    width: 100% !important;
-    height: 100% !important;
+button[data-testid="collapsedControl"],
+[data-testid="stSidebarCollapseButton"],
+[data-testid="stSidebarCloseButton"] {
+    display: none !important;
 }
 """, unsafe_allow_html=True)
-
-# JS via components.html so it actually executes (st.markdown strips <script> tags).
-# Uses window.parent.document to reach the main page DOM from inside the iframe.
-_stcomp.html("""
-<script>
-(function() {
-    var doc = window.parent.document;
-    function styleToggle() {
-        var ids = ["stSidebarCollapsedControl", "collapsedControl"];
-        ids.forEach(function(id) {
-            var el = doc.querySelector('[data-testid="' + id + '"]');
-            if (!el) return;
-            el.style.background = "#6366f1";
-            el.style.borderRadius = "0 10px 10px 0";
-            el.style.minWidth = "28px";
-            el.style.minHeight = "60px";
-            el.style.boxShadow = "2px 0 12px rgba(99,102,241,.7)";
-            el.style.zIndex = "9999";
-            el.style.display = "flex";
-            el.style.alignItems = "center";
-            el.style.justifyContent = "center";
-            el.style.cursor = "pointer";
-            var btn = el.querySelector("button") || el;
-            [el, btn].forEach(function(e) {
-                var svg = e.querySelector ? e.querySelector("svg") : null;
-                if (svg) { svg.style.fill="#fff"; svg.style.stroke="#fff"; }
-            });
-        });
-    }
-    styleToggle();
-    new MutationObserver(styleToggle)
-        .observe(doc.body, { childList: true, subtree: true });
-})();
-</script>
-""", height=0, scrolling=False)
 
 SIGNAL_ICONS = {"BUY_YES": "🟢 BUY YES", "BUY_NO": "🔴 BUY NO", "HOLD": "⚪ HOLD"}
 SIG_CSS      = {"BUY_YES": "signal-yes",  "BUY_NO": "signal-no",  "HOLD": "signal-hold"}
@@ -697,6 +632,31 @@ if "paper_ledger" not in st.session_state:
 if "live_ledger" not in st.session_state:
     st.session_state.live_ledger = []
 
+# ── Persist user settings across browser refreshes via URL query params ────────
+# On first load: read saved values from URL and pre-populate session_state so
+# widgets pick them up. On every run: write current values back into the URL.
+_qp = st.query_params
+def _qp_float(k: str, default: float) -> float:
+    try: return float(_qp.get(k, default))
+    except: return default
+def _qp_bool(k: str, default: bool) -> bool:
+    v = _qp.get(k)
+    return (v == "1") if v is not None else default
+
+_VALID_RL = ["Off", "Every 1 min", "Every 5 min", "Every 15 min", "Every 30 min"]
+
+if "poly_budget"       not in st.session_state:
+    st.session_state.poly_budget       = _qp_float("pb",  10.0)
+if "kalshi_budget"     not in st.session_state:
+    st.session_state.kalshi_budget     = _qp_float("kb",  10.0)
+if "sidebar_min_conf"  not in st.session_state:
+    st.session_state.sidebar_min_conf  = _qp_float("mc",  0.55)
+if "auto_paper"        not in st.session_state:
+    st.session_state.auto_paper        = _qp_bool("ap",   False)
+if "refresh_label"     not in st.session_state:
+    _rl = _qp.get("rl", "Off")
+    st.session_state.refresh_label     = _rl if _rl in _VALID_RL else "Off"
+
 # ── AI brain singleton — one instance per browser session, survives reruns ────
 import types as _types
 if "_brain" not in st.session_state:
@@ -729,7 +689,10 @@ _any_key = bool(
     _get_secret("KALSHI_API_KEY")
 )
 if "demo_mode" not in st.session_state:
-    st.session_state.demo_mode = not _any_key
+    if "demo" in _qp:
+        st.session_state.demo_mode = _qp["demo"] == "1"
+    else:
+        st.session_state.demo_mode = not _any_key
 
 # Stamp the start of every full script run so the fragment can detect timer-fires
 import time as _time_mod
@@ -1876,3 +1839,13 @@ Then **Reboot app**. The brain will immediately start persisting after the next 
 
 # ── call the fragment ──────────────────────────────────────────────────────────
 _live_dashboard()
+
+# ── Save current settings to URL so they survive a browser refresh ─────────────
+st.query_params.update({
+    "demo": "1" if st.session_state.get("demo_mode", True)   else "0",
+    "pb":   str(st.session_state.get("poly_budget",    10.0)),
+    "kb":   str(st.session_state.get("kalshi_budget",  10.0)),
+    "mc":   str(st.session_state.get("sidebar_min_conf", 0.55)),
+    "rl":   st.session_state.get("refresh_label", "Off"),
+    "ap":   "1" if st.session_state.get("auto_paper", False) else "0",
+})
