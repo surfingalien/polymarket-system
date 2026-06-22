@@ -1959,6 +1959,47 @@ Then **Reboot app**. The brain will immediately start persisting after the next 
         if _kal_status:
             st.info(f"📊 Kalshi: {_kal_status}")
 
+        # ── Kalshi near-miss diagnostic ───────────────────────────────────────
+        # Shows EVERY Kalshi market (even HOLD ones, which the Min-confidence
+        # filter hides) with the exact numbers that gate a trade, so it's clear
+        # whether markets are just below threshold or have no edge at all.
+        if _kalshi_live_creds:
+            _kal_all = sorted(
+                (a for a in all_analyses if a["platform"] == "Kalshi"),
+                key=lambda a: abs(a["edge"]), reverse=True,
+            )[:10]
+            if _kal_all:
+                _krows = []
+                for _a in _kal_all:
+                    _conf_ok = _a["conf"] >= 0.50
+                    _edge_ok = abs(_a["edge"]) >= _a["min_edge"]
+                    if _a["signal"] != "HOLD":
+                        _r = "✅ BUY signal"
+                    elif not _conf_ok and not _edge_ok:
+                        _r = "❌ conf & edge both too low"
+                    elif not _conf_ok:
+                        _r = f"❌ conf {_a['conf']:.2f} < 0.50 (quality {_a['quality']:.2f} shrinks it)"
+                    else:
+                        _r = f"❌ edge {abs(_a['edge']):.1%} < min {_a['min_edge']:.1%}"
+                    _krows.append({
+                        "Market":   _a["question"][:38],
+                        "Price":    f"{_a['price']:.0%}",
+                        "ModelProb": f"{_a['prob']:.0%}",
+                        "Edge":     f"{_a['edge']:+.1%}",
+                        "MinEdge":  f"{_a['min_edge']:.1%}",
+                        "AdjConf":  f"{_a['conf']:.2f}",
+                        "Quality":  f"{_a['quality']:.2f}",
+                        "Why":      _r,
+                    })
+                with st.expander(f"🔬 Kalshi markets scanned ({len(_kal_all)}) — why they did/didn't signal", expanded=True):
+                    st.dataframe(pd.DataFrame(_krows), use_container_width=True, hide_index=True)
+                    st.caption(
+                        "A Kalshi BUY needs **AdjConf ≥ 0.50** AND **|Edge| ≥ MinEdge**. "
+                        "AdjConf = model confidence × quality (low Kalshi volume/open-interest "
+                        "shrinks it). If everything is HOLD, Kalshi simply has no high-conviction "
+                        "edge right now — the bot is correctly waiting, not broken."
+                    )
+
         # Per-candidate breakdown: show why each live signal did/didn't trade.
         _live_sigs = [a for a in analyses
                       if a["signal"] != "HOLD"
