@@ -656,6 +656,12 @@ if "auto_paper"        not in st.session_state:
 if "refresh_label"     not in st.session_state:
     _rl = _qp.get("rl", "Off")
     st.session_state.refresh_label     = _rl if _rl in _VALID_RL else "Off"
+# Live toggles persist across refreshes (user opted in). Restored only if a
+# wallet key is present — never auto-arm live trading without credentials.
+if "live_trading"      not in st.session_state:
+    st.session_state.live_trading      = _qp_bool("lt",   False) and bool(_poly_pk)
+if "auto_live"         not in st.session_state:
+    st.session_state.auto_live         = _qp_bool("al",   False) and bool(_poly_pk)
 
 # ── AI brain singleton — one instance per browser session, survives reruns ────
 import types as _types
@@ -823,10 +829,11 @@ with _bs3:
     if _poly_pk and _live_on:
         st.toggle(
             "🤖 Auto-execute LIVE",
-            value=False,
+            value=st.session_state.get("auto_live", False),
             key="auto_live",
             help="Bot auto-places REAL Polymarket orders on every refresh cycle. "
-                 "Uses the Polymarket budget set in the sidebar.",
+                 "Uses the Polymarket budget set in the sidebar. Stays ON across "
+                 "browser refreshes — disable it manually to stop the bot.",
         )
         if st.session_state.get("auto_live", False):
             st.error("Auto-LIVE ON", icon="⚡")
@@ -1848,4 +1855,6 @@ st.query_params.update({
     "mc":   str(st.session_state.get("sidebar_min_conf", 0.55)),
     "rl":   st.session_state.get("refresh_label", "Off"),
     "ap":   "1" if st.session_state.get("auto_paper", False) else "0",
+    "lt":   "1" if st.session_state.get("live_trading", False) else "0",
+    "al":   "1" if st.session_state.get("auto_live", False) else "0",
 })
