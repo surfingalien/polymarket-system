@@ -1190,12 +1190,27 @@ def _live_dashboard():
                 st.session_state._brain.on_trade_placed(_to_brain_input(_a))
                 _live_added += 1
             except Exception as _exc:
-                # Persist the error so it stays visible in the Execute tab
-                # diagnostics (toasts vanish after a few seconds).
+                # A Polymarket failure here is almost always systemic for the
+                # whole cycle (US geo-block → 403, or an invalid wallet key) —
+                # every other signal will fail identically. Record one clear
+                # message and STOP retrying so the log isn't spammed and the
+                # Kalshi block below still runs. Kalshi is the US-accessible path.
+                _msg = str(_exc)
+                if "403" in _msg or "restricted" in _msg.lower():
+                    _hint = ("Polymarket blocks US accounts/IPs (403). This is a "
+                             "jurisdiction rule, not a bug — trade Kalshi instead.")
+                elif "hex" in _msg.lower():
+                    _hint = ("POLYMARKET_PRIVATE_KEY isn't valid hex. Polymarket is "
+                             "US-blocked anyway — remove the key from secrets to "
+                             "silence this and trade Kalshi only.")
+                else:
+                    _hint = "Polymarket live unavailable — trading Kalshi only."
                 st.session_state._last_live_error = (
-                    f"{time.strftime('%H:%M:%S')} — {_a['question'][:40]}: {_exc}"
+                    f"{time.strftime('%H:%M:%S')} — Polymarket disabled this cycle: {_hint} "
+                    f"(raw: {_msg[:60]})"
                 )
-                st.toast(f"Auto-live order failed: {_exc}", icon="❌")
+                st.toast(f"Polymarket skipped: {_hint}", icon="⚠️")
+                break  # stop hammering Polymarket; fall through to Kalshi
         if _live_added:
             st.toast(
                 f"🚨 Bot auto-placed {_live_added} LIVE order{'s' if _live_added != 1 else ''} on Polymarket",
@@ -1207,11 +1222,15 @@ def _live_dashboard():
     # Polymarket which 403s US users. Same gates: auto_live + live_trading + not demo.
     if _al and _lt and _kalshi_key and _kalshi_pem and not _dm:
         _kal_added = 0
+        _kal_candidates = 0   # Kalshi BUY signals seen this cycle
+        _kal_toosmall = 0     # skipped because Kelly-sized order < $1
         for _a in analyses:
             if _a["signal"] == "HOLD" or _a["kelly"] <= 0 or _a["platform"] != "Kalshi":
                 continue
+            _kal_candidates += 1
             _size = round(min(float(kalshi_budget) * _a["kelly"], float(kalshi_budget) * 0.15), 2)
             if _size < 1.0:
+                _kal_toosmall += 1
                 continue
             _dir = "YES" if _a["signal"] == "BUY_YES" else "NO"
             _kside = "yes" if _a["signal"] == "BUY_YES" else "no"
@@ -1248,6 +1267,21 @@ def _live_dashboard():
             st.toast(
                 f"🚨 Bot auto-placed {_kal_added} LIVE order{'s' if _kal_added != 1 else ''} on Kalshi",
                 icon="⚡",
+            )
+        else:
+            # No Kalshi order fired — record why so it's visible in diagnostics.
+            if _kal_candidates == 0:
+                _kal_why = ("no actionable Kalshi signals this cycle (all HOLD or no "
+                            "edge). Lower Min confidence or wait for Kalshi markets "
+                            "with an edge.")
+            elif _kal_toosmall == _kal_candidates:
+                _kal_why = (f"{_kal_candidates} Kalshi signal(s) found but each Kelly-sized "
+                            f"order is < $1 — raise the Kalshi budget (now ${kalshi_budget:.0f}).")
+            else:
+                _kal_why = (f"{_kal_candidates} Kalshi signal(s) found but already held "
+                            "(deduped against the live ledger).")
+            st.session_state._last_kalshi_status = (
+                f"{time.strftime('%H:%M:%S')} — Kalshi placed 0 orders: {_kal_why}"
             )
 
     # ── brain: detect resolutions + decay + save ──────────────────────────────
@@ -1902,6 +1936,10 @@ Then **Reboot app**. The brain will immediately start persisting after the next 
         _last_err = st.session_state.get("_last_live_error")
         if _last_err:
             st.error(f"⚠️ Last live-order error: {_last_err}")
+
+        _kal_status = st.session_state.get("_last_kalshi_status")
+        if _kal_status:
+            st.info(f"📊 Kalshi: {_kal_status}")
 
         # Per-candidate breakdown: show why each live signal did/didn't trade.
         _live_sigs = [a for a in analyses
