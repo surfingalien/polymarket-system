@@ -1139,6 +1139,11 @@ def _live_dashboard():
                 st.session_state._brain.on_trade_placed(_to_brain_input(_a))
                 _live_added += 1
             except Exception as _exc:
+                # Persist the error so it stays visible in the Execute tab
+                # diagnostics (toasts vanish after a few seconds).
+                st.session_state._last_live_error = (
+                    f"{time.strftime('%H:%M:%S')} — {_a['question'][:40]}: {_exc}"
+                )
                 st.toast(f"Auto-live order failed: {_exc}", icon="❌")
         if _live_added:
             st.toast(
@@ -1753,6 +1758,74 @@ Then **Reboot app**. The brain will immediately start persisting after the next 
         else:
             st.info("🔵 **Paper mode** — buttons below simulate fills only. "
                     "No real orders are placed.")
+
+        # ── auto-execute diagnostics — why are (or aren't) trades firing? ──────
+        st.markdown("### 🤖 Auto-Execute Status")
+        _gate_demo  = not _dm
+        _gate_live  = bool(_lt)
+        _gate_key   = bool(_poly_pk)
+        _gate_auto  = bool(_al)
+        _gate_loop  = bool(_refresh_secs)   # auto-refresh drives repeated cycles
+        _all_gates  = _gate_demo and _gate_live and _gate_key and _gate_auto
+
+        _g1, _g2, _g3, _g4, _g5 = st.columns(5)
+        _g1.metric("Demo OFF",        "✅" if _gate_demo else "❌ ON")
+        _g2.metric("Live trading",    "✅ ON" if _gate_live else "❌ OFF")
+        _g3.metric("Wallet key",      "✅" if _gate_key  else "❌ missing")
+        _g4.metric("Auto-execute",    "✅ ON" if _gate_auto else "❌ OFF")
+        _g5.metric("Auto-refresh",    "✅" if _gate_loop else "⚠️ Off")
+
+        if not _all_gates:
+            _need = []
+            if not _gate_demo: _need.append("turn **Demo mode OFF**")
+            if not _gate_live: _need.append("turn **Live trading ON**")
+            if not _gate_key:  _need.append("add **POLYMARKET_PRIVATE_KEY** to secrets")
+            if not _gate_auto: _need.append("turn **🤖 Auto-execute LIVE ON**")
+            st.warning("The AI brain will NOT auto-trade until you: " + "; ".join(_need) + ".")
+        elif not _gate_loop:
+            st.warning("All gates are ON, but **Auto-refresh is Off** — the bot only "
+                       "evaluates once per page load / ▶ Run. Set **⏱ Auto-refresh** "
+                       "to an interval (e.g. *Every 5 min*) for continuous trading.")
+        else:
+            st.success("All systems GO — the brain auto-places live Polymarket orders each refresh cycle.")
+
+        _last_err = st.session_state.get("_last_live_error")
+        if _last_err:
+            st.error(f"⚠️ Last live-order error: {_last_err}")
+
+        # Per-candidate breakdown: show why each Polymarket signal did/didn't trade.
+        _poly_sigs = [a for a in analyses
+                      if a["platform"] == "Polymarket" and a["signal"] != "HOLD"]
+        if _poly_sigs:
+            _diag_rows = []
+            for _a in _poly_sigs:
+                _dir = "YES" if _a["signal"] == "BUY_YES" else "NO"
+                _tok = _a.get("yes_token_id") if _a["signal"] == "BUY_YES" else _a.get("no_token_id")
+                _sz  = round(min(float(poly_budget) * _a["kelly"], float(poly_budget) * 0.15), 2)
+                _dup = any(l.get("Question", "")[:40] == _a["question"][:40] and l.get("Dir") == _dir
+                           for l in st.session_state.live_ledger)
+                if _a["kelly"] <= 0:        _why = "❌ Kelly = 0 (no edge)"
+                elif not _tok:              _why = "❌ no token id (mock/illiquid)"
+                elif _sz < 1.0:            _why = f"❌ size ${_sz:.2f} < $1 min (raise budget)"
+                elif _dup:                  _why = "⏸ already held"
+                elif not _all_gates:        _why = "⏸ gates off (see above)"
+                else:                       _why = "✅ eligible — will trade next cycle"
+                _diag_rows.append({
+                    "Question": _a["question"][:45],
+                    "Dir":      _dir,
+                    "Kelly":    f"{_a['kelly']:.1%}",
+                    "Size $":   f"${_sz:.2f}",
+                    "Edge":     f"{_a['edge']:+.1%}",
+                    "Status":   _why,
+                })
+            with st.expander(f"🔍 Why these {len(_poly_sigs)} Polymarket signal(s) did/didn't trade", expanded=not _all_gates):
+                st.dataframe(pd.DataFrame(_diag_rows), use_container_width=True, hide_index=True)
+                st.caption("With a $10 Polymarket budget a trade needs Kelly ≥ 10% to clear "
+                           "the $1 Polymarket minimum order. Raise the **Polymarket budget** "
+                           "above to size more signals over the minimum.")
+        else:
+            st.caption("No actionable Polymarket signals at the current Min confidence. "
+                       "Lower **Min confidence** or click **▶ Run** to re-scan.")
 
         # ── order book with live P&L ──────────────────────────────────────────
         st.markdown("### 📊 Order Book & P&L")
