@@ -1613,13 +1613,19 @@ Then **Reboot app**. The brain will immediately start persisting after the next 
         )
 
         # ── build positions from actionable signals ──────────────────────────
+        # Stake floor is a small fraction of the budget (not a hard $1) so the
+        # simulator still works with small per-platform budgets ($10–$20). This
+        # is a simulation, not live execution, so we include any positive stake.
+        _mc_min_stake = max(0.05, budget * 0.01)   # e.g. $0.20 at a $20 budget
         mc_positions = []
         pos_rows = []
+        _n_actionable = 0
         for a in analyses:
             if a["signal"] == "HOLD":
                 continue
+            _n_actionable += 1
             size = min(budget * a["kelly"], budget * 0.15)
-            if size < 1.0:
+            if size < _mc_min_stake:
                 continue
             mcp = position_from_signal(
                 label=a["question"][:30],
@@ -1645,7 +1651,20 @@ Then **Reboot app**. The brain will immediately start persisting after the next 
             })
 
         if not mc_positions:
-            st.info("No positions meet the current thresholds.")
+            if _n_actionable == 0:
+                st.info(
+                    "No actionable BUY signals at the current **Min confidence** "
+                    f"({min_conf:.0%}). Lower the Min confidence slider above, or "
+                    "click **▶ Run** to re-scan. In Demo mode the simulated edges "
+                    "may all fall below your threshold."
+                )
+            else:
+                st.info(
+                    f"{_n_actionable} actionable signal(s) found, but each suggested "
+                    f"stake is below the simulator's floor of ${_mc_min_stake:.2f} "
+                    "(Kelly sizing × your budget). Increase the Polymarket/Kalshi "
+                    "budgets above to size positions large enough to simulate."
+                )
         else:
             c1, c2 = st.columns([1, 1])
             with c1:
