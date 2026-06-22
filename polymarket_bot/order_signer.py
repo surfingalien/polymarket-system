@@ -19,6 +19,7 @@ Wallet types (signature_type):
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from dataclasses import dataclass
 from typing import Optional
@@ -26,6 +27,13 @@ from typing import Optional
 import structlog
 
 log = structlog.get_logger(__name__)
+
+# Unicode "invisible" whitespace characters that str.split() does NOT remove:
+# NBSP U+00A0, ZWSP U+200B, ZWNJ U+200C, ZWJ U+200D,
+# Word Joiner U+2060, BOM U+FEFF
+_INVISIBLE_WS = re.compile(
+    u'[\\s ​‌‍⁠﻿]+'
+)
 
 
 class SigningUnavailable(RuntimeError):
@@ -81,10 +89,11 @@ class PolymarketOrderSigner:
         doesn't fail with 'Non-hexadecimal digit found'. NEVER raises — strict
         validation happens at sign time in _validated_signing_key().
 
-        Handles the common copy-paste / TOML-secret problems:
+        Handles common copy-paste / TOML-secret problems:
           - surrounding single/double quotes
           - leading/trailing whitespace and newlines
-          - inner whitespace (spaces/newlines pasted mid-key)
+          - inner ASCII whitespace (spaces/newlines pasted mid-key)
+          - Unicode invisible characters: NBSP, ZWSP, ZWJ, BOM, etc.
 
         Keeps the original 0x prefix convention if present; eth-account / the
         CLOB client accept the key with or without it.
@@ -92,8 +101,8 @@ class PolymarketOrderSigner:
         if not key:
             return ""
         k = key.strip().strip('"').strip("'").strip()
-        # Drop any internal whitespace (spaces, tabs, newlines pasted mid-key)
-        k = "".join(k.split())
+        # Remove ALL whitespace including Unicode variants that str.split() misses
+        k = _INVISIBLE_WS.sub('', k)
         return k
 
     def _validated_signing_key(self) -> str:
@@ -110,18 +119,22 @@ class PolymarketOrderSigner:
             )
         if k[:2] in ("0x", "0X"):
             k = k[2:]
-        try:
-            int(k, 16)
-        except ValueError as exc:
+        _valid_hex = frozenset('0123456789abcdefABCDEF')
+        bad = [c for c in k if c not in _valid_hex]
+        if bad:
+            unique_bad = list(dict.fromkeys(bad))[:6]
+            _sample = ', '.join(f'U+{ord(c):04X}' for c in unique_bad)
             raise SigningUnavailable(
-                "POLYMARKET_PRIVATE_KEY is not valid hexadecimal (check for stray "
-                "characters or quotes, and that you pasted the raw private key — "
-                "not a seed phrase or wallet address)."
-            ) from exc
+                f"POLYMARKET_PRIVATE_KEY contains {len(bad)} non-hex character(s): "
+                f"{_sample} (key is {len(k)} chars after stripping 0x prefix). "
+                "The key must be a raw 64-char hex string — not a seed phrase, "
+                "wallet address, or PEM block."
+            )
         if len(k) != 64:
             raise SigningUnavailable(
                 f"POLYMARKET_PRIVATE_KEY should be 64 hex chars (32 bytes); got "
-                f"{len(k)}. Make sure you pasted the full wallet private key."
+                f"{len(k)} chars after stripping the 0x prefix. "
+                "Wallet address = 40 chars; full private key = 64 chars."
             )
         return "0x" + k.lower()
 
