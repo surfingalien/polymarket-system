@@ -368,16 +368,20 @@ def _execute_live_polymarket_order(
 def _execute_live_kalshi_order(
     ticker: str, price: float, size_usd: float, side: str,
     api_key_id: str, pem_content: str,
+    action: str = "buy", count: int = 0,
 ) -> dict:
     """Place a REAL RSA-PSS-signed Kalshi order. Only ever called from the gated
     live-trading path. Kalshi is US-regulated and US-accessible, so unlike
     Polymarket it works from a US account/IP. Never runs in mock mode.
 
-    `side` is "yes" or "no". `price` is the YES mid (0–1); we convert to the
-    contract price for the chosen side and a cents limit price."""
+    `side` is "yes" or "no". `action` is "buy" (open) or "sell" (close a held
+    position). `price` is the YES mid (0–1); we convert to the contract price for
+    the chosen side and a cents limit price. For a "buy", contract count is
+    derived from `size_usd`; for a "sell", pass the exact `count` to close."""
     contract_price = price if side == "yes" else (1.0 - price)
     contract_price = max(0.01, min(0.99, contract_price))
-    count = max(1, int(size_usd / contract_price))
+    if count <= 0:
+        count = max(1, int(size_usd / contract_price))
     limit_cents = int(round(contract_price * 100))
 
     async def _inner():
@@ -389,7 +393,7 @@ def _execute_live_kalshi_order(
         try:
             order = KalshiOrder(
                 ticker=ticker,
-                action="buy",
+                action=action,
                 side=side,
                 count=count,
                 limit_price=limit_cents,
@@ -553,6 +557,36 @@ def _history(mkt: dict, n: int = 30) -> list[float]:
     return out
 
 
+# ── predictive-analysis tuning ────────────────────────────────────────────────
+# A market only produces a BUY signal when adjusted confidence clears
+# _CONF_FLOOR AND the edge clears the per-market minimum. Adjusted confidence is
+# the model's raw confidence scaled by market quality:
+#       adj_conf = raw_conf * (_QUALITY_BASE + _QUALITY_SPAN * quality_score)
+# The original weighting (base 0.50, span 0.50) halved confidence on thin
+# markets, which structurally forced *every* lower-liquidity venue (e.g. Kalshi)
+# to HOLD no matter how strong the edge. A gentler base lets a genuinely
+# confident signal on a smaller market still trade, while higher-quality markets
+# still score higher. This rebalances the quality penalty — it does not remove
+# the confidence floor, so real conviction is still required to deploy capital.
+_CONF_FLOOR    = 0.50   # min adjusted confidence to act (raise = more conservative)
+_QUALITY_BASE  = 0.65   # confidence retained on a zero-quality market
+_QUALITY_SPAN  = 0.35   # extra confidence a top-quality market earns
+_MIN_ORDER_USD = 1.0    # floor an actionable order up to this so valid small
+                        # signals still execute (Kalshi fills >= 1 contract anyway)
+
+
+def _price_movement(hist: list) -> float:
+    """Recent absolute price move (0-1 scale) from a history series, used to
+    feed the quality scorer's movement component instead of a flat 0.0."""
+    try:
+        if not hist or len(hist) < 2:
+            return 0.0
+        first, last = float(hist[0]), float(hist[-1])
+        return abs(last - first)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 # ── full analysis pipeline — returns only plain primitives ────────────────────
 
 @st.cache_data(ttl=120, show_spinner=False)
@@ -616,15 +650,18 @@ def _run_analysis(markets: list[dict], anthropic_key: str = "") -> tuple[list[di
             raw.estimated_probability, market_price=mkt["price"],
         )
         adj_prob  = ls.adjust_probability(mkt["price"], float(adj_prob))
-        q_score   = qsc.score(mkt["volume"], mkt["liquidity"], 0.0, mkt["price"])
-        adj_conf  = float(adj_conf) * (0.5 + 0.5 * float(q_score))
+        q_score   = qsc.score(
+            mkt["volume"], mkt["liquidity"],
+            _price_movement(hist), mkt["price"],
+        )
+        adj_conf  = float(adj_conf) * (_QUALITY_BASE + _QUALITY_SPAN * float(q_score))
         min_edge  = tmp.adjusted_min_edge(cat.adjusted_min_edge(mkt["question"], 0.03))
         edge      = float(adj_prob) - mkt["price"]
         # Confidence-scaled Kelly: shrink the bet by model confidence so
         # uncertain edges deploy less capital (matches market_analyzer).
         kf        = float(kelly.compute(float(adj_prob), mkt["price"])) * float(adj_conf)
 
-        signal = ("HOLD" if abs(edge) < min_edge or adj_conf < 0.50
+        signal = ("HOLD" if abs(edge) < min_edge or adj_conf < _CONF_FLOOR
                   else ("BUY_YES" if edge > 0 else "BUY_NO"))
 
         sigs = [
@@ -1040,7 +1077,10 @@ def _live_dashboard():
     _price_map = {a["question"][:50]: a["price"] for a in analyses}
 
     def _trade_pnl(row: dict) -> float:
-        """Unrealised P&L in dollars for a paper trade row."""
+        """P&L in dollars for a trade row — realized once the position is closed,
+        otherwise unrealized against the current market price."""
+        if row.get("Open") is False and "Realized $" in row:
+            return float(row.get("Realized $") or 0.0)
         ep_yes = float(row.get("entry_num") or 0)
         if ep_yes <= 0:
             return 0.0
@@ -1117,7 +1157,8 @@ def _live_dashboard():
                     axis=1,
                 )
             _show_l = [c for c in ["Platform","Question","Dir","Size $","Entry",
-                                    "Current %","P&L $","Order ID","Status","Time","Mode"]
+                                    "Current %","Exit","P&L $","Realized $","Status",
+                                    "Order ID","Time","Mode"]
                        if c in df_l.columns]
             st.dataframe(
                 df_l[_show_l], use_container_width=True, hide_index=True,
@@ -1247,12 +1288,20 @@ def _live_dashboard():
                 continue
             _kal_candidates += 1
             _size = round(min(float(kalshi_budget) * _a["kelly"], float(kalshi_budget) * 0.15), 2)
-            if _size < 1.0:
-                _kal_toosmall += 1
-                continue
+            if _size < _MIN_ORDER_USD:
+                # Valid signal but Kelly-sized tiny: deploy the minimum so it
+                # still trades, as long as the budget itself can cover it.
+                if float(kalshi_budget) >= _MIN_ORDER_USD:
+                    _size = _MIN_ORDER_USD
+                else:
+                    _kal_toosmall += 1
+                    continue
             _dir = "YES" if _a["signal"] == "BUY_YES" else "NO"
             _kside = "yes" if _a["signal"] == "BUY_YES" else "no"
-            if any(l.get("Question", "")[:40] == _a["question"][:40] and l.get("Dir") == _dir
+            # Dedup against OPEN positions only — a previously closed position in
+            # the same market/direction may be re-entered on a fresh signal.
+            if any(l.get("Question", "")[:40] == _a["question"][:40]
+                   and l.get("Dir") == _dir and l.get("Open", True)
                    for l in st.session_state.live_ledger):
                 continue
             try:
@@ -1273,6 +1322,11 @@ def _live_dashboard():
                     "Status":   _res["status"],
                     "Time":     time.strftime("%H:%M:%S"),
                     "Mode":     "🤖 Auto-Live",
+                    # Position-maintenance metadata (used by the auto-exit pass)
+                    "ticker":   _a["id"],
+                    "side":     _kside,
+                    "count":    int(_res.get("count", 0)),
+                    "Open":     True,
                 })
                 st.session_state._brain.on_trade_placed(_to_brain_input(_a))
                 _kal_added += 1
@@ -1293,13 +1347,66 @@ def _live_dashboard():
                             "edge). Lower Min confidence or wait for Kalshi markets "
                             "with an edge.")
             elif _kal_toosmall == _kal_candidates:
-                _kal_why = (f"{_kal_candidates} Kalshi signal(s) found but each Kelly-sized "
-                            f"order is < $1 — raise the Kalshi budget (now ${kalshi_budget:.0f}).")
+                _kal_why = (f"{_kal_candidates} Kalshi signal(s) found but the Kalshi budget "
+                            f"(${kalshi_budget:.2f}) is below the ${_MIN_ORDER_USD:.0f} minimum "
+                            "order — raise the Kalshi budget.")
             else:
                 _kal_why = (f"{_kal_candidates} Kalshi signal(s) found but already held "
                             "(deduped against the live ledger).")
             st.session_state._last_kalshi_status = (
                 f"{time.strftime('%H:%M:%S')} — Kalshi placed 0 orders: {_kal_why}"
+            )
+
+    # ── auto-exit / position maintenance (Kalshi) ─────────────────────────────
+    # "Maintaining proper trades" means not just opening positions but closing
+    # them when the thesis breaks. For each OPEN auto-live Kalshi position we
+    # re-check the live model: if it now signals the OPPOSITE direction with a
+    # real edge (a genuine reversal, not noise), the bot sells to close. Same
+    # gates as entry, so disabling auto-live also halts auto-exits.
+    if _al and _lt and _kalshi_key and _kalshi_pem and not _dm:
+        _by_ticker = {a["id"]: a for a in all_analyses}
+        _closed = 0
+        for _row in st.session_state.live_ledger:
+            if _row.get("Platform") != "Kalshi" or not _row.get("Open", False):
+                continue
+            _cur = _by_ticker.get(_row.get("ticker"))
+            if not _cur:
+                continue
+            _held = _row.get("Dir")  # "YES" / "NO"
+            _flipped = ((_held == "YES" and _cur["signal"] == "BUY_NO")
+                        or (_held == "NO" and _cur["signal"] == "BUY_YES"))
+            if not (_flipped and abs(_cur["edge"]) >= _cur["min_edge"]):
+                continue
+            _cnt = int(_row.get("count", 0))
+            if _cnt <= 0:
+                continue
+            try:
+                _pnl = _trade_pnl(_row)
+                _ex = _execute_live_kalshi_order(
+                    ticker=_row["ticker"], price=_cur["price"], size_usd=0.0,
+                    side=_row.get("side", "yes"), api_key_id=_kalshi_key,
+                    pem_content=_kalshi_pem, action="sell", count=_cnt,
+                )
+                _row["Open"] = False
+                _row["Status"] = "CLOSED"
+                _row["Exit"] = f"{_cur['price']:.0%}"
+                _row["Realized $"] = round(_pnl, 2)
+                _row["Exit ID"] = _ex.get("order_id", "")
+                _closed += 1
+            except Exception as _exc:
+                st.session_state._last_live_error = (
+                    f"{time.strftime('%H:%M:%S')} — exit {_row.get('Question','')[:30]}: {_exc}"
+                )
+                st.toast(f"Auto-exit failed: {_exc}", icon="❌")
+        if _closed:
+            st.toast(
+                f"🔄 Bot auto-closed {_closed} reversed Kalshi position"
+                f"{'s' if _closed != 1 else ''}",
+                icon="🔄",
+            )
+            st.session_state._last_kalshi_status = (
+                f"{time.strftime('%H:%M:%S')} — auto-closed {_closed} reversed "
+                "position(s) on model flip."
             )
 
     # ── brain: detect resolutions + decay + save ──────────────────────────────
@@ -1971,14 +2078,14 @@ Then **Reboot app**. The brain will immediately start persisting after the next 
             if _kal_all:
                 _krows = []
                 for _a in _kal_all:
-                    _conf_ok = _a["conf"] >= 0.50
+                    _conf_ok = _a["conf"] >= _CONF_FLOOR
                     _edge_ok = abs(_a["edge"]) >= _a["min_edge"]
                     if _a["signal"] != "HOLD":
                         _r = "✅ BUY signal"
                     elif not _conf_ok and not _edge_ok:
                         _r = "❌ conf & edge both too low"
                     elif not _conf_ok:
-                        _r = f"❌ conf {_a['conf']:.2f} < 0.50 (quality {_a['quality']:.2f} shrinks it)"
+                        _r = f"❌ conf {_a['conf']:.2f} < {_CONF_FLOOR:.2f} (quality {_a['quality']:.2f} shrinks it)"
                     else:
                         _r = f"❌ edge {abs(_a['edge']):.1%} < min {_a['min_edge']:.1%}"
                     _krows.append({
@@ -1994,9 +2101,9 @@ Then **Reboot app**. The brain will immediately start persisting after the next 
                 with st.expander(f"🔬 Kalshi markets scanned ({len(_kal_all)}) — why they did/didn't signal", expanded=True):
                     st.dataframe(pd.DataFrame(_krows), use_container_width=True, hide_index=True)
                     st.caption(
-                        "A Kalshi BUY needs **AdjConf ≥ 0.50** AND **|Edge| ≥ MinEdge**. "
-                        "AdjConf = model confidence × quality (low Kalshi volume/open-interest "
-                        "shrinks it). If everything is HOLD, Kalshi simply has no high-conviction "
+                        f"A Kalshi BUY needs **AdjConf ≥ {_CONF_FLOOR:.2f}** AND **|Edge| ≥ MinEdge**. "
+                        f"AdjConf = model confidence × ({_QUALITY_BASE:.2f} + {_QUALITY_SPAN:.2f} × quality). "
+                        "If everything is HOLD, Kalshi simply has no high-conviction "
                         "edge right now — the bot is correctly waiting, not broken."
                     )
 
@@ -2014,12 +2121,17 @@ Then **Reboot app**. The brain will immediately start persisting after the next 
                 _tok = (_a.get("yes_token_id") if _a["signal"] == "BUY_YES"
                         else _a.get("no_token_id")) if _is_poly else "n/a"
                 _sz  = round(min(_pb * _a["kelly"], _pb * 0.15), 2)
-                _dup = any(l.get("Question", "")[:40] == _a["question"][:40] and l.get("Dir") == _dir
+                # Kalshi floors a valid small order up to the minimum if the
+                # budget can cover it (matches the auto-live loop).
+                if not _is_poly and _sz < _MIN_ORDER_USD and _pb >= _MIN_ORDER_USD:
+                    _sz = _MIN_ORDER_USD
+                _dup = any(l.get("Question", "")[:40] == _a["question"][:40]
+                           and l.get("Dir") == _dir and l.get("Open", True)
                            for l in st.session_state.live_ledger)
                 if _a["kelly"] <= 0:                _why = "❌ Kelly = 0 (no edge)"
                 elif _is_poly and not _tok:         _why = "❌ no token id (mock/illiquid)"
-                elif _sz < 1.0:                     _why = f"❌ size ${_sz:.2f} < $1 min (raise budget)"
-                elif _dup:                          _why = "⏸ already held"
+                elif _sz < _MIN_ORDER_USD:          _why = f"❌ budget ${_pb:.2f} < ${_MIN_ORDER_USD:.0f} min order"
+                elif _dup:                          _why = "⏸ already held (open)"
                 elif not _all_gates:                _why = "⏸ gates off (see above)"
                 else:                               _why = "✅ eligible — will trade next cycle"
                 _diag_rows.append({
@@ -2033,7 +2145,8 @@ Then **Reboot app**. The brain will immediately start persisting after the next 
                 })
             with st.expander(f"🔍 Why these {len(_live_sigs)} live signal(s) did/didn't trade", expanded=not _all_gates):
                 st.dataframe(pd.DataFrame(_diag_rows), use_container_width=True, hide_index=True)
-                st.caption("A trade needs Kelly × budget ≥ $1 to clear the minimum order. "
+                st.caption(f"A valid signal deploys its Kelly size, floored up to the "
+                           f"${_MIN_ORDER_USD:.0f} minimum order when the budget allows. "
                            "Raise the per-platform **budget** above to size more signals over the minimum.")
         else:
             st.caption("No actionable live signals at the current Min confidence. "
