@@ -77,7 +77,7 @@ class KalshiBot:
         side = direction.lower()  # "yes" | "no"
         contract_price = price if side == "yes" else (1.0 - price)
         contract_price = min(0.99, max(0.01, contract_price))
-        count = max(1, int(size_usd / contract_price))
+        count = max(1, round(size_usd / contract_price))
         limit_price_cents = min(99, max(1, int(round(contract_price * 100))))
 
         order = KalshiOrder(

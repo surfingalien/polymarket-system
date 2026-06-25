@@ -381,7 +381,7 @@ def _execute_live_kalshi_order(
     contract_price = price if side == "yes" else (1.0 - price)
     contract_price = max(0.01, min(0.99, contract_price))
     if count <= 0:
-        count = max(1, int(size_usd / contract_price))
+        count = max(1, round(size_usd / contract_price))
     limit_cents = int(round(contract_price * 100))
 
     async def _inner():
@@ -1378,6 +1378,12 @@ def _live_dashboard():
             if not (_flipped and abs(_cur["edge"]) >= _cur["min_edge"]):
                 continue
             _cnt = int(_row.get("count", 0))
+            if _cnt <= 0:
+                # Fallback: recalculate from entry size and price
+                _ep = float(_row.get("entry_num") or 0.5)
+                _sp = _ep if _row.get("side", "yes") == "yes" else (1.0 - _ep)
+                _sz = float(_row.get("Size $") or 0)
+                _cnt = max(1, round(_sz / max(0.01, _sp))) if _sz > 0 else 0
             if _cnt <= 0:
                 continue
             try:
