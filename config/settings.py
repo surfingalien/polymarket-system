@@ -36,7 +36,7 @@ class KalshiSettings(BaseSettings):
 
     api_key_id: str = Field(default="", description="Key ID from Kalshi dashboard")
     private_key_path: str = Field(default="keys/kalshi_private.pem")
-    api_host: str = Field(default="https://trading-api.kalshi.com")
+    api_host: str = Field(default="https://api.elections.kalshi.com")
     demo_mode: bool = Field(default=True)
     mock_mode: bool = Field(default=True)
     max_markets_per_cycle: int = Field(default=20)
