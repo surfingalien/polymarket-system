@@ -1,7 +1,7 @@
 """
 Kalshi V2 API client with RSA-PSS SHA-256 authentication.
 
-All requests to api.elections.kalshi.com (or demo-api.kalshi.co) must
+All requests to trading-api.kalshi.com (or demo-api.kalshi.co) must
 include an RSA-PSS signature over: timestamp + method + path.
 Key generation: run scripts/setup_kalshi_keys.py and upload the public key
 to https://kalshi.com/profile/api.
@@ -94,7 +94,7 @@ class KalshiClient:
         api_key_id: str = "",
         private_key_path: str = "keys/kalshi_private.pem",
         private_key_content: str = "",
-        base_url: str = "https://api.elections.kalshi.com/trade-api/v2",
+        base_url: str = "https://trading-api.kalshi.com/trade-api/v2",
         mock_mode: bool = True,
     ) -> None:
         self._key_id = api_key_id
