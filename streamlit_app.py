@@ -716,6 +716,8 @@ if "paper_ledger" not in st.session_state:
     st.session_state.paper_ledger = []
 if "live_ledger" not in st.session_state:
     st.session_state.live_ledger = []
+if "_kal_blocked_tickers" not in st.session_state:
+    st.session_state._kal_blocked_tickers = set()
 
 # ── Persist user settings across browser refreshes via URL query params ────────
 # On first load: read saved values from URL and pre-populate session_state so
@@ -1298,6 +1300,9 @@ def _live_dashboard():
                     continue
             _dir = "YES" if _a["signal"] == "BUY_YES" else "NO"
             _kside = "yes" if _a["signal"] == "BUY_YES" else "no"
+            # Skip markets that 410'd (expired/settled) earlier this session.
+            if _a["id"] in st.session_state._kal_blocked_tickers:
+                continue
             # Dedup against OPEN positions only — a previously closed position in
             # the same market/direction may be re-entered on a fresh signal.
             if any(l.get("Question", "")[:40] == _a["question"][:40]
@@ -1331,6 +1336,9 @@ def _live_dashboard():
                 st.session_state._brain.on_trade_placed(_to_brain_input(_a))
                 _kal_added += 1
             except Exception as _exc:
+                _exc_str = str(_exc)
+                if "410" in _exc_str:
+                    st.session_state._kal_blocked_tickers.add(_a["id"])
                 st.session_state._last_live_error = (
                     f"{time.strftime('%H:%M:%S')} — {_a['question'][:40]}: {_exc}"
                 )
