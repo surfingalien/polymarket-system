@@ -22,6 +22,7 @@ import httpx
 import numpy as np
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as _stcomp
 
 # ── page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -53,7 +54,7 @@ try:
     from shared.monte_carlo import MonteCarloPortfolio, position_from_signal
     from polymarket_bot.polymarket_client import PolymarketClient
     from polymarket_bot.order_signer import PolymarketOrderSigner, SigningUnavailable
-    from kalshi_bot.kalshi_client import KalshiClient
+    from kalshi_bot.kalshi_client import KalshiClient, KalshiOrder
 except ImportError as _e:
     st.error(f"Missing dependency — check requirements: {_e}")
     st.stop()
@@ -363,6 +364,52 @@ def _execute_live_polymarket_order(
     ))
     return {"order_id": res.order_id, "status": res.status, "shares": round(shares, 4)}
 
+
+def _execute_live_kalshi_order(
+    ticker: str, price: float, size_usd: float, side: str,
+    api_key_id: str, pem_content: str,
+    action: str = "buy", count: int = 0,
+) -> dict:
+    """Place a REAL RSA-PSS-signed Kalshi order. Only ever called from the gated
+    live-trading path. Kalshi is US-regulated and US-accessible, so unlike
+    Polymarket it works from a US account/IP. Never runs in mock mode.
+
+    `side` is "yes" or "no". `action` is "buy" (open) or "sell" (close a held
+    position). `price` is the YES mid (0–1); we convert to the contract price for
+    the chosen side and a cents limit price. For a "buy", contract count is
+    derived from `size_usd`; for a "sell", pass the exact `count` to close."""
+    contract_price = price if side == "yes" else (1.0 - price)
+    contract_price = max(0.01, min(0.99, contract_price))
+    if count <= 0:
+        count = max(1, int(size_usd / contract_price))
+    limit_cents = int(round(contract_price * 100))
+
+    async def _inner():
+        client = KalshiClient(
+            api_key_id=api_key_id,
+            private_key_content=pem_content,
+            mock_mode=False,
+        )
+        try:
+            order = KalshiOrder(
+                ticker=ticker,
+                action=action,
+                side=side,
+                count=count,
+                limit_price=limit_cents,
+            )
+            resp = await client.place_order(order)
+            o = (resp or {}).get("order", {}) if isinstance(resp, dict) else {}
+            return {
+                "order_id": o.get("order_id", f"kalshi_{int(time.time())}"),
+                "status":   o.get("status", "submitted"),
+                "count":    count,
+            }
+        finally:
+            await client.close()
+
+    return _run_coro_sync(_inner(), timeout=60)
+
 # ── CSS ───────────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
@@ -402,60 +449,18 @@ button[data-baseweb="tab"] { font-weight:600; }
 /* Rounder dataframes */
 div[data-testid="stDataFrame"] { border-radius:10px; overflow:hidden; }
 
-/* Sidebar toggle: always visible, branded colour — covers div/button/section
-   across Streamlit versions (1.35 uses button, 1.58+ uses div) */
+/* ── Remove sidebar collapse/expand entirely ──────────────────────────────────
+   Hide every variant of the collapse toggle across Streamlit versions so the
+   sidebar is permanently visible and can never be accidentally hidden. */
 div[data-testid="stSidebarCollapsedControl"],
 button[data-testid="stSidebarCollapsedControl"],
 section[data-testid="stSidebarCollapsedControl"],
 div[data-testid="collapsedControl"],
-button[data-testid="collapsedControl"] {
-    background: #6366f1 !important;
-    border-radius: 0 10px 10px 0 !important;
-    min-width: 26px !important;
-    min-height: 56px !important;
-    opacity: 1 !important;
-    box-shadow: 2px 0 10px rgba(99,102,241,.6) !important;
-    z-index: 9999 !important;
-    display: flex !important;
-    align-items: center !important;
-    justify-content: center !important;
+button[data-testid="collapsedControl"],
+[data-testid="stSidebarCollapseButton"],
+[data-testid="stSidebarCloseButton"] {
+    display: none !important;
 }
-div[data-testid="stSidebarCollapsedControl"]:hover,
-button[data-testid="stSidebarCollapsedControl"]:hover,
-div[data-testid="collapsedControl"]:hover {
-    background: #4f46e5 !important;
-    box-shadow: 2px 0 18px rgba(99,102,241,.85) !important;
-}
-div[data-testid="stSidebarCollapsedControl"] svg,
-button[data-testid="stSidebarCollapsedControl"] svg,
-div[data-testid="collapsedControl"] svg {
-    fill: #fff !important;
-    stroke: #fff !important;
-}
-</style>
-<script>
-(function patchSidebarToggle() {
-    function applyStyle() {
-        ["stSidebarCollapsedControl", "collapsedControl"].forEach(function(id) {
-            var el = document.querySelector('[data-testid="' + id + '"]');
-            if (!el) return;
-            el.style.background = "#6366f1";
-            el.style.borderRadius = "0 10px 10px 0";
-            el.style.minWidth = "26px";
-            el.style.minHeight = "56px";
-            el.style.boxShadow = "2px 0 10px rgba(99,102,241,.6)";
-            el.style.zIndex = "9999";
-            el.style.display = "flex";
-            el.style.alignItems = "center";
-            el.style.justifyContent = "center";
-            var svg = el.querySelector("svg");
-            if (svg) { svg.style.fill = "#fff"; svg.style.stroke = "#fff"; }
-        });
-    }
-    applyStyle();
-    new MutationObserver(applyStyle).observe(document.body, { childList: true, subtree: true });
-})();
-</script>
 """, unsafe_allow_html=True)
 
 SIGNAL_ICONS = {"BUY_YES": "🟢 BUY YES", "BUY_NO": "🔴 BUY NO", "HOLD": "⚪ HOLD"}
@@ -552,6 +557,36 @@ def _history(mkt: dict, n: int = 30) -> list[float]:
     return out
 
 
+# ── predictive-analysis tuning ────────────────────────────────────────────────
+# A market only produces a BUY signal when adjusted confidence clears
+# _CONF_FLOOR AND the edge clears the per-market minimum. Adjusted confidence is
+# the model's raw confidence scaled by market quality:
+#       adj_conf = raw_conf * (_QUALITY_BASE + _QUALITY_SPAN * quality_score)
+# The original weighting (base 0.50, span 0.50) halved confidence on thin
+# markets, which structurally forced *every* lower-liquidity venue (e.g. Kalshi)
+# to HOLD no matter how strong the edge. A gentler base lets a genuinely
+# confident signal on a smaller market still trade, while higher-quality markets
+# still score higher. This rebalances the quality penalty — it does not remove
+# the confidence floor, so real conviction is still required to deploy capital.
+_CONF_FLOOR    = 0.50   # min adjusted confidence to act (raise = more conservative)
+_QUALITY_BASE  = 0.65   # confidence retained on a zero-quality market
+_QUALITY_SPAN  = 0.35   # extra confidence a top-quality market earns
+_MIN_ORDER_USD = 1.0    # floor an actionable order up to this so valid small
+                        # signals still execute (Kalshi fills >= 1 contract anyway)
+
+
+def _price_movement(hist: list) -> float:
+    """Recent absolute price move (0-1 scale) from a history series, used to
+    feed the quality scorer's movement component instead of a flat 0.0."""
+    try:
+        if not hist or len(hist) < 2:
+            return 0.0
+        first, last = float(hist[0]), float(hist[-1])
+        return abs(last - first)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 # ── full analysis pipeline — returns only plain primitives ────────────────────
 
 @st.cache_data(ttl=120, show_spinner=False)
@@ -615,15 +650,18 @@ def _run_analysis(markets: list[dict], anthropic_key: str = "") -> tuple[list[di
             raw.estimated_probability, market_price=mkt["price"],
         )
         adj_prob  = ls.adjust_probability(mkt["price"], float(adj_prob))
-        q_score   = qsc.score(mkt["volume"], mkt["liquidity"], 0.0, mkt["price"])
-        adj_conf  = float(adj_conf) * (0.5 + 0.5 * float(q_score))
+        q_score   = qsc.score(
+            mkt["volume"], mkt["liquidity"],
+            _price_movement(hist), mkt["price"],
+        )
+        adj_conf  = float(adj_conf) * (_QUALITY_BASE + _QUALITY_SPAN * float(q_score))
         min_edge  = tmp.adjusted_min_edge(cat.adjusted_min_edge(mkt["question"], 0.03))
         edge      = float(adj_prob) - mkt["price"]
         # Confidence-scaled Kelly: shrink the bet by model confidence so
         # uncertain edges deploy less capital (matches market_analyzer).
         kf        = float(kelly.compute(float(adj_prob), mkt["price"])) * float(adj_conf)
 
-        signal = ("HOLD" if abs(edge) < min_edge or adj_conf < 0.50
+        signal = ("HOLD" if abs(edge) < min_edge or adj_conf < _CONF_FLOOR
                   else ("BUY_YES" if edge > 0 else "BUY_NO"))
 
         sigs = [
@@ -663,6 +701,12 @@ _poly_funder     = _get_secret("POLYMARKET_FUNDER")
 _supabase_url    = _get_secret("SUPABASE_URL")
 _supabase_key    = _get_secret("SUPABASE_KEY")
 
+# Live execution is possible if EITHER platform has its credentials:
+#   Polymarket → wallet private key (US accounts get 403 from the CLOB)
+#   Kalshi     → API key id + RSA PEM (US-regulated, US-accessible)
+_kalshi_live_creds = bool(_kalshi_key and _kalshi_pem)
+_has_live_creds    = bool(_poly_pk or _kalshi_live_creds)
+
 # Inject Supabase creds as env vars so shared/cloud_store.py (no streamlit import) can reach them
 import os as _os
 if _supabase_url: _os.environ["SUPABASE_URL"] = _supabase_url
@@ -672,6 +716,37 @@ if "paper_ledger" not in st.session_state:
     st.session_state.paper_ledger = []
 if "live_ledger" not in st.session_state:
     st.session_state.live_ledger = []
+
+# ── Persist user settings across browser refreshes via URL query params ────────
+# On first load: read saved values from URL and pre-populate session_state so
+# widgets pick them up. On every run: write current values back into the URL.
+_qp = st.query_params
+def _qp_float(k: str, default: float) -> float:
+    try: return float(_qp.get(k, default))
+    except: return default
+def _qp_bool(k: str, default: bool) -> bool:
+    v = _qp.get(k)
+    return (v == "1") if v is not None else default
+
+_VALID_RL = ["Off", "Every 1 min", "Every 5 min", "Every 15 min", "Every 30 min"]
+
+if "poly_budget"       not in st.session_state:
+    st.session_state.poly_budget       = _qp_float("pb",  10.0)
+if "kalshi_budget"     not in st.session_state:
+    st.session_state.kalshi_budget     = _qp_float("kb",  10.0)
+if "sidebar_min_conf"  not in st.session_state:
+    st.session_state.sidebar_min_conf  = _qp_float("mc",  0.55)
+if "auto_paper"        not in st.session_state:
+    st.session_state.auto_paper        = _qp_bool("ap",   False)
+if "refresh_label"     not in st.session_state:
+    _rl = _qp.get("rl", "Off")
+    st.session_state.refresh_label     = _rl if _rl in _VALID_RL else "Off"
+# Live toggles persist across refreshes (user opted in). Restored only if live
+# credentials are present — never auto-arm live trading without them.
+if "live_trading"      not in st.session_state:
+    st.session_state.live_trading      = _qp_bool("lt",   False) and _has_live_creds
+if "auto_live"         not in st.session_state:
+    st.session_state.auto_live         = _qp_bool("al",   False) and _has_live_creds
 
 # ── AI brain singleton — one instance per browser session, survives reruns ────
 import types as _types
@@ -705,7 +780,10 @@ _any_key = bool(
     _get_secret("KALSHI_API_KEY")
 )
 if "demo_mode" not in st.session_state:
-    st.session_state.demo_mode = not _any_key
+    if "demo" in _qp:
+        st.session_state.demo_mode = _qp["demo"] == "1"
+    else:
+        st.session_state.demo_mode = not _any_key
 
 # Stamp the start of every full script run so the fragment can detect timer-fires
 import time as _time_mod
@@ -716,7 +794,12 @@ with st.sidebar:
     st.markdown("**API Keys**")
     st.markdown("✅ Anthropic key set" if _anthropic_key  else "⚪ No Anthropic key → mock AI")
     st.markdown("✅ Polymarket key set" if _poly_key       else "⚪ No Polymarket key → mock data")
-    st.markdown("✅ Kalshi keys set"    if (_kalshi_key and _kalshi_pem) else "⚪ No Kalshi keys → mock data")
+    if _kalshi_key and _kalshi_pem:
+        st.markdown("✅ Kalshi keys set (API key + RSA PEM)")
+    elif _kalshi_key:
+        st.markdown("⚠️ Kalshi API key set but **RSA PEM missing** → add `KALSHI_PRIVATE_KEY_PEM`")
+    else:
+        st.markdown("⚪ No Kalshi keys → mock data")
     st.markdown("✅ Supabase connected" if (_supabase_url and _supabase_key) else "⚪ No Supabase → brain resets on restart")
     if not _supabase_url:
         _raw_url = ""
@@ -739,16 +822,26 @@ with st.sidebar:
     # ── live trading gate (DANGER) ──────────────────────────────────────────
     st.divider()
     st.markdown("### ⚠️ Live Trading")
-    if not _poly_pk:
-        st.caption("📝 Paper mode only — add `POLYMARKET_PRIVATE_KEY` to secrets "
-                   "to unlock live execution (never paste keys into chat).")
-        st.caption("Toggle visible in the main panel once wallet key is set.")
-    else:
-        st.caption("Wallet key detected. Toggle Live trading in the main panel ↗")
+    if _has_live_creds:
+        _live_plat_list = []
+        if _poly_pk:            _live_plat_list.append("Polymarket")
+        if _kalshi_live_creds:  _live_plat_list.append("Kalshi")
+        st.caption(f"✅ Live-trading credentials detected for: **{', '.join(_live_plat_list)}**. "
+                   "Toggle in the main panel ↗")
         if st.session_state.get("live_trading", False):
             st.error("⚡ LIVE MODE ACTIVE — real money at risk!")
-            st.caption(f"Wallet sig type: {_poly_sig_type} "
-                       f"({'EOA' if _poly_sig_type == 0 else 'proxy/safe'})")
+    elif _kalshi_key and not _kalshi_pem:
+        st.caption("🔑 `KALSHI_API_KEY` found but `KALSHI_PRIVATE_KEY_PEM` is missing. "
+                   "Add the RSA private key PEM to secrets to unlock live Kalshi trading.")
+        st.caption("Generate one locally: `python scripts/setup_kalshi_keys.py`, "
+                   "upload the public key to kalshi.com/profile/api, then paste the "
+                   "private key PEM into Streamlit secrets as `KALSHI_PRIVATE_KEY_PEM`.")
+    else:
+        st.caption("📝 Paper mode only. To unlock live trading add one of:  \n"
+                   "• **Kalshi** (US-OK): `KALSHI_API_KEY` + `KALSHI_PRIVATE_KEY_PEM`  \n"
+                   "• **Polymarket** (non-US): `POLYMARKET_PRIVATE_KEY`  \n"
+                   "(Never paste keys into chat.)")
+        st.caption("Toggle visible in the main panel once credentials are saved + app rebooted.")
 
     _missing = [k for k, v in {
         "ANTHROPIC_API_KEY": _anthropic_key,
@@ -779,31 +872,38 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 # ── demo toggle + run button (outside fragment — must not be disrupted) ────────
+# IMPORTANT: every control below binds DIRECTLY to its session_state key with no
+# conflicting `value=`/default. Passing both a `value=` and a key that is already
+# in session_state makes Streamlit re-seed the widget on some reruns, which is
+# what caused "▶ Run" to silently reset Demo / Live / Auto-execute. Likewise,
+# auto_live is ALWAYS rendered (disabled when unavailable) — a hidden keyed
+# widget has its state dropped by Streamlit, which broke auto-execution.
+def _on_demo_change():
+    # Demo flips force a fresh data fetch under the new mode.
+    st.cache_data.clear()
+
 _bar1, _bar2, _bar3 = st.columns([3, 2, 1])
 with _bar1:
     # Budget controls here so they're always visible (sidebar may be collapsed)
     _bc1, _bc2, _bc3 = st.columns(3)
     with _bc1:
-        st.number_input("Polymarket budget ($)", value=10.0, min_value=1.0, step=5.0,
+        st.number_input("Polymarket budget ($)", min_value=1.0, step=5.0,
                         key="poly_budget", help="Max $ per Polymarket trade")
     with _bc2:
-        st.number_input("Kalshi budget ($)", value=10.0, min_value=1.0, step=5.0,
+        st.number_input("Kalshi budget ($)", min_value=1.0, step=5.0,
                         key="kalshi_budget", help="Max $ per Kalshi trade")
     with _bc3:
-        st.slider("Min confidence", 0.40, 0.90, 0.55, 0.05, key="sidebar_min_conf")
+        st.slider("Min confidence", 0.40, 0.90, step=0.05, key="sidebar_min_conf")
 with _bar2:
-    _demo_new = st.toggle(
+    st.toggle(
         "🔵 Demo mode",
-        value=st.session_state.demo_mode,
-        key="demo_main",
+        key="demo_mode",
+        on_change=_on_demo_change,
         help="ON = safe simulated data. OFF = live API connections.",
     )
-    if _demo_new != st.session_state.demo_mode:
-        st.session_state.demo_mode = _demo_new
-        st.cache_data.clear()
-        st.rerun()
 with _bar3:
     if st.button("▶ Run", type="primary", use_container_width=True, key="run_main"):
+        # Only refresh data — never touch widget state.
         st.cache_data.clear()
         st.rerun()
 
@@ -812,38 +912,45 @@ _bs1, _bs2, _bs3, _bs4, _bs5 = st.columns(5)
 with _bs1:
     st.toggle(
         "📝 Auto paper trades",
-        value=False,
         key="auto_paper",
         help="Bot automatically logs a paper trade for every Buy signal "
              "that passes your confidence filter on each analysis run.",
     )
 with _bs2:
-    if _poly_pk:
+    if _has_live_creds:
         st.toggle(
             "🚨 Live trading (real $)",
-            value=st.session_state.get("live_trading", False),
             key="live_trading",
-            help="Switch from Paper to real-money execution on Polymarket. "
+            help="Switch from Paper to real-money execution. Polymarket needs "
+                 "POLYMARKET_PRIVATE_KEY (US accounts are geo-blocked → 403); "
+                 "Kalshi needs KALSHI_API_KEY + KALSHI_PRIVATE_KEY_PEM (US-OK). "
                  "Start with $10. Both bots default mock_mode=true — never "
                  "enable without weeks of mock testing and verified API connections.",
         )
         if st.session_state.get("live_trading", False):
             st.error("LIVE MODE ON", icon="🚨")
     else:
-        st.caption("📝 Paper only\n(add wallet key for live)")
+        if _kalshi_key and not _kalshi_pem:
+            st.caption("📝 Paper only\n(add `KALSHI_PRIVATE_KEY_PEM`)")
+        else:
+            st.caption("📝 Paper only\n(add Kalshi or Polymarket keys)")
 with _bs3:
+    # Always render so Streamlit never drops the auto_live state. Disable it
+    # (rather than hide) when live trading is off or no live creds are present.
     _live_on = st.session_state.get("live_trading", False)
-    if _poly_pk and _live_on:
-        st.toggle(
-            "🤖 Auto-execute LIVE",
-            value=False,
-            key="auto_live",
-            help="Bot auto-places REAL Polymarket orders on every refresh cycle. "
-                 "Uses the Polymarket budget set in the sidebar.",
-        )
-        if st.session_state.get("auto_live", False):
-            st.error("Auto-LIVE ON", icon="⚡")
-    else:
+    _al_ready = bool(_has_live_creds and _live_on)
+    st.toggle(
+        "🤖 Auto-execute LIVE",
+        key="auto_live",
+        disabled=not _al_ready,
+        help="Bot auto-places REAL orders on every refresh cycle — Polymarket "
+             "and/or Kalshi, whichever has credentials. Uses the per-platform "
+             "budgets above. Stays ON across browser refreshes — disable it "
+             "manually to stop the bot.",
+    )
+    if _al_ready and st.session_state.get("auto_live", False):
+        st.error("Auto-LIVE ON", icon="⚡")
+    elif not _al_ready:
         st.caption("Enable Live trading\nto unlock auto-live")
 with _bs4:
     _n_p_outer = len(st.session_state.paper_ledger)
@@ -856,7 +963,6 @@ with _bs5:
     st.selectbox(
         "⏱ Auto-refresh",
         ["Off", "Every 1 min", "Every 5 min", "Every 15 min", "Every 30 min"],
-        index=0,
         key="refresh_label",
         help="Run the bot 24/7 — fetches fresh data and auto-executes trades "
              "on the chosen interval.",
@@ -971,7 +1077,10 @@ def _live_dashboard():
     _price_map = {a["question"][:50]: a["price"] for a in analyses}
 
     def _trade_pnl(row: dict) -> float:
-        """Unrealised P&L in dollars for a paper trade row."""
+        """P&L in dollars for a trade row — realized once the position is closed,
+        otherwise unrealized against the current market price."""
+        if row.get("Open") is False and "Realized $" in row:
+            return float(row.get("Realized $") or 0.0)
         ep_yes = float(row.get("entry_num") or 0)
         if ep_yes <= 0:
             return 0.0
@@ -1048,7 +1157,8 @@ def _live_dashboard():
                     axis=1,
                 )
             _show_l = [c for c in ["Platform","Question","Dir","Size $","Entry",
-                                    "Current %","P&L $","Order ID","Status","Time","Mode"]
+                                    "Current %","Exit","P&L $","Realized $","Status",
+                                    "Order ID","Time","Mode"]
                        if c in df_l.columns]
             st.dataframe(
                 df_l[_show_l], use_container_width=True, hide_index=True,
@@ -1139,11 +1249,164 @@ def _live_dashboard():
                 st.session_state._brain.on_trade_placed(_to_brain_input(_a))
                 _live_added += 1
             except Exception as _exc:
-                st.toast(f"Auto-live order failed: {_exc}", icon="❌")
+                # A Polymarket failure here is almost always systemic for the
+                # whole cycle (US geo-block → 403, or an invalid wallet key) —
+                # every other signal will fail identically. Record one clear
+                # message and STOP retrying so the log isn't spammed and the
+                # Kalshi block below still runs. Kalshi is the US-accessible path.
+                _msg = str(_exc)
+                if "403" in _msg or "restricted" in _msg.lower():
+                    _hint = ("Polymarket blocks US accounts/IPs (403). This is a "
+                             "jurisdiction rule, not a bug — trade Kalshi instead.")
+                elif "hex" in _msg.lower():
+                    _hint = ("POLYMARKET_PRIVATE_KEY isn't valid hex. Polymarket is "
+                             "US-blocked anyway — remove the key from secrets to "
+                             "silence this and trade Kalshi only.")
+                else:
+                    _hint = "Polymarket live unavailable — trading Kalshi only."
+                st.session_state._last_live_error = (
+                    f"{time.strftime('%H:%M:%S')} — Polymarket disabled this cycle: {_hint} "
+                    f"(raw: {_msg[:60]})"
+                )
+                st.toast(f"Polymarket skipped: {_hint}", icon="⚠️")
+                break  # stop hammering Polymarket; fall through to Kalshi
         if _live_added:
             st.toast(
                 f"🚨 Bot auto-placed {_live_added} LIVE order{'s' if _live_added != 1 else ''} on Polymarket",
                 icon="⚡",
+            )
+
+    # ── auto LIVE trades (Kalshi — US-accessible, gated behind live_trading) ───
+    # Kalshi is US-regulated so live orders work from a US account/IP, unlike
+    # Polymarket which 403s US users. Same gates: auto_live + live_trading + not demo.
+    if _al and _lt and _kalshi_key and _kalshi_pem and not _dm:
+        _kal_added = 0
+        _kal_candidates = 0   # Kalshi BUY signals seen this cycle
+        _kal_toosmall = 0     # skipped because Kelly-sized order < $1
+        for _a in analyses:
+            if _a["signal"] == "HOLD" or _a["kelly"] <= 0 or _a["platform"] != "Kalshi":
+                continue
+            _kal_candidates += 1
+            _size = round(min(float(kalshi_budget) * _a["kelly"], float(kalshi_budget) * 0.15), 2)
+            if _size < _MIN_ORDER_USD:
+                # Valid signal but Kelly-sized tiny: deploy the minimum so it
+                # still trades, as long as the budget itself can cover it.
+                if float(kalshi_budget) >= _MIN_ORDER_USD:
+                    _size = _MIN_ORDER_USD
+                else:
+                    _kal_toosmall += 1
+                    continue
+            _dir = "YES" if _a["signal"] == "BUY_YES" else "NO"
+            _kside = "yes" if _a["signal"] == "BUY_YES" else "no"
+            # Dedup against OPEN positions only — a previously closed position in
+            # the same market/direction may be re-entered on a fresh signal.
+            if any(l.get("Question", "")[:40] == _a["question"][:40]
+                   and l.get("Dir") == _dir and l.get("Open", True)
+                   for l in st.session_state.live_ledger):
+                continue
+            try:
+                _res = _execute_live_kalshi_order(
+                    ticker=_a["id"], price=_a["price"], size_usd=_size,
+                    side=_kside, api_key_id=_kalshi_key, pem_content=_kalshi_pem,
+                )
+                st.session_state.live_ledger.append({
+                    "Platform": "Kalshi",
+                    "Question": _a["question"][:50],
+                    "Dir":      _dir,
+                    "Size $":   round(_size, 2),
+                    "entry_num": _a["price"],
+                    "Entry":    f"{_a['price']:.0%}",
+                    "AI Est.":  f"{_a['prob']:.0%}",
+                    "Edge":     f"{_a['edge']:+.1%}",
+                    "Order ID": _res["order_id"],
+                    "Status":   _res["status"],
+                    "Time":     time.strftime("%H:%M:%S"),
+                    "Mode":     "🤖 Auto-Live",
+                    # Position-maintenance metadata (used by the auto-exit pass)
+                    "ticker":   _a["id"],
+                    "side":     _kside,
+                    "count":    int(_res.get("count", 0)),
+                    "Open":     True,
+                })
+                st.session_state._brain.on_trade_placed(_to_brain_input(_a))
+                _kal_added += 1
+            except Exception as _exc:
+                st.session_state._last_live_error = (
+                    f"{time.strftime('%H:%M:%S')} — {_a['question'][:40]}: {_exc}"
+                )
+                st.toast(f"Auto-live Kalshi order failed: {_exc}", icon="❌")
+        if _kal_added:
+            st.toast(
+                f"🚨 Bot auto-placed {_kal_added} LIVE order{'s' if _kal_added != 1 else ''} on Kalshi",
+                icon="⚡",
+            )
+        else:
+            # No Kalshi order fired — record why so it's visible in diagnostics.
+            if _kal_candidates == 0:
+                _kal_why = ("no actionable Kalshi signals this cycle (all HOLD or no "
+                            "edge). Lower Min confidence or wait for Kalshi markets "
+                            "with an edge.")
+            elif _kal_toosmall == _kal_candidates:
+                _kal_why = (f"{_kal_candidates} Kalshi signal(s) found but the Kalshi budget "
+                            f"(${kalshi_budget:.2f}) is below the ${_MIN_ORDER_USD:.0f} minimum "
+                            "order — raise the Kalshi budget.")
+            else:
+                _kal_why = (f"{_kal_candidates} Kalshi signal(s) found but already held "
+                            "(deduped against the live ledger).")
+            st.session_state._last_kalshi_status = (
+                f"{time.strftime('%H:%M:%S')} — Kalshi placed 0 orders: {_kal_why}"
+            )
+
+    # ── auto-exit / position maintenance (Kalshi) ─────────────────────────────
+    # "Maintaining proper trades" means not just opening positions but closing
+    # them when the thesis breaks. For each OPEN auto-live Kalshi position we
+    # re-check the live model: if it now signals the OPPOSITE direction with a
+    # real edge (a genuine reversal, not noise), the bot sells to close. Same
+    # gates as entry, so disabling auto-live also halts auto-exits.
+    if _al and _lt and _kalshi_key and _kalshi_pem and not _dm:
+        _by_ticker = {a["id"]: a for a in all_analyses}
+        _closed = 0
+        for _row in st.session_state.live_ledger:
+            if _row.get("Platform") != "Kalshi" or not _row.get("Open", False):
+                continue
+            _cur = _by_ticker.get(_row.get("ticker"))
+            if not _cur:
+                continue
+            _held = _row.get("Dir")  # "YES" / "NO"
+            _flipped = ((_held == "YES" and _cur["signal"] == "BUY_NO")
+                        or (_held == "NO" and _cur["signal"] == "BUY_YES"))
+            if not (_flipped and abs(_cur["edge"]) >= _cur["min_edge"]):
+                continue
+            _cnt = int(_row.get("count", 0))
+            if _cnt <= 0:
+                continue
+            try:
+                _pnl = _trade_pnl(_row)
+                _ex = _execute_live_kalshi_order(
+                    ticker=_row["ticker"], price=_cur["price"], size_usd=0.0,
+                    side=_row.get("side", "yes"), api_key_id=_kalshi_key,
+                    pem_content=_kalshi_pem, action="sell", count=_cnt,
+                )
+                _row["Open"] = False
+                _row["Status"] = "CLOSED"
+                _row["Exit"] = f"{_cur['price']:.0%}"
+                _row["Realized $"] = round(_pnl, 2)
+                _row["Exit ID"] = _ex.get("order_id", "")
+                _closed += 1
+            except Exception as _exc:
+                st.session_state._last_live_error = (
+                    f"{time.strftime('%H:%M:%S')} — exit {_row.get('Question','')[:30]}: {_exc}"
+                )
+                st.toast(f"Auto-exit failed: {_exc}", icon="❌")
+        if _closed:
+            st.toast(
+                f"🔄 Bot auto-closed {_closed} reversed Kalshi position"
+                f"{'s' if _closed != 1 else ''}",
+                icon="🔄",
+            )
+            st.session_state._last_kalshi_status = (
+                f"{time.strftime('%H:%M:%S')} — auto-closed {_closed} reversed "
+                "position(s) on model flip."
             )
 
     # ── brain: detect resolutions + decay + save ──────────────────────────────
@@ -1613,13 +1876,19 @@ Then **Reboot app**. The brain will immediately start persisting after the next 
         )
 
         # ── build positions from actionable signals ──────────────────────────
+        # Stake floor is a small fraction of the budget (not a hard $1) so the
+        # simulator still works with small per-platform budgets ($10–$20). This
+        # is a simulation, not live execution, so we include any positive stake.
+        _mc_min_stake = max(0.05, budget * 0.01)   # e.g. $0.20 at a $20 budget
         mc_positions = []
         pos_rows = []
+        _n_actionable = 0
         for a in analyses:
             if a["signal"] == "HOLD":
                 continue
+            _n_actionable += 1
             size = min(budget * a["kelly"], budget * 0.15)
-            if size < 1.0:
+            if size < _mc_min_stake:
                 continue
             mcp = position_from_signal(
                 label=a["question"][:30],
@@ -1645,7 +1914,20 @@ Then **Reboot app**. The brain will immediately start persisting after the next 
             })
 
         if not mc_positions:
-            st.info("No positions meet the current thresholds.")
+            if _n_actionable == 0:
+                st.info(
+                    "No actionable BUY signals at the current **Min confidence** "
+                    f"({min_conf:.0%}). Lower the Min confidence slider above, or "
+                    "click **▶ Run** to re-scan. In Demo mode the simulated edges "
+                    "may all fall below your threshold."
+                )
+            else:
+                st.info(
+                    f"{_n_actionable} actionable signal(s) found, but each suggested "
+                    f"stake is below the simulator's floor of ${_mc_min_stake:.2f} "
+                    "(Kelly sizing × your budget). Increase the Polymarket/Kalshi "
+                    "budgets above to size positions large enough to simulate."
+                )
         else:
             c1, c2 = st.columns([1, 1])
             with c1:
@@ -1735,6 +2017,141 @@ Then **Reboot app**. The brain will immediately start persisting after the next 
             st.info("🔵 **Paper mode** — buttons below simulate fills only. "
                     "No real orders are placed.")
 
+        # ── auto-execute diagnostics — why are (or aren't) trades firing? ──────
+        st.markdown("### 🤖 Auto-Execute Status")
+        _gate_demo  = not _dm
+        _gate_live  = bool(_lt)
+        _gate_key   = bool(_poly_pk or _kalshi_live_creds)
+        _gate_auto  = bool(_al)
+        _gate_loop  = bool(_refresh_secs)   # auto-refresh drives repeated cycles
+        _all_gates  = _gate_demo and _gate_live and _gate_key and _gate_auto
+
+        _g1, _g2, _g3, _g4, _g5 = st.columns(5)
+        _g1.metric("Demo OFF",        "✅" if _gate_demo else "❌ ON")
+        _g2.metric("Live trading",    "✅ ON" if _gate_live else "❌ OFF")
+        _g3.metric("Live creds",      "✅" if _gate_key  else "❌ missing")
+        _g4.metric("Auto-execute",    "✅ ON" if _gate_auto else "❌ OFF")
+        _g5.metric("Auto-refresh",    "✅" if _gate_loop else "⚠️ Off")
+
+        # Which platforms can actually execute live right now?
+        _live_plats = []
+        if _poly_pk:            _live_plats.append("Polymarket")
+        if _kalshi_live_creds:  _live_plats.append("Kalshi")
+        st.caption(
+            "Live execution enabled for: **" + (", ".join(_live_plats) or "none") + "**. "
+            "Polymarket 403s US accounts; Kalshi is US-accessible."
+        )
+
+        if not _all_gates:
+            _need = []
+            if not _gate_demo: _need.append("turn **Demo mode OFF**")
+            if not _gate_live: _need.append("turn **Live trading ON**")
+            if not _gate_key:  _need.append("add **POLYMARKET_PRIVATE_KEY** or "
+                                            "**KALSHI_API_KEY + KALSHI_PRIVATE_KEY_PEM** to secrets")
+            if not _gate_auto: _need.append("turn **🤖 Auto-execute LIVE ON**")
+            st.warning("The AI brain will NOT auto-trade until you: " + "; ".join(_need) + ".")
+        elif not _gate_loop:
+            st.warning("All gates are ON, but **Auto-refresh is Off** — the bot only "
+                       "evaluates once per page load / ▶ Run. Set **⏱ Auto-refresh** "
+                       "to an interval (e.g. *Every 5 min*) for continuous trading.")
+        else:
+            st.success("All systems GO — the brain auto-places live orders on "
+                       + (" + ".join(_live_plats) or "(no platform)") + " each refresh cycle.")
+
+        _last_err = st.session_state.get("_last_live_error")
+        if _last_err:
+            st.error(f"⚠️ Last live-order error: {_last_err}")
+
+        _kal_status = st.session_state.get("_last_kalshi_status")
+        if _kal_status:
+            st.info(f"📊 Kalshi: {_kal_status}")
+
+        # ── Kalshi near-miss diagnostic ───────────────────────────────────────
+        # Shows EVERY Kalshi market (even HOLD ones, which the Min-confidence
+        # filter hides) with the exact numbers that gate a trade, so it's clear
+        # whether markets are just below threshold or have no edge at all.
+        if _kalshi_live_creds:
+            _kal_all = sorted(
+                (a for a in all_analyses if a["platform"] == "Kalshi"),
+                key=lambda a: abs(a["edge"]), reverse=True,
+            )[:10]
+            if _kal_all:
+                _krows = []
+                for _a in _kal_all:
+                    _conf_ok = _a["conf"] >= _CONF_FLOOR
+                    _edge_ok = abs(_a["edge"]) >= _a["min_edge"]
+                    if _a["signal"] != "HOLD":
+                        _r = "✅ BUY signal"
+                    elif not _conf_ok and not _edge_ok:
+                        _r = "❌ conf & edge both too low"
+                    elif not _conf_ok:
+                        _r = f"❌ conf {_a['conf']:.2f} < {_CONF_FLOOR:.2f} (quality {_a['quality']:.2f} shrinks it)"
+                    else:
+                        _r = f"❌ edge {abs(_a['edge']):.1%} < min {_a['min_edge']:.1%}"
+                    _krows.append({
+                        "Market":   _a["question"][:38],
+                        "Price":    f"{_a['price']:.0%}",
+                        "ModelProb": f"{_a['prob']:.0%}",
+                        "Edge":     f"{_a['edge']:+.1%}",
+                        "MinEdge":  f"{_a['min_edge']:.1%}",
+                        "AdjConf":  f"{_a['conf']:.2f}",
+                        "Quality":  f"{_a['quality']:.2f}",
+                        "Why":      _r,
+                    })
+                with st.expander(f"🔬 Kalshi markets scanned ({len(_kal_all)}) — why they did/didn't signal", expanded=True):
+                    st.dataframe(pd.DataFrame(_krows), use_container_width=True, hide_index=True)
+                    st.caption(
+                        f"A Kalshi BUY needs **AdjConf ≥ {_CONF_FLOOR:.2f}** AND **|Edge| ≥ MinEdge**. "
+                        f"AdjConf = model confidence × ({_QUALITY_BASE:.2f} + {_QUALITY_SPAN:.2f} × quality). "
+                        "If everything is HOLD, Kalshi simply has no high-conviction "
+                        "edge right now — the bot is correctly waiting, not broken."
+                    )
+
+        # Per-candidate breakdown: show why each live signal did/didn't trade.
+        _live_sigs = [a for a in analyses
+                      if a["signal"] != "HOLD"
+                      and ((a["platform"] == "Polymarket" and _poly_pk)
+                           or (a["platform"] == "Kalshi" and _kalshi_live_creds))]
+        if _live_sigs:
+            _diag_rows = []
+            for _a in _live_sigs:
+                _dir = "YES" if _a["signal"] == "BUY_YES" else "NO"
+                _is_poly = _a["platform"] == "Polymarket"
+                _pb  = float(poly_budget) if _is_poly else float(kalshi_budget)
+                _tok = (_a.get("yes_token_id") if _a["signal"] == "BUY_YES"
+                        else _a.get("no_token_id")) if _is_poly else "n/a"
+                _sz  = round(min(_pb * _a["kelly"], _pb * 0.15), 2)
+                # Kalshi floors a valid small order up to the minimum if the
+                # budget can cover it (matches the auto-live loop).
+                if not _is_poly and _sz < _MIN_ORDER_USD and _pb >= _MIN_ORDER_USD:
+                    _sz = _MIN_ORDER_USD
+                _dup = any(l.get("Question", "")[:40] == _a["question"][:40]
+                           and l.get("Dir") == _dir and l.get("Open", True)
+                           for l in st.session_state.live_ledger)
+                if _a["kelly"] <= 0:                _why = "❌ Kelly = 0 (no edge)"
+                elif _is_poly and not _tok:         _why = "❌ no token id (mock/illiquid)"
+                elif _sz < _MIN_ORDER_USD:          _why = f"❌ budget ${_pb:.2f} < ${_MIN_ORDER_USD:.0f} min order"
+                elif _dup:                          _why = "⏸ already held (open)"
+                elif not _all_gates:                _why = "⏸ gates off (see above)"
+                else:                               _why = "✅ eligible — will trade next cycle"
+                _diag_rows.append({
+                    "Platform": _a["platform"],
+                    "Question": _a["question"][:40],
+                    "Dir":      _dir,
+                    "Kelly":    f"{_a['kelly']:.1%}",
+                    "Size $":   f"${_sz:.2f}",
+                    "Edge":     f"{_a['edge']:+.1%}",
+                    "Status":   _why,
+                })
+            with st.expander(f"🔍 Why these {len(_live_sigs)} live signal(s) did/didn't trade", expanded=not _all_gates):
+                st.dataframe(pd.DataFrame(_diag_rows), use_container_width=True, hide_index=True)
+                st.caption(f"A valid signal deploys its Kelly size, floored up to the "
+                           f"${_MIN_ORDER_USD:.0f} minimum order when the budget allows. "
+                           "Raise the per-platform **budget** above to size more signals over the minimum.")
+        else:
+            st.caption("No actionable live signals at the current Min confidence. "
+                       "Lower **Min confidence** or click **▶ Run** to re-scan.")
+
         # ── order book with live P&L ──────────────────────────────────────────
         st.markdown("### 📊 Order Book & P&L")
         _render_order_book("exec")
@@ -1754,7 +2171,9 @@ Then **Reboot app**. The brain will immediately start persisting after the next 
                 direction = "YES" if a["signal"] == "BUY_YES" else "NO"
                 is_poly = a["platform"] == "Polymarket"
                 token_id = a["yes_token_id"] if direction == "YES" else a["no_token_id"]
-                can_live = bool(live_trading and is_poly and token_id and _poly_pk)
+                can_live_poly   = bool(live_trading and is_poly and token_id and _poly_pk)
+                can_live_kalshi = bool(live_trading and not is_poly and _kalshi_live_creds)
+                can_live = can_live_poly or can_live_kalshi
 
                 with st.container(border=True):
                     cL, cR = st.columns([3, 2])
@@ -1789,11 +2208,12 @@ Then **Reboot app**. The brain will immediately start persisting after the next 
 
                         # Live execution — heavily gated
                         if live_trading:
-                            if not is_poly:
-                                st.caption("⚠️ Live execution from the dashboard supports "
-                                           "Polymarket only. Use the bot for Kalshi.")
-                            elif not token_id:
+                            if is_poly and not _poly_pk:
+                                st.caption("⚠️ No POLYMARKET_PRIVATE_KEY in secrets — paper only.")
+                            elif is_poly and not token_id:
                                 st.caption("⚠️ No token id (mock market) — paper only.")
+                            elif not is_poly and not _kalshi_live_creds:
+                                st.caption("⚠️ No Kalshi API key + PEM in secrets — paper only.")
                             elif can_live:
                                 confirm = st.checkbox(
                                     f"Confirm REAL ${size:.2f} order",
@@ -1804,13 +2224,22 @@ Then **Reboot app**. The brain will immediately start persisting after the next 
                                              disabled=not confirm):
                                     try:
                                         with st.spinner("Signing & posting order…"):
-                                            res = _execute_live_polymarket_order(
-                                                token_id=token_id, price=a["price"],
-                                                size_usd=size, side="BUY",
-                                                private_key=_poly_pk,
-                                                sig_type=_poly_sig_type,
-                                                funder=_poly_funder,
-                                            )
+                                            if is_poly:
+                                                res = _execute_live_polymarket_order(
+                                                    token_id=token_id, price=a["price"],
+                                                    size_usd=size, side="BUY",
+                                                    private_key=_poly_pk,
+                                                    sig_type=_poly_sig_type,
+                                                    funder=_poly_funder,
+                                                )
+                                            else:
+                                                res = _execute_live_kalshi_order(
+                                                    ticker=a["id"], price=a["price"],
+                                                    size_usd=size,
+                                                    side="yes" if direction == "YES" else "no",
+                                                    api_key_id=_kalshi_key,
+                                                    pem_content=_kalshi_pem,
+                                                )
                                         st.session_state.live_ledger.append({
                                             "Platform":  a["platform"],
                                             "Question":  a["question"][:50],
@@ -1852,3 +2281,15 @@ Then **Reboot app**. The brain will immediately start persisting after the next 
 
 # ── call the fragment ──────────────────────────────────────────────────────────
 _live_dashboard()
+
+# ── Save current settings to URL so they survive a browser refresh ─────────────
+st.query_params.update({
+    "demo": "1" if st.session_state.get("demo_mode", True)   else "0",
+    "pb":   str(st.session_state.get("poly_budget",    10.0)),
+    "kb":   str(st.session_state.get("kalshi_budget",  10.0)),
+    "mc":   str(st.session_state.get("sidebar_min_conf", 0.55)),
+    "rl":   st.session_state.get("refresh_label", "Off"),
+    "ap":   "1" if st.session_state.get("auto_paper", False) else "0",
+    "lt":   "1" if st.session_state.get("live_trading", False) else "0",
+    "al":   "1" if st.session_state.get("auto_live", False) else "0",
+})

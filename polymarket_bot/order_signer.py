@@ -19,6 +19,7 @@ Wallet types (signature_type):
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from dataclasses import dataclass
 from typing import Optional
@@ -26,6 +27,13 @@ from typing import Optional
 import structlog
 
 log = structlog.get_logger(__name__)
+
+# Unicode "invisible" whitespace characters that str.split() does NOT remove:
+# NBSP U+00A0, ZWSP U+200B, ZWNJ U+200C, ZWJ U+200D,
+# Word Joiner U+2060, BOM U+FEFF
+_INVISIBLE_WS = re.compile(
+    u'[\\s ​‌‍⁠﻿]+'
+)
 
 
 class SigningUnavailable(RuntimeError):
@@ -59,7 +67,7 @@ class PolymarketOrderSigner:
         funder: str = "",
         mock_mode: bool = True,
     ) -> None:
-        self._private_key = private_key
+        self._private_key = self._normalize_private_key(private_key)
         self._api_key = api_key
         self._api_secret = api_secret
         self._api_passphrase = api_passphrase
@@ -69,6 +77,66 @@ class PolymarketOrderSigner:
         self._funder = funder
         self.mock_mode = mock_mode
         self._client = None  # lazily built py-clob-client instance
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _normalize_private_key(key: str) -> str:
+        """
+        Light cleanup of a wallet private key read from secrets/env so signing
+        doesn't fail with 'Non-hexadecimal digit found'. NEVER raises — strict
+        validation happens at sign time in _validated_signing_key().
+
+        Handles common copy-paste / TOML-secret problems:
+          - surrounding single/double quotes
+          - leading/trailing whitespace and newlines
+          - inner ASCII whitespace (spaces/newlines pasted mid-key)
+          - Unicode invisible characters: NBSP, ZWSP, ZWJ, BOM, etc.
+
+        Keeps the original 0x prefix convention if present; eth-account / the
+        CLOB client accept the key with or without it.
+        """
+        if not key:
+            return ""
+        k = key.strip().strip('"').strip("'").strip()
+        # Remove ALL whitespace including Unicode variants that str.split() misses
+        k = _INVISIBLE_WS.sub('', k)
+        return k
+
+    def _validated_signing_key(self) -> str:
+        """
+        Return a canonical 0x-prefixed 64-hex-char key for live signing, or
+        raise SigningUnavailable with an actionable message. Called only on the
+        real signing path so mock/test construction never trips over it.
+        """
+        k = self._private_key
+        if not k:
+            raise SigningUnavailable(
+                "No wallet private key configured — cannot sign a real order. "
+                "Set POLYMARKET_PRIVATE_KEY (never paste it into chat)."
+            )
+        if k[:2] in ("0x", "0X"):
+            k = k[2:]
+        _valid_hex = frozenset('0123456789abcdefABCDEF')
+        bad = [c for c in k if c not in _valid_hex]
+        if bad:
+            unique_bad = list(dict.fromkeys(bad))[:6]
+            _sample = ', '.join(f'U+{ord(c):04X}' for c in unique_bad)
+            raise SigningUnavailable(
+                f"POLYMARKET_PRIVATE_KEY contains {len(bad)} non-hex character(s): "
+                f"{_sample} (key is {len(k)} chars after stripping 0x prefix). "
+                "The key must be a raw 64-char hex string — not a seed phrase, "
+                "wallet address, or PEM block."
+            )
+        if len(k) != 64:
+            raise SigningUnavailable(
+                f"POLYMARKET_PRIVATE_KEY should be 64 hex chars (32 bytes); got "
+                f"{len(k)} chars after stripping the 0x prefix. "
+                "Wallet address = 40 chars; full private key = 64 chars."
+            )
+        return "0x" + k.lower()
 
     # ------------------------------------------------------------------
     # Public API
@@ -191,7 +259,7 @@ class PolymarketOrderSigner:
                 "Streamlit environment with a matching Python version."
             ) from exc
 
-        kwargs = {"key": self._private_key, "chain_id": self._chain_id}
+        kwargs = {"key": self._validated_signing_key(), "chain_id": self._chain_id}
         if self._signature_type:
             kwargs["signature_type"] = self._signature_type
         if self._funder:
