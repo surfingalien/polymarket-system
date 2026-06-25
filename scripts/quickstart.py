@@ -101,7 +101,7 @@ def write_env(config: dict, path: Path) -> None:
         f"KALSHI_API_KEY_ID={config.get('kalshi_key_id', '')}",
         f"KALSHI_PRIVATE_KEY_PATH={config.get('kalshi_key_path', 'keys/kalshi_private.pem')}",
         f"KALSHI_DEMO_MODE={str(config.get('kalshi_demo', True)).lower()}",
-        "KALSHI_API_HOST=https://trading-api.kalshi.com",
+        "KALSHI_API_HOST=https://api.elections.kalshi.com",
         "",
         "# ---- Risk (tuned for ${budget} budget) ----".replace("${budget}", str(config.get('budget', 100))),
         f"RISK_MAX_POSITION_SIZE_USD={config.get('max_position', 10)}",

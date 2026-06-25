@@ -61,7 +61,7 @@ def _check_sign(key, key_id: str) -> dict:
 async def _check_api(headers: dict):
     import httpx
 
-    url = "https://trading-api.kalshi.com/trade-api/v2/markets"
+    url = "https://api.elections.kalshi.com/trade-api/v2/markets"
     async with httpx.AsyncClient(timeout=15) as client:
         resp = await client.get(url, params={"limit": 5, "status": "open"}, headers=headers)
     if resp.status_code == 200:
