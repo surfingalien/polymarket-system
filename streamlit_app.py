@@ -598,22 +598,36 @@ def _price_movement(hist: list) -> float:
 
 @st.cache_data(ttl=120, show_spinner=False)
 def _run_analysis(
-    markets: list[dict], anthropic_key: str = "",
-    ai_model: str = "claude-opus-4-8", ai_base_url: str = "",
-) -> tuple[list[dict], bool, str]:
-    # Fetch AI probability estimates — live provider when key is present, else mock.
-    # ai_model/ai_base_url select the backend (Claude default, or Z.ai GLM).
+    markets: list[dict], providers: tuple = (),
+) -> tuple[list[dict], bool, str, str]:
+    # Fetch AI probability estimates — try each provider in order, falling
+    # through to the next on a usage-limit/auth/rate error (e.g. Claude exhausted
+    # → Z.ai GLM). `providers` is an ordered tuple of (key, model, base_url, name).
+    # Returns (analyses, using_live, ai_err, provider_used).
     live_ai: dict[str, dict] = {}
     using_live = False
     ai_err = ""
-    if anthropic_key:
+    provider_used = ""
+    for _pkey, _pmodel, _pbase, _pname in providers:
+        if not _pkey:
+            continue
         try:
-            live_ai = _live_ai_analysis(anthropic_key, markets, ai_model, ai_base_url)
+            live_ai = _live_ai_analysis(_pkey, markets, _pmodel, _pbase)
             using_live = bool(live_ai)
+            if using_live:
+                ai_err = ""
+                provider_used = _pname
+                break
         except Exception as _live_err:
             live_ai = {}
             using_live = False
-            ai_err = f"{type(_live_err).__name__}: {_live_err}"
+            ai_err = f"{_pname} — {type(_live_err).__name__}: {_live_err}"
+            # Fall through to the next provider only on limit/auth/rate failures;
+            # for other errors, stop and surface the message.
+            _e = str(_live_err).lower()
+            if not ("usage limit" in _e or "401" in _e or "authentication" in _e
+                    or "429" in _e or "rate limit" in _e or "quota" in _e):
+                break
 
     bay   = BayesianEstimator()
     kelly = KellyCriterion(max_fraction=0.15)
@@ -698,7 +712,7 @@ def _run_analysis(
             "yes_token_id": str(mkt.get("yes_token_id", "")),
             "no_token_id":  str(mkt.get("no_token_id", "")),
         })
-    return out, using_live, ai_err
+    return out, using_live, ai_err, provider_used
 
 
 # ── sidebar ───────────────────────────────────────────────────────────────────
@@ -709,18 +723,21 @@ _kalshi_key      = _get_secret("KALSHI_API_KEY")
 _kalshi_pem      = _get_secret("KALSHI_PRIVATE_KEY_PEM")
 
 # ── AI provider resolution ────────────────────────────────────────────────────
-# Anthropic (Claude) is preferred when its key is present. Otherwise, if a Z.ai
-# key is set, route the analysis through Z.ai's Anthropic-compatible GLM endpoint.
+# Build an ordered provider chain. Claude is primary when its key is present;
+# Z.ai's Anthropic-compatible GLM endpoint is the fallback. If Claude hits its
+# usage limit (or auth/rate error), analysis falls through to Z.ai automatically.
 _ZAI_BASE_URL = "https://api.z.ai/api/anthropic"
 _ZAI_MODEL    = _get_secret("ZAI_MODEL") or "glm-4.6"
+_ai_chain = []  # ordered list of (key, model, base_url, name)
 if _anthropic_key:
-    _ai_key, _ai_model, _ai_base_url, _ai_provider = (
-        _anthropic_key, "claude-opus-4-8", "", "Claude")
-elif _zai_key:
-    _ai_key, _ai_model, _ai_base_url, _ai_provider = (
-        _zai_key, _ZAI_MODEL, _ZAI_BASE_URL, "Z.ai GLM")
-else:
-    _ai_key, _ai_model, _ai_base_url, _ai_provider = ("", "claude-opus-4-8", "", "")
+    _ai_chain.append((_anthropic_key, "claude-opus-4-8", "", "Claude"))
+if _zai_key:
+    _ai_chain.append((_zai_key, _ZAI_MODEL, _ZAI_BASE_URL, "Z.ai GLM"))
+# Primary provider (for sidebar display before any call runs)
+_ai_key      = _ai_chain[0][0] if _ai_chain else ""
+_ai_model    = _ai_chain[0][1] if _ai_chain else "claude-opus-4-8"
+_ai_base_url = _ai_chain[0][2] if _ai_chain else ""
+_ai_provider = _ai_chain[0][3] if _ai_chain else ""
 _poly_pk         = _get_secret("POLYMARKET_PRIVATE_KEY")
 _poly_sig_type   = int(_get_secret("POLYMARKET_SIGNATURE_TYPE") or 0)
 _poly_funder     = _get_secret("POLYMARKET_FUNDER")
@@ -1031,18 +1048,20 @@ def _live_dashboard():
         st.cache_data.clear()
 
     # Compute effective API keys (demo mode forces mock regardless of key presence)
-    _eff_anthropic  = "" if _dm else _ai_key       # resolved AI key (Claude or Z.ai)
+    _eff_anthropic  = "" if _dm else _ai_key       # resolved AI key (primary)
     _eff_poly       = "" if _dm else _poly_key
     _eff_kalshi     = "" if _dm else _kalshi_key
     _eff_kalshi_pem = "" if _dm else _kalshi_pem
+    # Demo mode disables AI entirely; otherwise pass the full fallback chain.
+    _eff_ai_chain   = () if _dm else tuple(_ai_chain)
 
     # ── load data ─────────────────────────────────────────────────────────────
     try:
         with st.spinner("Fetching markets and running predictive models…"):
             _source_markets, _poly_live, _kalshi_live, _poly_err, _kalshi_err = \
                 _get_markets(_eff_poly, _eff_kalshi, _eff_kalshi_pem)
-            all_analyses, _live_ai_mode, _ai_err = _run_analysis(
-                _source_markets, _eff_anthropic, _ai_model, _ai_base_url)
+            all_analyses, _live_ai_mode, _ai_err, _ai_used = _run_analysis(
+                _source_markets, _eff_ai_chain)
     except Exception as exc:
         st.error("Analysis pipeline failed — see details below.")
         st.exception(exc)
@@ -1070,7 +1089,8 @@ def _live_dashboard():
             s = "background:#0f172a;color:#64748b;border-color:#334155;"
             return f'<span style="{_CHIP}{s}">⚫ {label} — no API key</span>'
 
-        _ai_label = _ai_provider or "Claude AI"
+        # Prefer the provider that actually served (after any fallback).
+        _ai_label = _ai_used or _ai_provider or "Claude AI"
         _chips = "".join([
             _conn_chip(_live_ai_mode, bool(_ai_key), _ai_label),
             _conn_chip(_poly_live,    bool(_poly_key),       "Polymarket"),
@@ -1092,11 +1112,18 @@ def _live_dashboard():
         )
     if _eff_anthropic and not _live_ai_mode:
         _err_low = _ai_err.lower()
-        if "usage limit" in _err_low or "api usage" in _err_low:
+        if "usage limit" in _err_low or "api usage" in _err_low or "quota" in _err_low:
             import re as _re
             _reset = (_re.search(r'(\d{4}-\d{2}-\d{2})', _ai_err) or type("", (), {"group": lambda *a: "July 1"})()).group(1)
+            # If Z.ai is not configured, point the user at it as the fallback.
+            _fallback_hint = (
+                "Add a **ZAI_API_KEY** secret to auto-fall back to Z.ai GLM when Claude is exhausted. "
+                if not _zai_key else
+                "The Z.ai fallback also failed — check **ZAI_API_KEY**. "
+            )
             st.warning(
-                f"**Anthropic API monthly limit reached** — Claude AI unavailable until **{_reset}**.  \n"
+                f"**AI usage limit reached** — primary provider unavailable until **{_reset}**.  \n"
+                f"{_fallback_hint}"
                 "Analysis is running on Bayesian + momentum signals (no AI). "
                 "Switch to **Demo mode** (toggle above) to silence this warning.",
                 icon="💳",
