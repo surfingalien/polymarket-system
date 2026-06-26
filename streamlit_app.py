@@ -2,7 +2,8 @@
 Polymarket / Kalshi AI Trading Bot — Streamlit Demo Dashboard
 
 Runs the full predictive algorithm stack on mock market data.
-No API keys required for demo. Set ANTHROPIC_API_KEY to enable live Claude analysis.
+No API keys required for demo. Set ANTHROPIC_API_KEY (Claude) or ZAI_API_KEY
+(Z.ai GLM, Anthropic-compatible) to enable live AI analysis.
 
 Uses ONLY Streamlit-native components (no Plotly) to guarantee compatibility
 across Python 3.10–3.14 and all Streamlit Cloud versions.
@@ -98,9 +99,15 @@ def _run_coro_sync(coro, timeout: int = 30):
     return result_box[0]  # empty list / None are valid results
 
 
-def _live_ai_analysis(api_key: str, markets: list[dict]) -> dict[str, dict]:
-    """Batch-call Claude AI; returns {market_id: plain_dict}."""
-    agent = ClaudeAgent(api_key=api_key, model="claude-opus-4-8")
+def _live_ai_analysis(
+    api_key: str, markets: list[dict],
+    model: str = "claude-opus-4-8", base_url: str = "",
+) -> dict[str, dict]:
+    """Batch-call the AI provider; returns {market_id: plain_dict}.
+
+    Provider is Anthropic by default; pass a GLM model + Z.ai base_url to route
+    through Z.ai's Anthropic-compatible endpoint instead."""
+    agent = ClaudeAgent(api_key=api_key, model=model, base_url=base_url)
     # Cap at 8 markets (single batch) to keep latency under 90 s timeout
     batch_input = [
         {"id": m["id"], "question": m["question"], "price": m["price"]}
@@ -590,19 +597,37 @@ def _price_movement(hist: list) -> float:
 # ── full analysis pipeline — returns only plain primitives ────────────────────
 
 @st.cache_data(ttl=120, show_spinner=False)
-def _run_analysis(markets: list[dict], anthropic_key: str = "") -> tuple[list[dict], bool, str]:
-    # Fetch AI probability estimates — live Claude when key is present, else mock
+def _run_analysis(
+    markets: list[dict], providers: tuple = (),
+) -> tuple[list[dict], bool, str, str]:
+    # Fetch AI probability estimates — try each provider in order, falling
+    # through to the next on a usage-limit/auth/rate error (e.g. Claude exhausted
+    # → Z.ai GLM). `providers` is an ordered tuple of (key, model, base_url, name).
+    # Returns (analyses, using_live, ai_err, provider_used).
     live_ai: dict[str, dict] = {}
     using_live = False
     ai_err = ""
-    if anthropic_key:
+    provider_used = ""
+    for _pkey, _pmodel, _pbase, _pname in providers:
+        if not _pkey:
+            continue
         try:
-            live_ai = _live_ai_analysis(anthropic_key, markets)
+            live_ai = _live_ai_analysis(_pkey, markets, _pmodel, _pbase)
             using_live = bool(live_ai)
+            if using_live:
+                ai_err = ""
+                provider_used = _pname
+                break
         except Exception as _live_err:
             live_ai = {}
             using_live = False
-            ai_err = f"{type(_live_err).__name__}: {_live_err}"
+            ai_err = f"{_pname} — {type(_live_err).__name__}: {_live_err}"
+            # Fall through to the next provider only on limit/auth/rate failures;
+            # for other errors, stop and surface the message.
+            _e = str(_live_err).lower()
+            if not ("usage limit" in _e or "401" in _e or "authentication" in _e
+                    or "429" in _e or "rate limit" in _e or "quota" in _e):
+                break
 
     bay   = BayesianEstimator()
     kelly = KellyCriterion(max_fraction=0.15)
@@ -687,14 +712,32 @@ def _run_analysis(markets: list[dict], anthropic_key: str = "") -> tuple[list[di
             "yes_token_id": str(mkt.get("yes_token_id", "")),
             "no_token_id":  str(mkt.get("no_token_id", "")),
         })
-    return out, using_live, ai_err
+    return out, using_live, ai_err, provider_used
 
 
 # ── sidebar ───────────────────────────────────────────────────────────────────
 _anthropic_key   = _get_secret("ANTHROPIC_API_KEY")
+_zai_key         = _get_secret("ZAI_API_KEY")
 _poly_key        = _get_secret("POLYMARKET_API_KEY")
 _kalshi_key      = _get_secret("KALSHI_API_KEY")
 _kalshi_pem      = _get_secret("KALSHI_PRIVATE_KEY_PEM")
+
+# ── AI provider resolution ────────────────────────────────────────────────────
+# Build an ordered provider chain. Claude is primary when its key is present;
+# Z.ai's Anthropic-compatible GLM endpoint is the fallback. If Claude hits its
+# usage limit (or auth/rate error), analysis falls through to Z.ai automatically.
+_ZAI_BASE_URL = "https://api.z.ai/api/anthropic"
+_ZAI_MODEL    = _get_secret("ZAI_MODEL") or "glm-4.6"
+_ai_chain = []  # ordered list of (key, model, base_url, name)
+if _anthropic_key:
+    _ai_chain.append((_anthropic_key, "claude-opus-4-8", "", "Claude"))
+if _zai_key:
+    _ai_chain.append((_zai_key, _ZAI_MODEL, _ZAI_BASE_URL, "Z.ai GLM"))
+# Primary provider (for sidebar display before any call runs)
+_ai_key      = _ai_chain[0][0] if _ai_chain else ""
+_ai_model    = _ai_chain[0][1] if _ai_chain else "claude-opus-4-8"
+_ai_base_url = _ai_chain[0][2] if _ai_chain else ""
+_ai_provider = _ai_chain[0][3] if _ai_chain else ""
 _poly_pk         = _get_secret("POLYMARKET_PRIVATE_KEY")
 _poly_sig_type   = int(_get_secret("POLYMARKET_SIGNATURE_TYPE") or 0)
 _poly_funder     = _get_secret("POLYMARKET_FUNDER")
@@ -778,6 +821,7 @@ def _to_brain_input(a: dict):
 # ── demo_mode must be initialized before data loading (used for _eff_* keys) ──
 _any_key = bool(
     _get_secret("ANTHROPIC_API_KEY") or
+    _get_secret("ZAI_API_KEY") or
     _get_secret("POLYMARKET_API_KEY") or
     _get_secret("KALSHI_API_KEY")
 )
@@ -794,7 +838,12 @@ st.session_state._last_full_run = _time_mod.time()
 with st.sidebar:
     st.title("🤖 Polymarket AI Bot")
     st.markdown("**API Keys**")
-    st.markdown("✅ Anthropic key set" if _anthropic_key  else "⚪ No Anthropic key → mock AI")
+    if _anthropic_key:
+        st.markdown("✅ Anthropic key set (Claude)")
+    elif _zai_key:
+        st.markdown(f"✅ Z.ai key set → GLM (`{_ai_model}`)")
+    else:
+        st.markdown("⚪ No AI key → mock AI")
     st.markdown("✅ Polymarket key set" if _poly_key       else "⚪ No Polymarket key → mock data")
     if _kalshi_key and _kalshi_pem:
         st.markdown("✅ Kalshi keys set (API key + RSA PEM)")
@@ -846,7 +895,8 @@ with st.sidebar:
         st.caption("Toggle visible in the main panel once credentials are saved + app rebooted.")
 
     _missing = [k for k, v in {
-        "ANTHROPIC_API_KEY": _anthropic_key,
+        # AI key satisfied by either Anthropic or Z.ai
+        "ANTHROPIC_API_KEY (or ZAI_API_KEY)": _anthropic_key or _zai_key,
         "POLYMARKET_API_KEY": _poly_key,
         "KALSHI_API_KEY": _kalshi_key,
         "KALSHI_PRIVATE_KEY_PEM": _kalshi_pem,
@@ -998,17 +1048,20 @@ def _live_dashboard():
         st.cache_data.clear()
 
     # Compute effective API keys (demo mode forces mock regardless of key presence)
-    _eff_anthropic  = "" if _dm else _anthropic_key
+    _eff_anthropic  = "" if _dm else _ai_key       # resolved AI key (primary)
     _eff_poly       = "" if _dm else _poly_key
     _eff_kalshi     = "" if _dm else _kalshi_key
     _eff_kalshi_pem = "" if _dm else _kalshi_pem
+    # Demo mode disables AI entirely; otherwise pass the full fallback chain.
+    _eff_ai_chain   = () if _dm else tuple(_ai_chain)
 
     # ── load data ─────────────────────────────────────────────────────────────
     try:
         with st.spinner("Fetching markets and running predictive models…"):
             _source_markets, _poly_live, _kalshi_live, _poly_err, _kalshi_err = \
                 _get_markets(_eff_poly, _eff_kalshi, _eff_kalshi_pem)
-            all_analyses, _live_ai_mode, _ai_err = _run_analysis(_source_markets, _eff_anthropic)
+            all_analyses, _live_ai_mode, _ai_err, _ai_used = _run_analysis(
+                _source_markets, _eff_ai_chain)
     except Exception as exc:
         st.error("Analysis pipeline failed — see details below.")
         st.exception(exc)
@@ -1036,8 +1089,10 @@ def _live_dashboard():
             s = "background:#0f172a;color:#64748b;border-color:#334155;"
             return f'<span style="{_CHIP}{s}">⚫ {label} — no API key</span>'
 
+        # Prefer the provider that actually served (after any fallback).
+        _ai_label = _ai_used or _ai_provider or "Claude AI"
         _chips = "".join([
-            _conn_chip(_live_ai_mode, bool(_anthropic_key), "Claude AI"),
+            _conn_chip(_live_ai_mode, bool(_ai_key), _ai_label),
             _conn_chip(_poly_live,    bool(_poly_key),       "Polymarket"),
             _conn_chip(_kalshi_live,  bool(_kalshi_key and _kalshi_pem), "Kalshi"),
         ])
@@ -1057,11 +1112,18 @@ def _live_dashboard():
         )
     if _eff_anthropic and not _live_ai_mode:
         _err_low = _ai_err.lower()
-        if "usage limit" in _err_low or "api usage" in _err_low:
+        if "usage limit" in _err_low or "api usage" in _err_low or "quota" in _err_low:
             import re as _re
             _reset = (_re.search(r'(\d{4}-\d{2}-\d{2})', _ai_err) or type("", (), {"group": lambda *a: "July 1"})()).group(1)
+            # If Z.ai is not configured, point the user at it as the fallback.
+            _fallback_hint = (
+                "Add a **ZAI_API_KEY** secret to auto-fall back to Z.ai GLM when Claude is exhausted. "
+                if not _zai_key else
+                "The Z.ai fallback also failed — check **ZAI_API_KEY**. "
+            )
             st.warning(
-                f"**Anthropic API monthly limit reached** — Claude AI unavailable until **{_reset}**.  \n"
+                f"**AI usage limit reached** — primary provider unavailable until **{_reset}**.  \n"
+                f"{_fallback_hint}"
                 "Analysis is running on Bayesian + momentum signals (no AI). "
                 "Switch to **Demo mode** (toggle above) to silence this warning.",
                 icon="💳",
@@ -1069,8 +1131,8 @@ def _live_dashboard():
         else:
             _ai_err_msg = f"  \n**Error:** `{_ai_err}`" if _ai_err else ""
             st.warning(
-                "**ANTHROPIC_API_KEY set but Claude AI call failed** — using mock analysis.  \n"
-                f"Check key validity at console.anthropic.com.{_ai_err_msg}"
+                f"**{_ai_provider or 'AI'} key set but the AI call failed** — using mock analysis.  \n"
+                f"Verify the key and that the model `{_ai_model}` is valid for this provider.{_ai_err_msg}"
             )
 
     analyses = [a for a in all_analyses if a["conf"] >= min_conf or a["signal"] == "HOLD"]
