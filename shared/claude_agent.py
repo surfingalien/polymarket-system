@@ -123,10 +123,16 @@ class ClaudeAgent:
         cache_ttl: int = 300,
         min_edge_for_signal: float = 0.04,
         timeout: float = 45.0,
+        base_url: str = "",
     ) -> None:
         # Explicit timeout: these calls are latency-sensitive and the default
         # (10 min) would hang the trading loop / dashboard on a slow response.
-        self._client = anthropic.AsyncAnthropic(api_key=api_key, timeout=timeout)
+        # base_url lets us point the Anthropic-compatible client at an alternative
+        # provider (e.g. Z.ai's GLM endpoint) without changing call sites.
+        _kwargs = {"api_key": api_key, "timeout": timeout}
+        if base_url:
+            _kwargs["base_url"] = base_url
+        self._client = anthropic.AsyncAnthropic(**_kwargs)
         self._model = model
         self._max_tokens = max_tokens
         self._cache_ttl = cache_ttl
