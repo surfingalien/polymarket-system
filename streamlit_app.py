@@ -469,7 +469,8 @@ def _execute_live_kalshi_order(
                 limit_price=limit_cents,
             )
             resp = await client.place_order(order)
-            o = (resp or {}).get("order", {}) if isinstance(resp, dict) else {}
+            # V2 returns the order flat or nested under "order".
+            o = (resp.get("order", resp) if isinstance(resp, dict) else {}) or {}
             return {
                 "order_id": o.get("order_id", f"kalshi_{int(time.time())}"),
                 "status":   o.get("status", "submitted"),
