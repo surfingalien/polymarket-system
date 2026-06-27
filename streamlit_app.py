@@ -427,6 +427,22 @@ def _execute_live_kalshi_order(
             mock_mode=False,
         )
         try:
+            # Pre-order liveness check (buys only): sports/golf "to win" markets
+            # have can_close_early=true — their scheduled close_time can be days
+            # out, yet they settle the instant the event resolves. The market-data
+            # endpoint returns status without 410-ing (only orders 410), so we
+            # confirm the market is still open right before sending the order.
+            if action == "buy":
+                _m = await client.get_market(ticker)
+                if _m is None:
+                    # Couldn't fetch — treat as transient, don't blacklist.
+                    raise RuntimeError(f"market fetch failed (pre-check), ticker={ticker}")
+                _ms = str(getattr(_m, "status", "")).lower()
+                if _ms not in ("open", "active"):
+                    # Definitively not tradeable → message triggers blacklist.
+                    raise RuntimeError(
+                        f"market closed (pre-check) — status={_ms or 'gone'}, ticker={ticker}"
+                    )
             order = KalshiOrder(
                 ticker=ticker,
                 action=action,
@@ -1428,10 +1444,10 @@ def _live_dashboard():
                 _kal_added += 1
             except Exception as _exc:
                 _exc_str = str(_exc)
-                # Distinguish failure types: 410/404 = dead market (blacklist it);
-                # 403 = auth/permission (halt auto-live — every order will fail);
-                # 429/400 = transient/param issue (don't blacklist, retry later).
-                if "410" in _exc_str or "404" in _exc_str:
+                # Distinguish failure types: 410/404/pre-check = dead market
+                # (blacklist it); 403 = auth/permission (halt auto-live — every
+                # order will fail); 429/400 = transient/param (retry later).
+                if "410" in _exc_str or "404" in _exc_str or "market closed" in _exc_str:
                     st.session_state._kal_blocked_tickers.add(_a["id"])
                 elif "403" in _exc_str:
                     st.session_state.auto_live = False
