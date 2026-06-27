@@ -279,6 +279,17 @@ class KalshiClient:
     def _sign(
         self, method: str, path: str, body: Optional[dict] = None
     ) -> dict:
+        # Kalshi's gateway rejects authenticated requests that carry a session
+        # cookie (set by a prior public GET) with INVALID_CSRF_TOKEN / 410 — it
+        # treats the request as browser-session auth and ignores our signature
+        # headers. Clearing the jar before every signed request guarantees each
+        # one is a clean API-key call. Public GETs don't need cookies either, so
+        # this is safe across the board.
+        try:
+            self._http.cookies.clear()
+        except Exception:
+            pass
+
         if not self._private_key or not self._key_id:
             return {"Content-Type": "application/json"}
 
