@@ -1523,6 +1523,16 @@ def _live_dashboard():
                 _row["Exit ID"] = _ex.get("order_id", "")
                 _closed += 1
             except Exception as _exc:
+                _exc_str = str(_exc)
+                # A 410/404 on exit means the market already settled — Kalshi
+                # auto-resolves the position, so there's nothing left to sell.
+                # Mark it closed (settled) so we stop retrying it every cycle.
+                if "410" in _exc_str or "404" in _exc_str:
+                    _row["Open"] = False
+                    _row["Status"] = "SETTLED"
+                    _row["Exit"] = f"{_cur['price']:.0%}"
+                    _row["Realized $"] = round(_trade_pnl(_row), 2)
+                    _closed += 1
                 st.session_state._last_live_error = (
                     f"{time.strftime('%H:%M:%S')} — exit {_row.get('Question','')[:30]}: {_exc}"
                 )
