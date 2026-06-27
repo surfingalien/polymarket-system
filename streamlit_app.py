@@ -319,6 +319,24 @@ def _fetch_kalshi_markets_sync(api_key_id: str, pem_content: str, limit: int = 2
     return _run_coro_sync(_inner())
 
 
+@st.cache_data(ttl=120, show_spinner=False)
+def _kalshi_auth_check_sync(api_key_id: str, pem_content: str) -> tuple[bool, str]:
+    """Verify Kalshi *trading* credentials with a real authenticated call.
+    Cached so it runs at most once every 2 min, not on every rerun."""
+    async def _inner():
+        client = KalshiClient(
+            api_key_id=api_key_id, private_key_content=pem_content, mock_mode=False,
+        )
+        try:
+            return await client.auth_check()
+        finally:
+            await client.close()
+    try:
+        return _run_coro_sync(_inner(), timeout=30)
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+
+
 @st.cache_data(ttl=60, show_spinner=False)
 def _get_markets(
     poly_key: str = "",
@@ -840,11 +858,20 @@ if "auto_live"         not in st.session_state:
 
 # ── AI brain singleton — one instance per browser session, survives reruns ────
 import types as _types
-if "_brain" not in st.session_state:
-    _brain_ens = EnsemblePredictor()
-    _brain_inst = LearningEngine(_brain_ens, state_file=Path("data/learning_state.json"))
-    _brain_inst.load()
-    st.session_state._brain = _brain_inst
+
+def _get_brain():
+    """Lazily build (or rebuild) the learning brain. Fragments with run_every
+    re-execute without the top-level init, and Streamlit Cloud can evict session
+    state between ticks — so always go through this guard rather than reading the
+    attribute directly, which would AttributeError on a fresh fragment run."""
+    if "_brain" not in st.session_state:
+        _ens = EnsemblePredictor()
+        _inst = LearningEngine(_ens, state_file=Path("data/learning_state.json"))
+        _inst.load()
+        st.session_state._brain = _inst
+    return st.session_state._brain
+
+_get_brain()  # ensure it exists on the initial full run
 
 def _to_brain_input(a: dict):
     """Wrap an analysis dict into the duck-typed object LearningEngine expects."""
@@ -892,6 +919,20 @@ with st.sidebar:
     st.markdown("✅ Polymarket key set" if _poly_key       else "⚪ No Polymarket key → mock data")
     if _kalshi_key and _kalshi_pem:
         st.markdown("✅ Kalshi keys set (API key + RSA PEM)")
+        # Verify trading auth with a real authenticated call. GET /markets is
+        # public so it can't catch a bad key ID/PEM — this can. INVALID_CSRF_TOKEN
+        # / 4xx here means the signature isn't accepted (key ID ≠ uploaded key).
+        _kauth_ok, _kauth_detail = _kalshi_auth_check_sync(_kalshi_key, _kalshi_pem)
+        if _kauth_ok:
+            st.markdown(f"✅ Kalshi **trading auth verified** ({_kauth_detail})")
+        else:
+            st.markdown(
+                "❌ Kalshi **trading auth FAILED** — orders will be rejected.  \n"
+                f"`{_kauth_detail[:140]}`  \n"
+                "Fix: ensure `KALSHI_API_KEY` is the **Key ID** from kalshi.com/profile/api "
+                "and `KALSHI_PRIVATE_KEY_PEM` is the private key whose public half you "
+                "uploaded for that Key ID."
+            )
     elif _kalshi_key:
         st.markdown("⚠️ Kalshi API key set but **RSA PEM missing** → add `KALSHI_PRIVATE_KEY_PEM`")
     else:
@@ -1173,6 +1214,17 @@ def _live_dashboard():
                 "Switch to **Demo mode** (toggle above) to silence this warning.",
                 icon="💳",
             )
+        elif any(s in _err_low for s in (
+                "insufficient balance", "recharge", "no resource package",
+                "rate_limit", "429", "insufficient_quota", "billing")):
+            # Provider is configured correctly but out of credits / rate-limited.
+            st.warning(
+                f"**{_ai_provider or 'AI'} provider is out of credits or rate-limited** — "
+                "using Bayesian + momentum signals (no AI).  \n"
+                "Top up the provider account (or wait for the limit to reset), or switch "
+                f"providers via secrets.  \n**Error:** `{_ai_err}`",
+                icon="💳",
+            )
         else:
             _ai_err_msg = f"  \n**Error:** `{_ai_err}`" if _ai_err else ""
             st.warning(
@@ -1311,7 +1363,7 @@ def _live_dashboard():
                 "Time":      time.strftime("%H:%M:%S"),
                 "Mode":      "🤖 Auto",
             })
-            st.session_state._brain.on_trade_placed(_to_brain_input(_a))
+            _get_brain().on_trade_placed(_to_brain_input(_a))
             _auto_added += 1
         if _auto_added:
             st.toast(
@@ -1355,7 +1407,7 @@ def _live_dashboard():
                     "Time":     time.strftime("%H:%M:%S"),
                     "Mode":     "🤖 Auto-Live",
                 })
-                st.session_state._brain.on_trade_placed(_to_brain_input(_a))
+                _get_brain().on_trade_placed(_to_brain_input(_a))
                 _live_added += 1
             except Exception as _exc:
                 # A Polymarket failure here is almost always systemic for the
@@ -1440,7 +1492,7 @@ def _live_dashboard():
                     "count":    int(_res.get("count", 0)),
                     "Open":     True,
                 })
-                st.session_state._brain.on_trade_placed(_to_brain_input(_a))
+                _get_brain().on_trade_placed(_to_brain_input(_a))
                 _kal_added += 1
             except Exception as _exc:
                 _exc_str = str(_exc)
@@ -1549,7 +1601,7 @@ def _live_dashboard():
             )
 
     # ── brain: detect resolutions + decay + save ──────────────────────────────
-    _brain = st.session_state._brain
+    _brain = _get_brain()
     _brain_dirty = False
     for _ma in all_analyses:
         _mid = _ma["id"]
@@ -1755,7 +1807,7 @@ def _live_dashboard():
         )
 
         try:
-            summ = st.session_state._brain.performance_summary()
+            summ = _get_brain().performance_summary()
         except Exception:
             summ = {
                 "resolved_markets": 0, "win_rate": 0.0,
@@ -2342,7 +2394,7 @@ Then **Reboot app**. The brain will immediately start persisting after the next 
                                 "Time":      time.strftime("%H:%M:%S"),
                                 "Mode":      "👆 Manual",
                             })
-                            st.session_state._brain.on_trade_placed(_to_brain_input(a))
+                            _get_brain().on_trade_placed(_to_brain_input(a))
                             st.toast(f"Paper buy recorded: {a['question'][:30]}")
 
                         # Live execution — heavily gated
@@ -2393,7 +2445,7 @@ Then **Reboot app**. The brain will immediately start persisting after the next 
                                             "Time":      time.strftime("%H:%M:%S"),
                                             "Mode":      "👆 Manual-Live",
                                         })
-                                        st.session_state._brain.on_trade_placed(_to_brain_input(a))
+                                        _get_brain().on_trade_placed(_to_brain_input(a))
                                         st.success(f"Order posted: {res['order_id']} "
                                                    f"({res['status']})")
                                     except SigningUnavailable as exc:

@@ -184,6 +184,30 @@ class KalshiClient:
             log.warning("kalshi_balance_failed", error=str(exc))
             return 0.0
 
+    async def auth_check(self) -> tuple[bool, str]:
+        """Make a real AUTHENTICATED call (balance) to verify trading credentials.
+        Returns (ok, detail). Unlike GET /markets (public), this endpoint requires
+        a valid signature, so it definitively tells whether the key ID + PEM are
+        accepted by Kalshi for trading."""
+        headers = self._sign("GET", "/trade-api/v2/portfolio/balance")
+        if "KALSHI-ACCESS-SIGNATURE" not in headers:
+            return False, "no signature built — missing key ID or unparseable PEM"
+        try:
+            resp = await self._http.get(
+                f"{self._base}/portfolio/balance", headers=headers,
+            )
+            if resp.status_code == 200:
+                bal = float(resp.json().get("balance", 0)) / 100.0
+                return True, f"balance ${bal:,.2f}"
+            _body = ""
+            try:
+                _body = resp.text[:200]
+            except Exception:
+                pass
+            return False, f"HTTP {resp.status_code}: {_body}"
+        except Exception as exc:
+            return False, f"{type(exc).__name__}: {exc}"
+
     async def get_positions(self) -> list[dict]:
         if not self._key_id:
             return []
@@ -218,13 +242,33 @@ class KalshiClient:
         path = "/trade-api/v2/portfolio/orders"
         body = order.to_dict()
         headers = self._sign("POST", path, body)
+        # Fail loudly if we couldn't build authentication. Without a key ID +
+        # parseable private key, _sign omits the KALSHI-ACCESS-* headers and the
+        # order would go out unauthenticated — Kalshi then treats it as a browser
+        # request and returns the confusing INVALID_CSRF_TOKEN / 410 instead of a
+        # clear auth error. Surface the real cause instead.
+        if "KALSHI-ACCESS-SIGNATURE" not in headers:
+            raise RuntimeError(
+                "Kalshi order not authenticated: missing API key ID or unparseable "
+                "private key. Check KALSHI_API_KEY (the key ID from the dashboard) "
+                "and KALSHI_PRIVATE_KEY_PEM."
+            )
         try:
             resp = await self._http.post(
                 f"{self._base}/portfolio/orders",
                 json=body,
                 headers=headers,
             )
-            resp.raise_for_status()
+            if resp.status_code >= 400:
+                # Include Kalshi's response body — the status line alone hides the
+                # actual cause (e.g. INVALID_CSRF_TOKEN = signature not accepted,
+                # which means the key ID and PEM don't match the uploaded public key).
+                _body = ""
+                try:
+                    _body = resp.text[:300]
+                except Exception:
+                    pass
+                raise RuntimeError(f"HTTP {resp.status_code} placing order: {_body}")
             result = resp.json()
             log.info(
                 "kalshi_order_placed",
