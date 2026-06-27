@@ -319,6 +319,24 @@ def _fetch_kalshi_markets_sync(api_key_id: str, pem_content: str, limit: int = 2
     return _run_coro_sync(_inner())
 
 
+@st.cache_data(ttl=120, show_spinner=False)
+def _kalshi_auth_check_sync(api_key_id: str, pem_content: str) -> tuple[bool, str]:
+    """Verify Kalshi *trading* credentials with a real authenticated call.
+    Cached so it runs at most once every 2 min, not on every rerun."""
+    async def _inner():
+        client = KalshiClient(
+            api_key_id=api_key_id, private_key_content=pem_content, mock_mode=False,
+        )
+        try:
+            return await client.auth_check()
+        finally:
+            await client.close()
+    try:
+        return _run_coro_sync(_inner(), timeout=30)
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+
+
 @st.cache_data(ttl=60, show_spinner=False)
 def _get_markets(
     poly_key: str = "",
@@ -901,6 +919,20 @@ with st.sidebar:
     st.markdown("✅ Polymarket key set" if _poly_key       else "⚪ No Polymarket key → mock data")
     if _kalshi_key and _kalshi_pem:
         st.markdown("✅ Kalshi keys set (API key + RSA PEM)")
+        # Verify trading auth with a real authenticated call. GET /markets is
+        # public so it can't catch a bad key ID/PEM — this can. INVALID_CSRF_TOKEN
+        # / 4xx here means the signature isn't accepted (key ID ≠ uploaded key).
+        _kauth_ok, _kauth_detail = _kalshi_auth_check_sync(_kalshi_key, _kalshi_pem)
+        if _kauth_ok:
+            st.markdown(f"✅ Kalshi **trading auth verified** ({_kauth_detail})")
+        else:
+            st.markdown(
+                "❌ Kalshi **trading auth FAILED** — orders will be rejected.  \n"
+                f"`{_kauth_detail[:140]}`  \n"
+                "Fix: ensure `KALSHI_API_KEY` is the **Key ID** from kalshi.com/profile/api "
+                "and `KALSHI_PRIVATE_KEY_PEM` is the private key whose public half you "
+                "uploaded for that Key ID."
+            )
     elif _kalshi_key:
         st.markdown("⚠️ Kalshi API key set but **RSA PEM missing** → add `KALSHI_PRIVATE_KEY_PEM`")
     else:

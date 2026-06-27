@@ -184,6 +184,30 @@ class KalshiClient:
             log.warning("kalshi_balance_failed", error=str(exc))
             return 0.0
 
+    async def auth_check(self) -> tuple[bool, str]:
+        """Make a real AUTHENTICATED call (balance) to verify trading credentials.
+        Returns (ok, detail). Unlike GET /markets (public), this endpoint requires
+        a valid signature, so it definitively tells whether the key ID + PEM are
+        accepted by Kalshi for trading."""
+        headers = self._sign("GET", "/trade-api/v2/portfolio/balance")
+        if "KALSHI-ACCESS-SIGNATURE" not in headers:
+            return False, "no signature built — missing key ID or unparseable PEM"
+        try:
+            resp = await self._http.get(
+                f"{self._base}/portfolio/balance", headers=headers,
+            )
+            if resp.status_code == 200:
+                bal = float(resp.json().get("balance", 0)) / 100.0
+                return True, f"balance ${bal:,.2f}"
+            _body = ""
+            try:
+                _body = resp.text[:200]
+            except Exception:
+                pass
+            return False, f"HTTP {resp.status_code}: {_body}"
+        except Exception as exc:
+            return False, f"{type(exc).__name__}: {exc}"
+
     async def get_positions(self) -> list[dict]:
         if not self._key_id:
             return []
