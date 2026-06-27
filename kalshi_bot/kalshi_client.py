@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import base64
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -239,8 +240,28 @@ class KalshiClient:
             )
             return {"order_id": f"mock_{int(time.time())}", "status": "MOCK"}
 
-        path = "/trade-api/v2/portfolio/orders"
-        body = order.to_dict()
+        # V2 order endpoint. Kalshi deprecated the legacy /portfolio/orders
+        # endpoint (returns deprecated_v1_order_endpoint / 410); the current
+        # surface is /portfolio/events/orders with a single YES-denominated book:
+        #   side="bid" → buy YES   |   side="ask" → sell YES (= buy NO)
+        #   price is the YES price in dollars; client_order_id is required.
+        # We translate our (action, side, contract-cents) order into that model.
+        path = "/trade-api/v2/portfolio/events/orders"
+        # Reconstruct the YES price (cents) from the stored contract price.
+        yes_cents = order.limit_price if order.side == "yes" else (100 - order.limit_price)
+        yes_cents = max(1, min(99, int(yes_cents)))
+        v2_side = "bid" if (
+            (order.action == "buy" and order.side == "yes")
+            or (order.action == "sell" and order.side == "no")
+        ) else "ask"
+        body = {
+            "ticker": order.ticker,
+            "client_order_id": order.client_order_id or str(uuid.uuid4()),
+            "side": v2_side,
+            "count": str(int(order.count)),
+            "price": f"{yes_cents / 100:.4f}",
+            "time_in_force": "good_till_canceled",
+        }
         headers = self._sign("POST", path, body)
         # Fail loudly if we couldn't build authentication. Without a key ID +
         # parseable private key, _sign omits the KALSHI-ACCESS-* headers and the
@@ -255,7 +276,7 @@ class KalshiClient:
             )
         try:
             resp = await self._http.post(
-                f"{self._base}/portfolio/orders",
+                f"{self._base}/portfolio/events/orders",
                 json=body,
                 headers=headers,
             )
@@ -270,10 +291,12 @@ class KalshiClient:
                     pass
                 raise RuntimeError(f"HTTP {resp.status_code} placing order: {_body}")
             result = resp.json()
+            # V2 may return the order flat or nested under "order".
+            _o = result.get("order", result) if isinstance(result, dict) else {}
             log.info(
                 "kalshi_order_placed",
-                order_id=result.get("order", {}).get("order_id"),
-                status=result.get("order", {}).get("status"),
+                order_id=_o.get("order_id"),
+                status=_o.get("status"),
             )
             return result
         except Exception as exc:
