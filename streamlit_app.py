@@ -161,6 +161,23 @@ def _days_until(iso_str: str | None) -> int:
         return 30
 
 
+def _seconds_until_close(iso_str: str | None) -> float | None:
+    """Seconds until a market's close_time. None if unknown/unparseable.
+    Negative means the market has already closed."""
+    if not iso_str:
+        return None
+    try:
+        end = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+        return (end - datetime.now(timezone.utc)).total_seconds()
+    except Exception:
+        return None
+
+
+# A Kalshi market within this window of its close (or already past it) will
+# reject orders with 410 Gone — skip it at fetch time rather than fail on order.
+_MIN_SECONDS_TO_CLOSE = 3600  # 1 hour
+
+
 def _fetch_polymarket_markets_sync(api_key: str, limit: int = 25) -> list[dict]:
     """Fetch live Polymarket markets in a background thread (async-safe)."""
     async def _inner():
@@ -257,7 +274,19 @@ def _fetch_kalshi_markets_sync(api_key_id: str, pem_content: str, limit: int = 2
             raw = await client.get_markets(limit=limit, status="open")
             result = []
             drop_price = 0
+            drop_closed = 0
             for m in raw:
+                # Trust the market's own status over the query param — only an
+                # actively-open market accepts orders. Anything else 410s.
+                if str(getattr(m, "status", "open")).lower() not in ("open", "active"):
+                    drop_closed += 1
+                    continue
+                # Drop markets that have closed or are about to — these 410 on
+                # order. Unknown close_time (None) is kept (blacklist catches it).
+                _secs = _seconds_until_close(m.close_time)
+                if _secs is not None and _secs < _MIN_SECONDS_TO_CLOSE:
+                    drop_closed += 1
+                    continue
                 mid = m.mid_price
                 if not (0.02 <= mid <= 0.98):
                     drop_price += 1
@@ -276,8 +305,8 @@ def _fetch_kalshi_markets_sync(api_key_id: str, pem_content: str, limit: int = 2
             # If the API returned markets but filters dropped them all, surface why
             if raw and not result:
                 raise RuntimeError(
-                    f"API returned {len(raw)} markets but all filtered out on price "
-                    f"({drop_price} dropped). "
+                    f"API returned {len(raw)} markets but all filtered out "
+                    f"({drop_price} on price, {drop_closed} closed/closing). "
                     f"Sample: {[(round(m.mid_price, 3), m.volume) for m in raw[:5]]}"
                 )
             if not raw:
@@ -1399,12 +1428,20 @@ def _live_dashboard():
                 _kal_added += 1
             except Exception as _exc:
                 _exc_str = str(_exc)
-                if "410" in _exc_str:
+                # Distinguish failure types: 410/404 = dead market (blacklist it);
+                # 403 = auth/permission (halt auto-live — every order will fail);
+                # 429/400 = transient/param issue (don't blacklist, retry later).
+                if "410" in _exc_str or "404" in _exc_str:
                     st.session_state._kal_blocked_tickers.add(_a["id"])
+                elif "403" in _exc_str:
+                    st.session_state.auto_live = False
+                    st.toast("Kalshi 403 — auto-live disabled (check API key/account)", icon="🔴")
                 st.session_state._last_live_error = (
                     f"{time.strftime('%H:%M:%S')} — {_a['question'][:40]}: {_exc}"
                 )
                 st.toast(f"Auto-live Kalshi order failed: {_exc}", icon="❌")
+                if "403" in _exc_str:
+                    break  # stop hammering on an auth failure
         if _kal_added:
             st.toast(
                 f"🚨 Bot auto-placed {_kal_added} LIVE order{'s' if _kal_added != 1 else ''} on Kalshi",
