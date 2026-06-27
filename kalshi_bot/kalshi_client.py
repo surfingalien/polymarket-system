@@ -261,6 +261,10 @@ class KalshiClient:
             "count": str(int(order.count)),
             "price": f"{yes_cents / 100:.4f}",
             "time_in_force": "good_till_canceled",
+            # Required by the V2 schema. taker_at_cross = if this order would
+            # cross our own resting order, execute it as the taker (a safe default
+            # for a bot that isn't market-making against itself).
+            "self_trade_prevention_type": "taker_at_cross",
         }
         headers = self._sign("POST", path, body)
         # Fail loudly if we couldn't build authentication. Without a key ID +
