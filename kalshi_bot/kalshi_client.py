@@ -26,6 +26,15 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 log = structlog.get_logger(__name__)
 
 
+def _fp(v) -> float:
+    """Parse a Kalshi V2 fixed-point string (e.g. '10.00', '0.5600') to float.
+    Returns 0.0 for None/blank/unparseable."""
+    try:
+        return float(v) if v not in (None, "") else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
 @dataclass
 class KalshiMarket:
     ticker: str
@@ -261,6 +270,10 @@ class KalshiClient:
             "count": str(int(order.count)),
             "price": f"{yes_cents / 100:.4f}",
             "time_in_force": "good_till_canceled",
+            # Required by the V2 schema. taker_at_cross = if this order would
+            # cross our own resting order, execute it as the taker (a safe default
+            # for a bot that isn't market-making against itself).
+            "self_trade_prevention_type": "taker_at_cross",
         }
         headers = self._sign("POST", path, body)
         # Fail loudly if we couldn't build authentication. Without a key ID +
@@ -291,14 +304,24 @@ class KalshiClient:
                     pass
                 raise RuntimeError(f"HTTP {resp.status_code} placing order: {_body}")
             result = resp.json()
-            # V2 may return the order flat or nested under "order".
-            _o = result.get("order", result) if isinstance(result, dict) else {}
+            if not isinstance(result, dict):
+                result = {}
+            # V2 CreateOrderV2Response is FLAT (no "order" wrapper) and has no
+            # "status" field — only order_id, fill_count, remaining_count, ts_ms.
+            # Derive a status from the fill so callers have something meaningful.
+            _fill = _fp(result.get("fill_count"))
+            _rem  = _fp(result.get("remaining_count"))
+            _status = ("filled" if _rem == 0 and _fill > 0
+                       else "partially_filled" if _fill > 0
+                       else "resting")
             log.info(
                 "kalshi_order_placed",
-                order_id=_o.get("order_id"),
-                status=_o.get("status"),
+                order_id=result.get("order_id"),
+                fill_count=_fill, remaining_count=_rem, status=_status,
             )
-            return result
+            # Normalize to a shape callers already expect.
+            return {"order": {"order_id": result.get("order_id"), "status": _status,
+                              "fill_count": _fill, "remaining_count": _rem}, **result}
         except Exception as exc:
             log.error("kalshi_place_order_failed", error=str(exc))
             raise
@@ -306,11 +329,12 @@ class KalshiClient:
     async def cancel_order(self, order_id: str) -> dict:
         if self.mock_mode:
             return {"status": "MOCK_CANCELLED"}
-        path = f"/trade-api/v2/portfolio/orders/{order_id}"
+        # V2 cancel lives on the events/orders surface, matching create.
+        path = f"/trade-api/v2/portfolio/events/orders/{order_id}"
         headers = self._sign("DELETE", path)
         try:
             resp = await self._http.delete(
-                f"{self._base}/portfolio/orders/{order_id}",
+                f"{self._base}/portfolio/events/orders/{order_id}",
                 headers=headers,
             )
             resp.raise_for_status()
@@ -324,12 +348,17 @@ class KalshiClient:
     ) -> dict:
         if self.mock_mode:
             return {"status": "MOCK_AMENDED"}
-        path = f"/trade-api/v2/portfolio/orders/{order_id}/amend"
-        body = {"count": count, "limit_price": limit_price}
+        # V2 amend on the events/orders surface; price is fixed-point YES dollars.
+        path = f"/trade-api/v2/portfolio/events/orders/{order_id}/amend"
+        yes_cents = max(1, min(99, int(limit_price)))
+        body = {
+            "count": str(int(count)),
+            "price": f"{yes_cents / 100:.4f}",
+        }
         headers = self._sign("POST", path, body)
         try:
             resp = await self._http.post(
-                f"{self._base}/portfolio/orders/{order_id}/amend",
+                f"{self._base}/portfolio/events/orders/{order_id}/amend",
                 json=body,
                 headers=headers,
             )
