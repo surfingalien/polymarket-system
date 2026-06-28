@@ -447,20 +447,20 @@ def _execute_live_kalshi_order(
         try:
             # Pre-order liveness check (buys only): sports/golf "to win" markets
             # have can_close_early=true — their scheduled close_time can be days
-            # out, yet they settle the instant the event resolves. The market-data
-            # endpoint returns status without 410-ing (only orders 410), so we
-            # confirm the market is still open right before sending the order.
+            # out, yet they settle the instant the event resolves. We confirm the
+            # market is still open right before sending the order — but ONLY block
+            # when we DEFINITIVELY learn it's closed. If the lookup fails (None),
+            # proceed: the real order endpoint surfaces a clear error and 410s are
+            # blacklisted, so an unverifiable market must not silently skip a trade.
             if action == "buy":
                 _m = await client.get_market(ticker)
-                if _m is None:
-                    # Couldn't fetch — treat as transient, don't blacklist.
-                    raise RuntimeError(f"market fetch failed (pre-check), ticker={ticker}")
-                _ms = str(getattr(_m, "status", "")).lower()
-                if _ms not in ("open", "active"):
-                    # Definitively not tradeable → message triggers blacklist.
-                    raise RuntimeError(
-                        f"market closed (pre-check) — status={_ms or 'gone'}, ticker={ticker}"
-                    )
+                if _m is not None:
+                    _ms = str(getattr(_m, "status", "")).lower()
+                    if _ms not in ("open", "active"):
+                        # Definitively not tradeable → message triggers blacklist.
+                        raise RuntimeError(
+                            f"market closed (pre-check) — status={_ms or 'gone'}, ticker={ticker}"
+                        )
             order = KalshiOrder(
                 ticker=ticker,
                 action=action,
