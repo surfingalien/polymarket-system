@@ -794,6 +794,13 @@ _MAX_DRAWDOWN  = 0.20   # halt NEW entries once live P&L is down >20% of deploye
 _MAX_OPEN_POS  = 5      # max simultaneous open live positions
 _MAX_EXPOSURE  = 100.0  # max total $ across all open live positions
 
+# ── AI-managed exit tuning (used when auto-manage exits is ON, the default) ────
+_EXIT_EDGE_CAPTURED   = 0.02  # price within 2c of model fair → thesis done, lock in
+_EXIT_MIN_PROFIT_LOCK = 0.05  # only edge-capture-exit once at least +5%
+_EXIT_TRAIL_ACTIVATE  = 0.12  # arm the trailing lock once profit reaches +12%
+_EXIT_TRAIL_GIVEBACK  = 0.40  # ...then exit if it gives back 40% of the peak gain
+_EXIT_SAFETY_STOP     = 0.35  # hard stop only for real disasters (-35%)
+
 
 def _price_movement(hist: list) -> float:
     """Recent absolute price move (0-1 scale) from a history series, used to
@@ -1081,6 +1088,8 @@ if "kalshi_budget"     not in st.session_state:
     st.session_state.kalshi_budget     = _qp_float("kb",  10.0)
 if "sidebar_min_conf"  not in st.session_state:
     st.session_state.sidebar_min_conf  = _qp_float("mc",  0.55)
+if "auto_manage_exits" not in st.session_state:
+    st.session_state.auto_manage_exits = _qp_bool("ame", True)
 if "take_profit_pct"   not in st.session_state:
     st.session_state.take_profit_pct   = _qp_float("tp",  _TAKE_PROFIT)
 if "stop_loss_pct"     not in st.session_state:
@@ -1285,14 +1294,22 @@ with _bar1:
                         key="kalshi_budget", help="Max $ per Kalshi trade")
     with _bc3:
         st.slider("Min confidence", 0.40, 0.90, step=0.05, key="sidebar_min_conf")
-    # Fast exit controls: book profits / cut losses on open positions.
-    _ec1, _ec2 = st.columns(2)
-    with _ec1:
-        st.slider("Take-profit %", 0.05, 1.00, step=0.05, key="take_profit_pct",
-                  help="Auto-sell an open position once it's up this % of its cost")
-    with _ec2:
-        st.slider("Stop-loss %", 0.05, 0.90, step=0.05, key="stop_loss_pct",
-                  help="Auto-sell an open position once it's down this % of its cost")
+    # Exit strategy: AI-managed by default (the brain decides when to lock in
+    # based on edge captured + trailing peak), or manual fixed %s.
+    st.toggle(
+        "🧠 AI-managed exits", key="auto_manage_exits",
+        help="ON: the brain locks in gains when the model's fair value is reached "
+             "or a winner starts reversing (trailing) — no fixed target needed. "
+             "OFF: use the fixed Take-profit / Stop-loss %s below.",
+    )
+    if not st.session_state.get("auto_manage_exits", True):
+        _ec1, _ec2 = st.columns(2)
+        with _ec1:
+            st.slider("Take-profit %", 0.05, 1.00, step=0.05, key="take_profit_pct",
+                      help="Auto-sell once a position is up this % of its cost")
+        with _ec2:
+            st.slider("Stop-loss %", 0.05, 0.90, step=0.05, key="stop_loss_pct",
+                      help="Auto-sell once a position is down this % of its cost")
     # Portfolio risk gates: block NEW live entries when limits are hit.
     _rc1, _rc2, _rc3 = st.columns(3)
     with _rc1:
@@ -1944,16 +1961,46 @@ def _live_dashboard():
             _size = float(_row.get("Size $") or 0.0)
             _upnl = _trade_pnl(_row)
             _pnl_frac = (_upnl / _size) if _size > 0 else 0.0
+            # Track the peak profit this position has reached (for trailing lock).
+            _peak = max(float(_row.get("peak_pnl", 0.0) or 0.0), _pnl_frac)
+            _row["peak_pnl"] = _peak
             _flipped = bool(_cur) and (
                 (_held == "YES" and _cur["signal"] == "BUY_NO")
                 or (_held == "NO" and _cur["signal"] == "BUY_YES"))
             _reason = None
-            if _pnl_frac >= _tp:
-                _reason = "take-profit"
-            elif _pnl_frac <= -_sl:
-                _reason = "stop-loss"
-            elif _flipped and abs(_cur["edge"]) >= _cur["min_edge"]:
-                _reason = "model-reversal"
+
+            if st.session_state.get("auto_manage_exits", True):
+                # ── AI-MANAGED EXIT — no fixed target; decide on market state ──
+                # 1) Edge captured: once in profit, if price has reached the model's
+                #    fair value the thesis has played out — lock the gain in rather
+                #    than risk a reversal (this is the "secure reasonable gains" rule).
+                if _cur and _pnl_frac >= _EXIT_MIN_PROFIT_LOCK:
+                    _fair = float(_cur["prob"]) if _held == "YES" else (1.0 - float(_cur["prob"]))
+                    _now_held = _curprice if _held == "YES" else (1.0 - _curprice)
+                    if (_fair - _now_held) <= _EXIT_EDGE_CAPTURED:
+                        _reason = f"edge captured (+{_pnl_frac:.0%}, fair value reached)"
+                # 2) Trailing profit-lock: a winner that gives back part of its peak
+                #    gain gets sold to bank most of it.
+                if _reason is None and _peak >= _EXIT_TRAIL_ACTIVATE:
+                    _giveback = _peak - _pnl_frac
+                    if _giveback >= max(0.05, _EXIT_TRAIL_GIVEBACK * _peak):
+                        _reason = f"trailing lock (peak +{_peak:.0%} → +{_pnl_frac:.0%})"
+                # 3) Model reversal: brain flipped direction with real edge.
+                if _reason is None and _flipped and abs(_cur["edge"]) >= _cur["min_edge"]:
+                    _reason = "model reversal"
+                # 4) Safety stop: only for genuine disasters (wide, so noise doesn't
+                #    whipsaw out of recoverable positions).
+                if _reason is None and _pnl_frac <= -_EXIT_SAFETY_STOP:
+                    _reason = f"safety stop ({_pnl_frac:.0%})"
+            else:
+                # ── MANUAL fixed thresholds ──
+                if _pnl_frac >= _tp:
+                    _reason = "take-profit"
+                elif _pnl_frac <= -_sl:
+                    _reason = "stop-loss"
+                elif _flipped and abs(_cur["edge"]) >= _cur["min_edge"]:
+                    _reason = "model-reversal"
+
             if _reason is None:
                 continue
             _cnt = int(_row.get("count", 0))
@@ -2965,6 +3012,7 @@ st.query_params.update({
     "pb":   str(st.session_state.get("poly_budget",    10.0)),
     "kb":   str(st.session_state.get("kalshi_budget",  10.0)),
     "mc":   str(st.session_state.get("sidebar_min_conf", 0.55)),
+    "ame":  "1" if st.session_state.get("auto_manage_exits", True) else "0",
     "tp":   str(st.session_state.get("take_profit_pct", _TAKE_PROFIT)),
     "sl":   str(st.session_state.get("stop_loss_pct", _STOP_LOSS)),
     "dd":   str(st.session_state.get("max_drawdown_pct", _MAX_DRAWDOWN)),
