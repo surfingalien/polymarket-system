@@ -76,15 +76,36 @@ _UNSET = object()  # sentinel: distinguishes "never set" from a real None/[] res
 
 
 def _run_coro_sync(coro, timeout: int = 30):
-    """Run an async coroutine safely from a synchronous Streamlit context."""
+    """Run an async coroutine safely from a synchronous Streamlit context.
+
+    Uses a managed event loop (not bare asyncio.run) and flushes pending
+    callbacks before closing. Python 3.14 closes the loop more aggressively, so
+    httpx's deferred SSL transport teardown (call_soon → _call_connection_lost)
+    could otherwise fire after the loop is gone and raise 'Event loop is closed'.
+    """
     result_box: list = [_UNSET]
     exc_box: list = [None]
 
     def _target():
+        loop = asyncio.new_event_loop()
         try:
-            result_box[0] = asyncio.run(coro)
+            asyncio.set_event_loop(loop)
+            result_box[0] = loop.run_until_complete(coro)
         except Exception as e:
             exc_box[0] = e
+        finally:
+            # Let transports/SSL connection-lost callbacks run while the loop is
+            # still open, then shut down async generators, THEN close.
+            try:
+                loop.run_until_complete(asyncio.sleep(0.05))
+                loop.run_until_complete(loop.shutdown_asyncgens())
+            except Exception:
+                pass
+            try:
+                asyncio.set_event_loop(None)
+                loop.close()
+            except Exception:
+                pass
 
     t = threading.Thread(target=_target, daemon=True)
     t.start()
