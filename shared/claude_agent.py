@@ -279,9 +279,17 @@ class ClaudeAgent:
 
         except Exception as exc:
             err_str = str(exc)
-            # Hard errors (usage limits, auth) should propagate so callers can
-            # correctly mark AI as unavailable instead of silently returning fallbacks.
-            if "usage limit" in err_str.lower() or "401" in err_str or "authentication" in err_str.lower():
+            _el = err_str.lower()
+            # Hard "provider unavailable" errors must PROPAGATE so the caller can
+            # fall through to the next provider (e.g. Z.ai out of credits → Claude)
+            # instead of silently returning neutral fallback estimates that look
+            # like a successful analysis. Covers auth, usage/rate limits, and
+            # out-of-credits/billing across providers.
+            if ("usage limit" in _el or "401" in err_str or "authentication" in _el
+                    or "429" in err_str or "rate limit" in _el or "rate_limit" in _el
+                    or "quota" in _el or "insufficient balance" in _el
+                    or "recharge" in _el or "no resource package" in _el
+                    or "insufficient_quota" in _el or "billing" in _el):
                 raise
             log.error("batch_analysis_failed", error=err_str)
             for orig_idx, m in zip(uncached_indices, uncached):

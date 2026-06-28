@@ -595,10 +595,12 @@ def _execute_live_kalshi_order(
             resp = await client.place_order(order)
             # V2 returns the order flat or nested under "order".
             o = (resp.get("order", resp) if isinstance(resp, dict) else {}) or {}
+            _fc = float(o.get("fill_count", 0) or 0)
             return {
                 "order_id": o.get("order_id", f"kalshi_{int(time.time())}"),
                 "status":   o.get("status", "submitted"),
                 "count":    count,
+                "fill_count": _fc,
             }
         finally:
             await client.close()
@@ -1938,8 +1940,21 @@ def _live_dashboard():
                     side=_row.get("side", "yes"), api_key_id=_kalshi_key,
                     pem_content=_kalshi_pem, action="sell", count=_cnt,
                 )
+                _filled = float(_ex.get("fill_count", 0) or 0)
+                if _filled <= 0:
+                    # The close order placed but did NOT fill (no liquidity at the
+                    # IoC price). Do NOT mark it closed — keep it open so it retries
+                    # next cycle, and surface the truth instead of a false success.
+                    _row["Status"] = "exit pending (unfilled)"
+                    st.session_state._last_kalshi_status = (
+                        f"{time.strftime('%H:%M:%S')} — {_reason} on "
+                        f"{_row.get('Question','')[:30]} did NOT fill (no liquidity "
+                        "at the exit price); will retry."
+                    )
+                    continue
+                # Filled (fully or partially) → realize what filled.
                 _row["Open"] = False
-                _row["Status"] = "CLOSED"
+                _row["Status"] = "CLOSED" if _filled >= _cnt else "PARTIAL CLOSE"
                 _row["Exit"] = f"{_curprice:.0%}"
                 _row["Realized $"] = round(_pnl, 2)
                 _row["Exit ID"] = _ex.get("order_id", "")

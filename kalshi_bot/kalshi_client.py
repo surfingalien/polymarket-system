@@ -272,7 +272,12 @@ class KalshiClient:
             # price them marketably (cross the spread by a few cents) so they fill
             # right away instead of resting uselessly under an IoC.
             _tif = "immediate_or_cancel"
-            yes_cents = (yes_cents + 3) if v2_side == "bid" else (yes_cents - 3)
+            # Cross the spread by 5c so the IoC actually matches. Kalshi gives the
+            # taker price improvement (fills at the resting price), so this is the
+            # aggressiveness, not the fill price. On a genuinely illiquid market
+            # nothing matches and the order returns fill_count=0 — the caller then
+            # keeps the position open and retries rather than reporting a fake fill.
+            yes_cents = (yes_cents + 5) if v2_side == "bid" else (yes_cents - 5)
             yes_cents = max(1, min(99, yes_cents))
         body = {
             "ticker": order.ticker,
