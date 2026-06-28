@@ -1424,6 +1424,31 @@ def _live_dashboard():
                 f"{time.strftime('%H:%M:%S')} — ⚠️ position sync failed: {_exc}"
             )
 
+        # Register synced positions with the brain so it TRACKS them (shows as
+        # pending) and LEARNS from them on close. We don't know the signals that
+        # opened an external position, so we attribute it to the current model
+        # signals for that market, recorded in the direction actually held.
+        # Skip rows the bot already registered at entry — don't overwrite their
+        # accurate entry-time memory.
+        _brain_obj = _get_brain()
+        _cur_by_tkr = {a["id"]: a for a in all_analyses}
+        for _row in st.session_state.live_ledger:
+            if (_row.get("Platform") != "Kalshi" or not _row.get("Open", False)
+                    or _row.get("_brain_seen", False)):
+                continue
+            _tkr = _row.get("ticker")
+            if _tkr in _brain_obj._memories:
+                _row["_brain_seen"] = True   # bot already recorded this at entry
+                continue
+            _a = _cur_by_tkr.get(_tkr)
+            if _a and _a.get("signals"):
+                _held_sig = "BUY_YES" if _row.get("Dir") == "YES" else "BUY_NO"
+                try:
+                    _brain_obj.on_trade_placed(_to_brain_input({**_a, "signal": _held_sig}))
+                    _row["_brain_seen"] = True
+                except Exception:
+                    pass
+
     # ── connection status chips ────────────────────────────────────────────────
     if _dm:
         st.info(
