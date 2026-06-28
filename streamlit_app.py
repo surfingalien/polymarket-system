@@ -2184,7 +2184,11 @@ Then **Reboot app**. The brain will immediately start persisting after the next 
     # ══════════════════════════════════════════════════════════════════════════
     with t5:
         st.subheader("💼 Monte Carlo Portfolio Simulator")
-        st.info("**MOCK MODE** — outcomes are simulated, no real orders placed.")
+        st.caption(
+            "🔮 Forward-looking **risk projection** — it never places orders. The "
+            "positions are real; only the future *outcomes* are simulated (that's "
+            "what Monte Carlo does)."
+        )
         st.markdown(
             "Each prediction-market position is a binary bet that wins (resolves "
             "your way) or loses its full stake. Rather than one coin-flip per "
@@ -2193,7 +2197,17 @@ Then **Reboot app**. The brain will immediately start persisting after the next 
             "and the **risk of ruin**."
         )
 
-        # ── build positions from actionable signals ──────────────────────────
+        # Choose what basket to project: the candidate BUYs the bot would open,
+        # or the positions you actually hold right now (the live ledger).
+        _mc_mode = st.radio(
+            "Simulate",
+            ["Candidate BUY signals", "My open live positions"],
+            horizontal=True,
+            help="Candidate = what the bot would open now. Open positions = what "
+                 "you currently hold (real entries from the live ledger).",
+        )
+
+        # ── build positions ──────────────────────────────────────────────────
         # Stake floor is a small fraction of the budget (not a hard $1) so the
         # simulator still works with small per-platform budgets ($10–$20). This
         # is a simulation, not live execution, so we include any positive stake.
@@ -2201,7 +2215,45 @@ Then **Reboot app**. The brain will immediately start persisting after the next 
         mc_positions = []
         pos_rows = []
         _n_actionable = 0
-        for a in analyses:
+
+        if _mc_mode == "My open live positions":
+            # Project the basket you actually hold. Use the current model prob
+            # for each ticker when available, else the stored entry estimate.
+            _cur_by_tkr = {a["id"]: a for a in all_analyses}
+            for _row in st.session_state.live_ledger:
+                if not _row.get("Open", False):
+                    continue
+                _stake = float(_row.get("Size $") or 0.0)
+                if _stake <= 0:
+                    continue
+                _dir = str(_row.get("Dir", "YES"))
+                _sig = "BUY_YES" if _dir == "YES" else "BUY_NO"
+                _entry = float(_row.get("entry_num") or 0.5)
+                _cur = _cur_by_tkr.get(_row.get("ticker"))
+                _tp = float(_cur["prob"]) if _cur else _entry
+                _n_actionable += 1
+                mcp = position_from_signal(
+                    label=str(_row.get("Question", ""))[:30],
+                    signal=_sig, market_price=_entry, true_prob=_tp, stake=_stake,
+                )
+                if mcp is None:
+                    continue
+                mc_positions.append(mcp)
+                ev = mcp.win_prob * mcp.stake * mcp.win_payoff_mult - (1 - mcp.win_prob) * mcp.stake
+                pos_rows.append({
+                    "Platform":  _row.get("Platform", ""),
+                    "Question":  str(_row.get("Question", ""))[:50],
+                    "Direction": _dir,
+                    "Stake $":   round(_stake, 2),
+                    "Entry":     f"{_entry:.0%}",
+                    "AI Est.":   f"{_tp:.0%}",
+                    "Win Prob":  f"{mcp.win_prob:.0%}",
+                    "Edge":      f"{(_tp - _entry):+.1%}",
+                    "EV $":      round(ev, 2),
+                })
+
+        else:
+          for a in analyses:
             if a["signal"] == "HOLD":
                 continue
             _n_actionable += 1
@@ -2232,7 +2284,12 @@ Then **Reboot app**. The brain will immediately start persisting after the next 
             })
 
         if not mc_positions:
-            if _n_actionable == 0:
+            if _mc_mode == "My open live positions":
+                st.info(
+                    "No **open live positions** to simulate yet — place a live "
+                    "trade first, or switch to *Candidate BUY signals* above."
+                )
+            elif _n_actionable == 0:
                 st.info(
                     "No actionable BUY signals at the current **Min confidence** "
                     f"({min_conf:.0%}). Lower the Min confidence slider above, or "
