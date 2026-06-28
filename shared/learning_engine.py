@@ -40,7 +40,8 @@ from .predictive_models import EnsemblePredictor
 log = structlog.get_logger(__name__)
 
 _DEFAULT_STATE_FILE = Path("data/learning_state.json")
-_LR = 0.08          # learning rate per resolved market
+_LR = 0.08          # learning rate per resolved market (full Brier credit)
+_LR_TRADE = 0.04    # lighter learning rate per CLOSED trade (realized-P&L credit)
 _DECAY = 0.02       # fraction to pull back toward DEFAULT_WEIGHTS each cycle
 _MIN_WEIGHT = 0.1
 _MAX_WEIGHT = 8.0
@@ -188,6 +189,28 @@ class LearningEngine:
             brier_improvement=round(total_improvement, 4),
             resolved_total=self._resolved_count,
         )
+
+    def on_trade_closed(self, market_id: str, won: bool) -> None:
+        """Faster feedback than waiting for resolution: when a position is CLOSED
+        (take-profit, stop-loss, or model reversal), credit/penalize the signals
+        that drove it by whether the realized trade made money. A signal that
+        agreed with the taken direction is rewarded on a win and penalized on a
+        loss (and vice-versa for a signal that disagreed). Uses a lighter learning
+        rate than resolution and does NOT mark the memory resolved, so the market
+        can still earn full Brier credit when it actually settles."""
+        memory = self._memories.get(market_id)
+        if memory is None:
+            return
+        sign = 1.0 if won else -1.0
+        for sig in memory.signals:
+            # support > 0 → signal pointed the way we traded; < 0 → it disagreed.
+            support = sig.value if memory.direction == "YES" else -sig.value
+            delta = _LR_TRADE * sign * support * sig.confidence
+            self._ensemble.update_weights(sig.name, delta)
+        self._weight_snapshots.append((time.time(), dict(self._ensemble._weights)))
+        if len(self._weight_snapshots) > 500:
+            self._weight_snapshots = self._weight_snapshots[-500:]
+        log.info("weights_updated_from_trade_close", market_id=market_id, won=won)
 
     def apply_decay(self) -> None:
         """
