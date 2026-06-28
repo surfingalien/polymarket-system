@@ -882,11 +882,16 @@ def _run_analysis(
             live_ai = {}
             using_live = False
             ai_err = f"{_pname} — {type(_live_err).__name__}: {_live_err}"
-            # Fall through to the next provider only on limit/auth/rate failures;
-            # for other errors, stop and surface the message.
+            # Fall through to the next provider on any "provider unavailable"
+            # failure — usage limit, auth, rate limit, OR out of credits
+            # (Z.ai's "insufficient balance / recharge", OpenAI's "insufficient
+            # _quota"). For genuine other errors, stop and surface the message.
             _e = str(_live_err).lower()
             if not ("usage limit" in _e or "401" in _e or "authentication" in _e
-                    or "429" in _e or "rate limit" in _e or "quota" in _e):
+                    or "429" in _e or "rate limit" in _e or "quota" in _e
+                    or "insufficient balance" in _e or "recharge" in _e
+                    or "no resource package" in _e or "insufficient_quota" in _e
+                    or "billing" in _e or "credit" in _e):
                 break
 
     bay   = BayesianEstimator()
@@ -994,16 +999,20 @@ _news_tavily     = _get_secret("NEWS_TAVILY_API_KEY")
 _news_newsapi    = _get_secret("NEWS_NEWSAPI_KEY")
 
 # ── AI provider resolution ────────────────────────────────────────────────────
-# Build an ordered provider chain. Claude is primary when its key is present;
-# Z.ai's Anthropic-compatible GLM endpoint is the fallback. If Claude hits its
-# usage limit (or auth/rate error), analysis falls through to Z.ai automatically.
+# Build an ordered provider chain. Z.ai GLM is primary (to conserve Claude
+# credits); Claude is the fallback. If Z.ai is out of credits / rate-limited,
+# analysis falls through to Claude automatically. Order is overridable via the
+# AI_PRIMARY secret ("claude" to make Claude primary instead).
 _ZAI_BASE_URL = "https://api.z.ai/api/anthropic"
 _ZAI_MODEL    = _get_secret("ZAI_MODEL") or "glm-4.6"
+_AI_PRIMARY   = (_get_secret("AI_PRIMARY") or "zai").strip().lower()
+_claude_entry = (_anthropic_key, "claude-opus-4-8", "", "Claude") if _anthropic_key else None
+_zai_entry    = (_zai_key, _ZAI_MODEL, _ZAI_BASE_URL, "Z.ai GLM") if _zai_key else None
 _ai_chain = []  # ordered list of (key, model, base_url, name)
-if _anthropic_key:
-    _ai_chain.append((_anthropic_key, "claude-opus-4-8", "", "Claude"))
-if _zai_key:
-    _ai_chain.append((_zai_key, _ZAI_MODEL, _ZAI_BASE_URL, "Z.ai GLM"))
+if _AI_PRIMARY == "claude":
+    _ai_chain = [e for e in (_claude_entry, _zai_entry) if e]
+else:  # default: Z.ai first, Claude fallback
+    _ai_chain = [e for e in (_zai_entry, _claude_entry) if e]
 # Primary provider (for sidebar display before any call runs)
 _ai_key      = _ai_chain[0][0] if _ai_chain else ""
 _ai_model    = _ai_chain[0][1] if _ai_chain else "claude-opus-4-8"
@@ -1128,10 +1137,12 @@ st.session_state._last_full_run = _time_mod.time()
 with st.sidebar:
     st.title("🤖 Polymarket AI Bot")
     st.markdown("**API Keys**")
-    if _anthropic_key:
-        st.markdown("✅ Anthropic key set (Claude)")
-    elif _zai_key:
-        st.markdown(f"✅ Z.ai key set → GLM (`{_ai_model}`)")
+    if _ai_chain:
+        _names = [e[3] for e in _ai_chain]
+        if len(_names) > 1:
+            st.markdown(f"✅ AI: **{_names[0]}** primary → {_names[1]} fallback")
+        else:
+            st.markdown(f"✅ AI: **{_names[0]}**")
     else:
         st.markdown("⚪ No AI key → mock AI")
     if _news_tavily or _news_newsapi:
