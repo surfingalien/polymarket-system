@@ -275,6 +275,12 @@ class KalshiClient:
             # for a bot that isn't market-making against itself).
             "self_trade_prevention_type": "taker_at_cross",
         }
+        # A "sell" is closing an existing position. In the single-book model the
+        # opposite-side order would otherwise read as OPENING a new (collateralized)
+        # position and fail with insufficient_balance. reduce_only caps the order
+        # at the held position so it only ever closes — no balance required.
+        if order.action == "sell":
+            body["reduce_only"] = True
         headers = self._sign("POST", path, body)
         # Fail loudly if we couldn't build authentication. Without a key ID +
         # parseable private key, _sign omits the KALSHI-ACCESS-* headers and the

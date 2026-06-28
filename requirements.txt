@@ -31,6 +31,7 @@ tavily-python>=0.3.0
 newsapi-python>=0.2.7
 
 # Storage & Caching
+supabase>=2.3.0          # persistent learning brain across restarts (Streamlit Cloud)
 sqlalchemy>=2.0.31
 alembic>=1.13.2
 redis>=5.0.7
