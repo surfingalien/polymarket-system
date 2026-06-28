@@ -263,17 +263,16 @@ class KalshiClient:
             (order.action == "buy" and order.side == "yes")
             or (order.action == "sell" and order.side == "no")
         ) else "ask"
-        _tif = "good_till_canceled"
         _is_close = (order.action == "sell")
-        if _is_close:
-            # A close must use reduce_only (so it only reduces the held position
-            # and never opens a new collateralized one → no insufficient_balance).
-            # Kalshi requires reduce_only orders to be immediate_or_cancel, and we
-            # price them marketably (cross the spread by a few cents) so they fill
-            # right away instead of resting uselessly under an IoC.
-            _tif = "immediate_or_cancel"
-            yes_cents = (yes_cents + 3) if v2_side == "bid" else (yes_cents - 3)
-            yes_cents = max(1, min(99, yes_cents))
+        # Both entries and exits are MARKETABLE immediate_or_cancel: cross the
+        # spread so the order fills right now (or returns fill_count=0 and is not
+        # recorded) — instead of resting unfilled and piling up as phantom
+        # positions that distort P&L. Kalshi gives the taker price improvement
+        # (fills at the resting price), so the cross is aggressiveness, not the
+        # fill price. Bids cross up (pay the ask), asks cross down (hit the bid).
+        _tif = "immediate_or_cancel"
+        yes_cents = (yes_cents + 5) if v2_side == "bid" else (yes_cents - 5)
+        yes_cents = max(1, min(99, yes_cents))
         body = {
             "ticker": order.ticker,
             "client_order_id": order.client_order_id or str(uuid.uuid4()),

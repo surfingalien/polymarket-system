@@ -414,17 +414,34 @@ def _kalshi_positions_sync(api_key_id: str, pem_content: str) -> list[dict]:
         return {"positions": [], "raw_count": 0, "error": f"{type(exc).__name__}: {exc}"}
 
 
-def _sync_kalshi_positions_to_ledger(positions: list[dict]) -> tuple[int, int]:
+def _sync_kalshi_positions_to_ledger(positions: list[dict], reconcile: bool = False) -> tuple[int, int, int]:
     """Merge fetched Kalshi positions into the live ledger so they appear in the
     portfolio and the auto-exit/brain can act on them. Updates existing open rows
-    (matched by ticker+direction) and adds new '🔄 Synced' rows. Returns
-    (added, updated)."""
+    (matched by ticker+direction) and adds new '🔄 Synced' rows.
+
+    When `reconcile` is True (the positions fetch succeeded), any OPEN Kalshi row
+    NOT backed by a real account position is marked not-held — this prunes
+    phantom rows from unfilled/expired orders so the P&L and counts reflect the
+    real account. Returns (added, updated, pruned)."""
     ledger = st.session_state.live_ledger
     existing = {
         (r.get("ticker"), r.get("Dir")): r
         for r in ledger
         if r.get("Platform") == "Kalshi" and r.get("Open", False)
     }
+    _real_keys = {(p["ticker"], p["dir"]) for p in positions}
+    pruned = 0
+    if reconcile:
+        _now = time.time()
+        for _key, _row in existing.items():
+            if _key not in _real_keys:
+                # Not held on Kalshi. But the positions fetch is cached ~45s, so a
+                # JUST-filled order may not appear yet — only prune rows older than
+                # that window (legacy phantom rows have no placed_ts → pruned now).
+                if _now - float(_row.get("placed_ts", 0) or 0) > 90:
+                    _row["Open"] = False
+                    _row["Status"] = "not held (no position on Kalshi)"
+                    pruned += 1
     added = updated = 0
     for p in positions:
         _row = existing.get((p["ticker"], p["dir"]))
@@ -455,10 +472,11 @@ def _sync_kalshi_positions_to_ledger(positions: list[dict]) -> tuple[int, int]:
                 "side":     p["side"],
                 "count":    p["count"],
                 "cur_yes":  p["cur_yes"],
+                "placed_ts": time.time(),
                 "Open":     True,
             })
             added += 1
-    return added, updated
+    return added, updated, pruned
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -595,10 +613,12 @@ def _execute_live_kalshi_order(
             resp = await client.place_order(order)
             # V2 returns the order flat or nested under "order".
             o = (resp.get("order", resp) if isinstance(resp, dict) else {}) or {}
+            _fc = float(o.get("fill_count", 0) or 0)
             return {
                 "order_id": o.get("order_id", f"kalshi_{int(time.time())}"),
                 "status":   o.get("status", "submitted"),
                 "count":    count,
+                "fill_count": _fc,
             }
         finally:
             await client.close()
@@ -1417,7 +1437,10 @@ def _live_dashboard():
         try:
             _kres = _kalshi_positions_sync(_kalshi_key, _kalshi_pem)
             _kpos = _kres.get("positions", [])
-            _added, _updated = _sync_kalshi_positions_to_ledger(_kpos)
+            # Reconcile only when the fetch succeeded — prune phantom rows so P&L
+            # reflects the real account, never on a failed/empty fetch.
+            _fetch_ok = not _kres.get("error")
+            _added, _updated, _pruned = _sync_kalshi_positions_to_ledger(_kpos, reconcile=_fetch_ok)
             # Always record a visible sync status (count or error) so an empty
             # portfolio is explained instead of silently blank.
             if _kres.get("error"):
@@ -1427,8 +1450,8 @@ def _live_dashboard():
             else:
                 st.session_state._last_position_sync = (
                     f"{time.strftime('%H:%M:%S')} — Kalshi positions: "
-                    f"{len(_kpos)} open (of {_kres.get('raw_count', 0)} returned); "
-                    f"{_added} added, {_updated} updated."
+                    f"{len(_kpos)} held; {_added} added, {_updated} updated, "
+                    f"{_pruned} phantom row(s) pruned."
                 )
         except Exception as _exc:
             st.session_state._last_position_sync = (
@@ -1817,30 +1840,41 @@ def _live_dashboard():
                     ticker=_a["id"], price=_a["price"], size_usd=_size,
                     side=_kside, api_key_id=_kalshi_key, pem_content=_kalshi_pem,
                 )
+                _filled = float(_res.get("fill_count", 0) or 0)
+                if _filled <= 0:
+                    # Marketable IoC entry did NOT fill (no liquidity at the price)
+                    # — do NOT record a phantom position. It simply wasn't taken.
+                    continue
+                _fillcnt = int(_filled)
+                # Record only the contracts that actually filled.
+                _real_size = round(_a["price"] * _fillcnt if _kside == "yes"
+                                   else (1.0 - _a["price"]) * _fillcnt, 2)
                 st.session_state.live_ledger.append({
                     "Platform": "Kalshi",
                     "Question": _a["question"][:50],
                     "Dir":      _dir,
-                    "Size $":   round(_size, 2),
+                    "Size $":   _real_size if _real_size > 0 else round(_size, 2),
                     "entry_num": _a["price"],
                     "Entry":    f"{_a['price']:.0%}",
                     "AI Est.":  f"{_a['prob']:.0%}",
                     "Edge":     f"{_a['edge']:+.1%}",
                     "Order ID": _res["order_id"],
-                    "Status":   _res["status"],
+                    "Status":   "FILLED",
                     "Time":     time.strftime("%H:%M:%S"),
                     "Mode":     "🤖 Auto-Live",
                     # Position-maintenance metadata (used by the auto-exit pass)
                     "ticker":   _a["id"],
                     "side":     _kside,
-                    "count":    int(_res.get("count", 0)),
+                    "count":    _fillcnt,
+                    "_brain_seen": True,
+                    "placed_ts": time.time(),
                     "Open":     True,
                 })
                 _get_brain().on_trade_placed(_to_brain_input(_a))
                 _kal_added += 1
                 # Keep the risk gates honest within this same cycle.
                 _open_count += 1
-                _total_exposure += _size
+                _total_exposure += _real_size if _real_size > 0 else _size
             except Exception as _exc:
                 _exc_str = str(_exc)
                 # Distinguish failure types: 410/404/pre-check = dead market
@@ -1938,8 +1972,21 @@ def _live_dashboard():
                     side=_row.get("side", "yes"), api_key_id=_kalshi_key,
                     pem_content=_kalshi_pem, action="sell", count=_cnt,
                 )
+                _filled = float(_ex.get("fill_count", 0) or 0)
+                if _filled <= 0:
+                    # The close order placed but did NOT fill (no liquidity at the
+                    # IoC price). Do NOT mark it closed — keep it open so it retries
+                    # next cycle, and surface the truth instead of a false success.
+                    _row["Status"] = "exit pending (unfilled)"
+                    st.session_state._last_kalshi_status = (
+                        f"{time.strftime('%H:%M:%S')} — {_reason} on "
+                        f"{_row.get('Question','')[:30]} did NOT fill (no liquidity "
+                        "at the exit price); will retry."
+                    )
+                    continue
+                # Filled (fully or partially) → realize what filled.
                 _row["Open"] = False
-                _row["Status"] = "CLOSED"
+                _row["Status"] = "CLOSED" if _filled >= _cnt else "PARTIAL CLOSE"
                 _row["Exit"] = f"{_curprice:.0%}"
                 _row["Realized $"] = round(_pnl, 2)
                 _row["Exit ID"] = _ex.get("order_id", "")
