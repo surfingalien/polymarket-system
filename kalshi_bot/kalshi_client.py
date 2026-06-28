@@ -263,23 +263,30 @@ class KalshiClient:
             (order.action == "buy" and order.side == "yes")
             or (order.action == "sell" and order.side == "no")
         ) else "ask"
+        _tif = "good_till_canceled"
+        _is_close = (order.action == "sell")
+        if _is_close:
+            # A close must use reduce_only (so it only reduces the held position
+            # and never opens a new collateralized one → no insufficient_balance).
+            # Kalshi requires reduce_only orders to be immediate_or_cancel, and we
+            # price them marketably (cross the spread by a few cents) so they fill
+            # right away instead of resting uselessly under an IoC.
+            _tif = "immediate_or_cancel"
+            yes_cents = (yes_cents + 3) if v2_side == "bid" else (yes_cents - 3)
+            yes_cents = max(1, min(99, yes_cents))
         body = {
             "ticker": order.ticker,
             "client_order_id": order.client_order_id or str(uuid.uuid4()),
             "side": v2_side,
             "count": str(int(order.count)),
             "price": f"{yes_cents / 100:.4f}",
-            "time_in_force": "good_till_canceled",
+            "time_in_force": _tif,
             # Required by the V2 schema. taker_at_cross = if this order would
             # cross our own resting order, execute it as the taker (a safe default
             # for a bot that isn't market-making against itself).
             "self_trade_prevention_type": "taker_at_cross",
         }
-        # A "sell" is closing an existing position. In the single-book model the
-        # opposite-side order would otherwise read as OPENING a new (collateralized)
-        # position and fail with insufficient_balance. reduce_only caps the order
-        # at the held position so it only ever closes — no balance required.
-        if order.action == "sell":
+        if _is_close:
             body["reduce_only"] = True
         headers = self._sign("POST", path, body)
         # Fail loudly if we couldn't build authentication. Without a key ID +
