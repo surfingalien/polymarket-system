@@ -373,35 +373,45 @@ def _kalshi_positions_sync(api_key_id: str, pem_content: str) -> list[dict]:
             raw = await client.get_positions()
             out = []
             for p in raw:
-                _cnt = int(p.get("position", 0) or 0)
+                # Kalshi V2 renamed position fields to fixed-point / *_dollars
+                # variants (position_fp, market_exposure_dollars, ...). Read the
+                # new names first, fall back to the legacy cents-based names.
+                _cnt = int(float(p.get("position_fp", p.get("position", 0)) or 0))
                 if _cnt == 0:
                     continue
                 _tkr = str(p.get("ticker", ""))
                 _side = "yes" if _cnt > 0 else "no"
                 _dir  = "YES" if _cnt > 0 else "NO"
                 _n = abs(_cnt)
-                # market_exposure is the position's cost basis in cents.
-                _exp_cents = abs(int(p.get("market_exposure", 0) or 0))
-                _cost_per = (_exp_cents / _n) if _n else 0.0   # cents/contract
-                _entry_yes = (_cost_per / 100.0) if _side == "yes" else (1.0 - _cost_per / 100.0)
+                # Cost basis. *_dollars is already in dollars; legacy is cents.
+                if p.get("market_exposure_dollars") is not None:
+                    _exp = abs(float(p.get("market_exposure_dollars") or 0))
+                else:
+                    _exp = abs(float(p.get("market_exposure", 0) or 0)) / 100.0
+                _cost_per = (_exp / _n) if _n else 0.0          # dollars/contract
+                _entry_yes = _cost_per if _side == "yes" else (1.0 - _cost_per)
                 _entry_yes = max(0.01, min(0.99, _entry_yes))
                 # Current price + title from the market-data endpoint.
                 _m = await client.get_market(_tkr)
                 _cur_yes = float(_m.mid_price) if _m else _entry_yes
                 _question = (_m.title if _m else _tkr)
+                if p.get("realized_pnl_dollars") is not None:
+                    _realized = float(p.get("realized_pnl_dollars") or 0)
+                else:
+                    _realized = float(p.get("realized_pnl", 0) or 0) / 100.0
                 out.append({
                     "ticker": _tkr, "count": _n, "side": _side, "dir": _dir,
-                    "entry_yes": _entry_yes, "size_usd": round(_exp_cents / 100.0, 2),
+                    "entry_yes": _entry_yes, "size_usd": round(_exp, 2),
                     "cur_yes": _cur_yes, "question": _question,
-                    "realized": round(float(p.get("realized_pnl", 0) or 0) / 100.0, 2),
+                    "realized": round(_realized, 2),
                 })
-            return out
+            return {"positions": out, "raw_count": len(raw), "error": ""}
         finally:
             await client.close()
     try:
         return _run_coro_sync(_inner(), timeout=45)
-    except Exception:
-        return []
+    except Exception as exc:
+        return {"positions": [], "raw_count": 0, "error": f"{type(exc).__name__}: {exc}"}
 
 
 def _sync_kalshi_positions_to_ledger(positions: list[dict]) -> tuple[int, int]:
@@ -760,6 +770,9 @@ _MIN_ORDER_USD = 1.0    # floor an actionable order up to this so valid small
                         # signals still execute (Kalshi fills >= 1 contract anyway)
 _TAKE_PROFIT   = 0.25   # default: book profit when a position is +25% of its cost
 _STOP_LOSS     = 0.20   # default: cut a position at -20% of its cost
+_MAX_DRAWDOWN  = 0.20   # halt NEW entries once live P&L is down >20% of deployed capital
+_MAX_OPEN_POS  = 5      # max simultaneous open live positions
+_MAX_EXPOSURE  = 100.0  # max total $ across all open live positions
 
 
 def _price_movement(hist: list) -> float:
@@ -1043,6 +1056,12 @@ if "take_profit_pct"   not in st.session_state:
     st.session_state.take_profit_pct   = _qp_float("tp",  _TAKE_PROFIT)
 if "stop_loss_pct"     not in st.session_state:
     st.session_state.stop_loss_pct     = _qp_float("sl",  _STOP_LOSS)
+if "max_drawdown_pct"  not in st.session_state:
+    st.session_state.max_drawdown_pct  = _qp_float("dd",  _MAX_DRAWDOWN)
+if "max_open_pos"      not in st.session_state:
+    st.session_state.max_open_pos      = int(_qp_float("mop", _MAX_OPEN_POS))
+if "max_exposure_usd"  not in st.session_state:
+    st.session_state.max_exposure_usd  = _qp_float("mex", _MAX_EXPOSURE)
 if "auto_paper"        not in st.session_state:
     st.session_state.auto_paper        = _qp_bool("ap",   False)
 if "refresh_label"     not in st.session_state:
@@ -1243,6 +1262,18 @@ with _bar1:
     with _ec2:
         st.slider("Stop-loss %", 0.05, 0.90, step=0.05, key="stop_loss_pct",
                   help="Auto-sell an open position once it's down this % of its cost")
+    # Portfolio risk gates: block NEW live entries when limits are hit.
+    _rc1, _rc2, _rc3 = st.columns(3)
+    with _rc1:
+        st.slider("Max drawdown %", 0.05, 0.50, step=0.05, key="max_drawdown_pct",
+                  help="Halt NEW entries once live P&L is down this % of deployed capital")
+    with _rc2:
+        st.number_input("Max open positions", min_value=1, max_value=50, step=1,
+                        key="max_open_pos", help="Cap on simultaneous open live positions")
+    with _rc3:
+        st.number_input("Max total exposure $", min_value=5.0, step=10.0,
+                        key="max_exposure_usd",
+                        help="Ceiling on total $ across all open live positions")
 with _bar2:
     st.toggle(
         "🔵 Demo mode",
@@ -1373,16 +1404,24 @@ def _live_dashboard():
     # (not just auto-live), cached 45 s.
     if _kalshi_key and _kalshi_pem and not _dm:
         try:
-            _kpos = _kalshi_positions_sync(_kalshi_key, _kalshi_pem)
+            _kres = _kalshi_positions_sync(_kalshi_key, _kalshi_pem)
+            _kpos = _kres.get("positions", [])
             _added, _updated = _sync_kalshi_positions_to_ledger(_kpos)
-            if _added:
-                st.session_state._last_kalshi_status = (
-                    f"{time.strftime('%H:%M:%S')} — synced {_added} live Kalshi "
-                    f"position(s) into the portfolio."
+            # Always record a visible sync status (count or error) so an empty
+            # portfolio is explained instead of silently blank.
+            if _kres.get("error"):
+                st.session_state._last_position_sync = (
+                    f"{time.strftime('%H:%M:%S')} — ⚠️ position sync error: {_kres['error']}"
+                )
+            else:
+                st.session_state._last_position_sync = (
+                    f"{time.strftime('%H:%M:%S')} — Kalshi positions: "
+                    f"{len(_kpos)} open (of {_kres.get('raw_count', 0)} returned); "
+                    f"{_added} added, {_updated} updated."
                 )
         except Exception as _exc:
-            st.session_state._last_live_error = (
-                f"{time.strftime('%H:%M:%S')} — position sync failed: {_exc}"
+            st.session_state._last_position_sync = (
+                f"{time.strftime('%H:%M:%S')} — ⚠️ position sync failed: {_exc}"
             )
 
     # ── connection status chips ────────────────────────────────────────────────
@@ -1495,8 +1534,15 @@ def _live_dashboard():
         """Render unified order book: paper + live positions with live P&L."""
         paper = st.session_state.paper_ledger
         live  = st.session_state.live_ledger
+        # Surface the Kalshi position-sync status so an empty book is explained.
+        _psync = st.session_state.get("_last_position_sync", "")
+        if _psync:
+            st.caption(f"🔄 {_psync}")
         if not paper and not live:
-            st.caption("No trades recorded yet.")
+            st.caption(
+                "No trades recorded yet. Live Kalshi positions sync automatically "
+                "when your keys are set and Demo mode is off."
+            )
             return
 
         # ── summary metrics ───────────────────────────────────────────────────
@@ -1680,10 +1726,30 @@ def _live_dashboard():
         _kal_added = 0
         _kal_candidates = 0   # Kalshi BUY signals seen this cycle
         _kal_toosmall = 0     # skipped because Kelly-sized order < $1
+        # ── portfolio risk gates (block NEW entries) ──────────────────────────
+        _max_dd   = float(st.session_state.get("max_drawdown_pct", _MAX_DRAWDOWN))
+        _max_open = int(st.session_state.get("max_open_pos", _MAX_OPEN_POS))
+        _max_exp  = float(st.session_state.get("max_exposure_usd", _MAX_EXPOSURE))
+        _open_live = [r for r in st.session_state.live_ledger if r.get("Open", False)]
+        _open_count = len(_open_live)
+        _total_exposure = sum(float(r.get("Size $") or 0) for r in _open_live)
+        _live_invested = sum(float(r.get("Size $") or 0) for r in st.session_state.live_ledger)
+        _live_pnl = sum(_trade_pnl(r) for r in st.session_state.live_ledger)
+        _dd_frac = ((-_live_pnl / _live_invested) if (_live_invested > 0 and _live_pnl < 0) else 0.0)
+        _risk_halt = ""
+        if _dd_frac >= _max_dd:
+            _risk_halt = (f"drawdown {_dd_frac:.0%} ≥ max {_max_dd:.0%} — "
+                          "halting new entries (circuit-breaker)")
         for _a in analyses:
             if _a["signal"] == "HOLD" or _a["kelly"] <= 0 or _a["platform"] != "Kalshi":
                 continue
             _kal_candidates += 1
+            # Circuit-breaker + position-count gate stop ALL new entries.
+            if _risk_halt:
+                break
+            if _open_count >= _max_open:
+                _risk_halt = f"{_open_count} open positions ≥ max {_max_open}"
+                break
             _size = round(min(float(kalshi_budget) * _a["kelly"], float(kalshi_budget) * 0.15), 2)
             if _size < _MIN_ORDER_USD:
                 # Valid signal but Kelly-sized tiny: deploy the minimum so it
@@ -1693,6 +1759,12 @@ def _live_dashboard():
                 else:
                     _kal_toosmall += 1
                     continue
+            # Total-exposure ceiling: skip entries that would breach the cap.
+            if (_total_exposure + _size) > _max_exp:
+                if not _risk_halt:
+                    _risk_halt = (f"exposure ${_total_exposure:.0f}+${_size:.0f} "
+                                  f"would exceed max ${_max_exp:.0f}")
+                continue
             _dir = "YES" if _a["signal"] == "BUY_YES" else "NO"
             _kside = "yes" if _a["signal"] == "BUY_YES" else "no"
             # Skip markets that 410'd (expired/settled) earlier this session.
@@ -1730,6 +1802,9 @@ def _live_dashboard():
                 })
                 _get_brain().on_trade_placed(_to_brain_input(_a))
                 _kal_added += 1
+                # Keep the risk gates honest within this same cycle.
+                _open_count += 1
+                _total_exposure += _size
             except Exception as _exc:
                 _exc_str = str(_exc)
                 # Distinguish failure types: 410/404/pre-check = dead market
@@ -1753,7 +1828,9 @@ def _live_dashboard():
             )
         else:
             # No Kalshi order fired — record why so it's visible in diagnostics.
-            if _kal_candidates == 0:
+            if _risk_halt:
+                _kal_why = f"🛑 risk gate: {_risk_halt}."
+            elif _kal_candidates == 0:
                 _kal_why = ("no actionable Kalshi signals this cycle (all HOLD or no "
                             "edge). Lower Min confidence or wait for Kalshi markets "
                             "with an edge.")
@@ -2805,6 +2882,11 @@ st.query_params.update({
     "pb":   str(st.session_state.get("poly_budget",    10.0)),
     "kb":   str(st.session_state.get("kalshi_budget",  10.0)),
     "mc":   str(st.session_state.get("sidebar_min_conf", 0.55)),
+    "tp":   str(st.session_state.get("take_profit_pct", _TAKE_PROFIT)),
+    "sl":   str(st.session_state.get("stop_loss_pct", _STOP_LOSS)),
+    "dd":   str(st.session_state.get("max_drawdown_pct", _MAX_DRAWDOWN)),
+    "mop":  str(st.session_state.get("max_open_pos", _MAX_OPEN_POS)),
+    "mex":  str(st.session_state.get("max_exposure_usd", _MAX_EXPOSURE)),
     "rl":   st.session_state.get("refresh_label", "Off"),
     "ap":   "1" if st.session_state.get("auto_paper", False) else "0",
     "lt":   "1" if st.session_state.get("live_trading", False) else "0",
