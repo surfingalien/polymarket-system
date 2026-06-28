@@ -359,6 +359,98 @@ def _kalshi_auth_check_sync(api_key_id: str, pem_content: str) -> tuple[bool, st
         return False, f"{type(exc).__name__}: {exc}"
 
 
+@st.cache_data(ttl=45, show_spinner=False)
+def _kalshi_positions_sync(api_key_id: str, pem_content: str) -> list[dict]:
+    """Fetch the ACTUAL open positions on the Kalshi account and normalize them
+    so the portfolio + auto-exit can manage positions placed in prior sessions
+    or directly on Kalshi. Returns one dict per non-zero position with entry
+    cost basis, current price, and title. Cached 45 s."""
+    async def _inner():
+        client = KalshiClient(
+            api_key_id=api_key_id, private_key_content=pem_content, mock_mode=False,
+        )
+        try:
+            raw = await client.get_positions()
+            out = []
+            for p in raw:
+                _cnt = int(p.get("position", 0) or 0)
+                if _cnt == 0:
+                    continue
+                _tkr = str(p.get("ticker", ""))
+                _side = "yes" if _cnt > 0 else "no"
+                _dir  = "YES" if _cnt > 0 else "NO"
+                _n = abs(_cnt)
+                # market_exposure is the position's cost basis in cents.
+                _exp_cents = abs(int(p.get("market_exposure", 0) or 0))
+                _cost_per = (_exp_cents / _n) if _n else 0.0   # cents/contract
+                _entry_yes = (_cost_per / 100.0) if _side == "yes" else (1.0 - _cost_per / 100.0)
+                _entry_yes = max(0.01, min(0.99, _entry_yes))
+                # Current price + title from the market-data endpoint.
+                _m = await client.get_market(_tkr)
+                _cur_yes = float(_m.mid_price) if _m else _entry_yes
+                _question = (_m.title if _m else _tkr)
+                out.append({
+                    "ticker": _tkr, "count": _n, "side": _side, "dir": _dir,
+                    "entry_yes": _entry_yes, "size_usd": round(_exp_cents / 100.0, 2),
+                    "cur_yes": _cur_yes, "question": _question,
+                    "realized": round(float(p.get("realized_pnl", 0) or 0) / 100.0, 2),
+                })
+            return out
+        finally:
+            await client.close()
+    try:
+        return _run_coro_sync(_inner(), timeout=45)
+    except Exception:
+        return []
+
+
+def _sync_kalshi_positions_to_ledger(positions: list[dict]) -> tuple[int, int]:
+    """Merge fetched Kalshi positions into the live ledger so they appear in the
+    portfolio and the auto-exit/brain can act on them. Updates existing open rows
+    (matched by ticker+direction) and adds new '🔄 Synced' rows. Returns
+    (added, updated)."""
+    ledger = st.session_state.live_ledger
+    existing = {
+        (r.get("ticker"), r.get("Dir")): r
+        for r in ledger
+        if r.get("Platform") == "Kalshi" and r.get("Open", False)
+    }
+    added = updated = 0
+    for p in positions:
+        _row = existing.get((p["ticker"], p["dir"]))
+        if _row is not None:
+            # Refresh live state on a position we already track.
+            _row["count"]   = p["count"]
+            _row["cur_yes"] = p["cur_yes"]
+            if not _row.get("Size $"):
+                _row["Size $"] = p["size_usd"]
+            if not _row.get("entry_num"):
+                _row["entry_num"] = p["entry_yes"]
+            updated += 1
+        else:
+            ledger.append({
+                "Platform": "Kalshi",
+                "Question": p["question"][:50],
+                "Dir":      p["dir"],
+                "Size $":   p["size_usd"],
+                "entry_num": p["entry_yes"],
+                "Entry":    f"{p['entry_yes']:.0%}",
+                "AI Est.":  "—",
+                "Edge":     "—",
+                "Order ID": "synced",
+                "Status":   "OPEN",
+                "Time":     time.strftime("%H:%M:%S"),
+                "Mode":     "🔄 Synced",
+                "ticker":   p["ticker"],
+                "side":     p["side"],
+                "count":    p["count"],
+                "cur_yes":  p["cur_yes"],
+                "Open":     True,
+            })
+            added += 1
+    return added, updated
+
+
 @st.cache_data(ttl=60, show_spinner=False)
 def _get_markets(
     poly_key: str = "",
@@ -1274,6 +1366,25 @@ def _live_dashboard():
         st.exception(exc)
         return
 
+    # ── sync REAL Kalshi positions into the ledger ─────────────────────────────
+    # Pull the account's actual open positions so they appear in the portfolio
+    # and the auto-exit/brain can manage them — including positions opened in a
+    # prior session or directly on Kalshi. Runs whenever Kalshi creds are present
+    # (not just auto-live), cached 45 s.
+    if _kalshi_key and _kalshi_pem and not _dm:
+        try:
+            _kpos = _kalshi_positions_sync(_kalshi_key, _kalshi_pem)
+            _added, _updated = _sync_kalshi_positions_to_ledger(_kpos)
+            if _added:
+                st.session_state._last_kalshi_status = (
+                    f"{time.strftime('%H:%M:%S')} — synced {_added} live Kalshi "
+                    f"position(s) into the portfolio."
+                )
+        except Exception as _exc:
+            st.session_state._last_live_error = (
+                f"{time.strftime('%H:%M:%S')} — position sync failed: {_exc}"
+            )
+
     # ── connection status chips ────────────────────────────────────────────────
     if _dm:
         st.info(
@@ -1372,7 +1483,11 @@ def _live_dashboard():
         if ep <= 0:
             return 0.0
         q       = str(row.get("Question", ""))
-        yes_now = _price_map.get(q, ep_yes)
+        # Prefer the live scan price; for synced positions whose market isn't in
+        # this cycle's scan, fall back to the price captured at sync time.
+        yes_now = _price_map.get(q)
+        if yes_now is None:
+            yes_now = float(row.get("cur_yes", ep_yes) or ep_yes)
         cp      = yes_now if dir_ == "YES" else (1.0 - yes_now)
         return round((size / ep) * cp - size, 2)
 
@@ -1670,17 +1785,21 @@ def _live_dashboard():
             if _row.get("Platform") != "Kalshi" or not _row.get("Open", False):
                 continue
             _cur = _by_ticker.get(_row.get("ticker"))
-            if not _cur:
-                continue
             _held = _row.get("Dir")  # "YES" / "NO"
+            # Current YES price: live scan when the market is in this cycle's
+            # scan, else the price captured at position-sync time. This lets the
+            # bot manage SYNCED positions (prior session / placed on Kalshi) too.
+            _curprice = (float(_cur["price"]) if _cur
+                         else float(_row.get("cur_yes", _row.get("entry_num", 0.5)) or 0.5))
             # Position-aware exit decision, evaluated every refresh so the bot
             # reacts fast: book profit at +TP, cut losses at -SL, or close on a
             # genuine model reversal. P&L fraction = unrealized $ / position cost.
             _size = float(_row.get("Size $") or 0.0)
             _upnl = _trade_pnl(_row)
             _pnl_frac = (_upnl / _size) if _size > 0 else 0.0
-            _flipped = ((_held == "YES" and _cur["signal"] == "BUY_NO")
-                        or (_held == "NO" and _cur["signal"] == "BUY_YES"))
+            _flipped = bool(_cur) and (
+                (_held == "YES" and _cur["signal"] == "BUY_NO")
+                or (_held == "NO" and _cur["signal"] == "BUY_YES"))
             _reason = None
             if _pnl_frac >= _tp:
                 _reason = "take-profit"
@@ -1702,13 +1821,13 @@ def _live_dashboard():
             try:
                 _pnl = _trade_pnl(_row)
                 _ex = _execute_live_kalshi_order(
-                    ticker=_row["ticker"], price=_cur["price"], size_usd=0.0,
+                    ticker=_row["ticker"], price=_curprice, size_usd=0.0,
                     side=_row.get("side", "yes"), api_key_id=_kalshi_key,
                     pem_content=_kalshi_pem, action="sell", count=_cnt,
                 )
                 _row["Open"] = False
                 _row["Status"] = "CLOSED"
-                _row["Exit"] = f"{_cur['price']:.0%}"
+                _row["Exit"] = f"{_curprice:.0%}"
                 _row["Realized $"] = round(_pnl, 2)
                 _row["Exit ID"] = _ex.get("order_id", "")
                 _row["Exit Reason"] = _reason
@@ -1725,7 +1844,7 @@ def _live_dashboard():
                 if "410" in _exc_str or "404" in _exc_str:
                     _row["Open"] = False
                     _row["Status"] = "SETTLED"
-                    _row["Exit"] = f"{_cur['price']:.0%}"
+                    _row["Exit"] = f"{_curprice:.0%}"
                     _pnl = round(_trade_pnl(_row), 2)
                     _row["Realized $"] = _pnl
                     _row["Exit Reason"] = "settled"
