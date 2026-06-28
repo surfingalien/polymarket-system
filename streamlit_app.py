@@ -1185,7 +1185,7 @@ with st.sidebar:
     st.divider()
     st.caption("💰 Budget, confidence & refresh controls are in the main panel ↗")
     st.divider()
-    if st.button("🔄 Re-run Analysis", use_container_width=True, key="rerun_sidebar"):
+    if st.button("🔄 Re-run Analysis", width='stretch', key="rerun_sidebar"):
         st.cache_data.clear()
         st.rerun()
 
@@ -1293,7 +1293,7 @@ with _bar2:
         help="ON = safe simulated data. OFF = live API connections.",
     )
 with _bar3:
-    if st.button("▶ Run", type="primary", use_container_width=True, key="run_main"):
+    if st.button("▶ Run", type="primary", width='stretch', key="run_main"):
         # Only refresh data — never touch widget state.
         st.cache_data.clear()
         st.rerun()
@@ -1615,7 +1615,7 @@ def _live_dashboard():
                                     "Current %","AI Est.","Edge","P&L $","ROI","Time","Mode"]
                        if c in df_p.columns]
             st.dataframe(
-                df_p[_show_p], use_container_width=True, hide_index=True,
+                df_p[_show_p], width='stretch', hide_index=True,
                 column_config={
                     "P&L $":  st.column_config.NumberColumn("P&L $", format="%+.2f"),
                     "Size $": st.column_config.NumberColumn("Size $", format="$%.2f"),
@@ -1640,7 +1640,7 @@ def _live_dashboard():
                                     "Order ID","Time","Mode"]
                        if c in df_l.columns]
             st.dataframe(
-                df_l[_show_l], use_container_width=True, hide_index=True,
+                df_l[_show_l], width='stretch', hide_index=True,
                 column_config={
                     "P&L $":  st.column_config.NumberColumn("P&L $", format="%+.2f"),
                     "Size $": st.column_config.NumberColumn("Size $", format="$%.2f"),
@@ -2072,7 +2072,7 @@ def _live_dashboard():
             })
 
         st.dataframe(
-            pd.DataFrame(rows), use_container_width=True, hide_index=True,
+            pd.DataFrame(rows), width='stretch', hide_index=True,
             column_config={
                 "30-Day Trend": st.column_config.LineChartColumn(
                     "30-Day Trend", width="small",
@@ -2120,7 +2120,7 @@ def _live_dashboard():
                 "Probability": [chosen["price"], chosen["prob"], chosen["bayesian"]],
             }, index=["Market Price", "AI Estimate", "Bayesian Est."])
             st.markdown("**Probability comparison**")
-            st.bar_chart(prob_df, height=180, use_container_width=True)
+            st.bar_chart(prob_df, height=180, width='stretch')
 
             # Price history — native line chart
             hist_df = pd.DataFrame(
@@ -2128,7 +2128,7 @@ def _live_dashboard():
                  "AI Estimate":  [chosen["prob"]] * len(chosen["history"])},
             )
             st.markdown("**30-Day price history**")
-            st.line_chart(hist_df, height=180, use_container_width=True)
+            st.line_chart(hist_df, height=180, width='stretch')
 
         with col_r:
             st.markdown(f"""
@@ -2165,13 +2165,13 @@ def _live_dashboard():
                 "Weight":     round(s["weight"], 2),
                 "Direction":  "🟢 Bullish" if s["value"] > 0 else "🔴 Bearish",
             } for s in sigs])
-            st.dataframe(sig_df, use_container_width=True, hide_index=True)
+            st.dataframe(sig_df, width='stretch', hide_index=True)
 
             chart_df = pd.DataFrame(
                 {"Signal Value": [s["value"] for s in sigs]},
                 index=[s["name"].replace("_", " ").title() for s in sigs],
             )
-            st.bar_chart(chart_df, height=200, use_container_width=True)
+            st.bar_chart(chart_df, height=200, width='stretch')
         else:
             st.info("No directional signals — all signals are neutral for this market.")
 
@@ -2244,7 +2244,7 @@ def _live_dashboard():
 
         st.dataframe(
             pd.DataFrame(w_rows),
-            use_container_width=True, hide_index=True,
+            width='stretch', hide_index=True,
             column_config={
                 "Weight": st.column_config.ProgressColumn(
                     "Current Weight", min_value=0.0, max_value=8.0, format="%.2f",
@@ -2256,7 +2256,7 @@ def _live_dashboard():
         st.markdown("#### Weight Drift from Default")
         st.bar_chart(
             pd.DataFrame.from_dict({"Drift": drift_vals}, orient="columns"),
-            height=200, use_container_width=True,
+            height=200, width='stretch',
         )
 
         if not _resolved:
@@ -2367,7 +2367,7 @@ Then **Reboot app**. The brain will immediately start persisting after the next 
                 "Net Spread":    f"{o.net_spread:+.1%}",
                 "Direction":     o.direction,
             } for o in arb]
-            st.dataframe(pd.DataFrame(arb_rows), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(arb_rows), width='stretch', hide_index=True)
         else:
             st.info("No arb opportunities in the current mock dataset.")
             st.markdown("""
@@ -2402,7 +2402,7 @@ Then **Reboot app**. The brain will immediately start persisting after the next 
         if not _poly_live:
             st.info("Connect a live Polymarket feed (POLYMARKET_API_KEY) to scan real "
                     "order books. Mock mids always sum to ~$1.00, so no arb appears.")
-        elif st.button("🔍 Scan live order books for arb", use_container_width=True):
+        elif st.button("🔍 Scan live order books for arb", width='stretch'):
             with st.spinner(f"Fetching YES/NO books for {min(scan_n, len(_live_poly))} markets…"):
                 try:
                     enriched = _fetch_polymarket_arb_sync(_poly_key, _live_poly[:scan_n])
@@ -2427,7 +2427,7 @@ Then **Reboot app**. The brain will immediately start persisting after the next 
                     "ROI":        f"{o.roi:+.2%}",
                     "Conf.":      f"{o.confidence:.0%}",
                 } for o in arbs]
-                st.dataframe(pd.DataFrame(ia_rows), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(ia_rows), width='stretch', hide_index=True)
             elif enriched:
                 st.info(f"Scanned {len(enriched)} live markets — no bundle priced under "
                         "$1.00 right now. These windows are brief; re-scan during volatility.")
@@ -2601,7 +2601,7 @@ Then **Reboot app**. The brain will immediately start persisting after the next 
                 {"P5": res.band_p5, "Median": res.band_p50, "P95": res.band_p95},
                 index=res.step_labels,
             )
-            st.line_chart(fan_df, height=260, use_container_width=True)
+            st.line_chart(fan_df, height=260, width='stretch')
 
             # final P&L distribution
             st.markdown("**Final P&L distribution** (all simulated outcomes)")
@@ -2609,9 +2609,9 @@ Then **Reboot app**. The brain will immediately start persisting after the next 
                 {"Frequency": res.hist_counts},
                 index=[f"${c:+.0f}" for c in res.hist_centers],
             )
-            st.bar_chart(hist_df, height=220, use_container_width=True)
+            st.bar_chart(hist_df, height=220, width='stretch')
 
-            st.dataframe(pd.DataFrame(pos_rows), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(pos_rows), width='stretch', hide_index=True)
             st.caption(
                 "Win probability uses the AI/ensemble estimate; payoff is the binary "
                 "market's mechanical $1 resolution. Outcomes assumed independent unless "
@@ -2729,7 +2729,7 @@ Then **Reboot app**. The brain will immediately start persisting after the next 
                         "Why":      _r,
                     })
                 with st.expander(f"🔬 Kalshi markets scanned ({len(_kal_all)}) — why they did/didn't signal", expanded=True):
-                    st.dataframe(pd.DataFrame(_krows), use_container_width=True, hide_index=True)
+                    st.dataframe(pd.DataFrame(_krows), width='stretch', hide_index=True)
                     st.caption(
                         f"A Kalshi BUY needs **AdjConf ≥ {_CONF_FLOOR:.2f}** AND **|Edge| ≥ MinEdge**. "
                         f"AdjConf = model confidence × ({_QUALITY_BASE:.2f} + {_QUALITY_SPAN:.2f} × quality). "
@@ -2774,7 +2774,7 @@ Then **Reboot app**. The brain will immediately start persisting after the next 
                     "Status":   _why,
                 })
             with st.expander(f"🔍 Why these {len(_live_sigs)} live signal(s) did/didn't trade", expanded=not _all_gates):
-                st.dataframe(pd.DataFrame(_diag_rows), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(_diag_rows), width='stretch', hide_index=True)
                 st.caption(f"A valid signal deploys its Kelly size, floored up to the "
                            f"${_MIN_ORDER_USD:.0f} minimum order when the budget allows. "
                            "Raise the per-platform **budget** above to size more signals over the minimum.")
@@ -2819,7 +2819,7 @@ Then **Reboot app**. The brain will immediately start persisting after the next 
                     with cR:
                         # Paper trade — always available
                         if st.button("📝 Paper Buy", key=f"paper_{a['id']}",
-                                     use_container_width=True):
+                                     width='stretch'):
                             st.session_state.paper_ledger.append({
                                 "Platform":  a["platform"],
                                 "Question":  a["question"][:50],
@@ -2850,7 +2850,7 @@ Then **Reboot app**. The brain will immediately start persisting after the next 
                                     key=f"confirm_{a['id']}",
                                 )
                                 if st.button("🚨 EXECUTE LIVE", key=f"live_{a['id']}",
-                                             type="primary", use_container_width=True,
+                                             type="primary", width='stretch',
                                              disabled=not confirm):
                                     try:
                                         with st.spinner("Signing & posting order…"):
