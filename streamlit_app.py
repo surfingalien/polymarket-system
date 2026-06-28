@@ -49,8 +49,9 @@ try:
         EnsemblePredictor, KellyCriterion,
         MomentumAnalyzer, OrderBookAnalyzer,
         OrderBookSnapshot, PricePoint,
-        ResolutionDecayModel,
+        ResolutionDecayModel, SentimentConverter,
     )
+    from shared.news_fetcher import NewsFetcher
     from shared.intra_market_arb import IntraMarketArbitrage
     from shared.monte_carlo import MonteCarloPortfolio, position_from_signal
     from polymarket_bot.polymarket_client import PolymarketClient
@@ -658,11 +659,78 @@ def _price_movement(hist: list) -> float:
         return 0.0
 
 
+# ── market sentiment factor ───────────────────────────────────────────────────
+# A small sentiment lexicon (mirrors news_fetcher) so we can score the AI's own
+# rationale text without a network call. Real news sentiment is layered on top
+# when a news API key is configured.
+_SENT_POS = ("win", "rise", "surge", "lead", "ahead", "victory", "likely", "favored",
+             "confirm", "approve", "pass", "increase", "beat", "record", "strong",
+             "advance", "dominant", "momentum", "boost", "gain")
+_SENT_NEG = ("loss", "fall", "drop", "behind", "defeat", "unlikely", "fail", "weak",
+             "reject", "deny", "decrease", "miss", "collapse", "crisis", "injury",
+             "eliminated", "struggle", "doubt", "setback", "risk")
+
+
+def _lex_sentiment(text: str) -> float:
+    """Lexicon sentiment in [-1, +1]. 0.0 for empty/neutral text."""
+    t = (text or "").lower()
+    if not t:
+        return 0.0
+    pos = sum(1 for w in _SENT_POS if w in t)
+    neg = sum(1 for w in _SENT_NEG if w in t)
+    total = pos + neg
+    if total == 0:
+        return 0.0
+    return max(-1.0, min(1.0, (pos - neg) / total))
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _news_sentiment_sync(question: str, tavily: str, newsapi: str) -> tuple[float, int]:
+    """Real news sentiment for a market question (cached 10 min). Returns
+    (sentiment[-1..1], article_count). 0 articles if no key / fetch fails."""
+    if not (tavily or newsapi):
+        return 0.0, 0
+    async def _inner():
+        nf = NewsFetcher(tavily_key=tavily, newsapi_key=newsapi, max_articles=5)
+        try:
+            res = await nf.fetch(question[:120])
+            real = [a for a in res.articles if a.source != "mock"]
+            return float(res.sentiment_score), len(real)
+        finally:
+            await nf.close()
+    try:
+        return _run_coro_sync(_inner(), timeout=20)
+    except Exception:
+        return 0.0, 0
+
+
+def _market_sentiment(ai_d: dict, question: str, tavily: str, newsapi: str) -> tuple[float, int]:
+    """Combine real news sentiment (when a key is set) with sentiment derived
+    from the AI's own rationale + risk flags. Returns (sentiment, evidence_count)."""
+    # AI-rationale sentiment — always available, no network.
+    _txt = " ".join([
+        str(ai_d.get("reasoning", "")),
+        " ".join(str(f) for f in ai_d.get("factors", [])),
+    ])
+    ai_sent = _lex_sentiment(_txt)
+    # More uncertainty flags → temper the read toward neutral.
+    _flags = len(ai_d.get("flags", []) or [])
+    ai_sent *= max(0.4, 1.0 - 0.15 * _flags)
+    ai_n = 2 if _txt.strip() else 0
+
+    news_sent, news_n = _news_sentiment_sync(question, tavily, newsapi)
+    if news_n > 0:
+        # Weight real news above the AI's self-rationale.
+        sent = (news_sent * news_n * 1.5 + ai_sent * ai_n) / (news_n * 1.5 + ai_n)
+        return max(-1.0, min(1.0, sent)), news_n + ai_n
+    return ai_sent, ai_n
+
+
 # ── full analysis pipeline — returns only plain primitives ────────────────────
 
 @st.cache_data(ttl=120, show_spinner=False)
 def _run_analysis(
-    markets: list[dict], providers: tuple = (),
+    markets: list[dict], providers: tuple = (), news_keys: tuple = ("", ""),
 ) -> tuple[list[dict], bool, str, str]:
     # Fetch AI probability estimates — try each provider in order, falling
     # through to the next on a usage-limit/auth/rate error (e.g. Claude exhausted
@@ -698,6 +766,8 @@ def _run_analysis(
     ob    = OrderBookAnalyzer()
     mom   = MomentumAnalyzer()
     ens   = EnsemblePredictor(kelly)
+    sentc = SentimentConverter()
+    _tavily, _newsapi = (news_keys + ("", ""))[:2]
     decay = ResolutionDecayModel()
     ls    = LongshotBiasDetector()
     cat   = CategoryEdgeModel()
@@ -724,6 +794,12 @@ def _run_analysis(
         ob_sigs  = ob.analyze(ob_snap)
         mom_sigs = mom.analyze(pp)
 
+        # Market sentiment factor: news sentiment (when a key is set) blended with
+        # the AI rationale's tone. Fires the dormant `news_sentiment` ensemble
+        # signal so it influences the estimate AND the brain learns its weight.
+        _sent, _sent_n = _market_sentiment(ai_d, mkt["question"], _tavily, _newsapi)
+        _sent_sig = sentc.to_signal(_sent, _sent_n) if _sent_n > 0 else None
+
         raw = ens.predict(
             market_price=mkt["price"],
             ai_probability=ai_d["prob"],
@@ -731,7 +807,7 @@ def _run_analysis(
             bayesian_estimate=float(bay_m),
             microstructure_signals=ob_sigs,
             momentum_signals=mom_sigs,
-            sentiment_signal=None,
+            sentiment_signal=_sent_sig,
         )
 
         adj_conf, adj_prob = decay.adjust_for_time(
@@ -772,6 +848,7 @@ def _run_analysis(
             "prob": float(adj_prob), "conf": float(adj_conf),
             "edge": float(edge), "kelly": float(kf),
             "quality": float(q_score), "signal": signal,
+            "sentiment": float(_sent), "sentiment_n": int(_sent_n),
             "min_edge": float(min_edge), "history": hist, "signals": sigs,
             "yes_token_id": str(mkt.get("yes_token_id", "")),
             "no_token_id":  str(mkt.get("no_token_id", "")),
@@ -785,6 +862,8 @@ _zai_key         = _get_secret("ZAI_API_KEY")
 _poly_key        = _get_secret("POLYMARKET_API_KEY")
 _kalshi_key      = _get_secret("KALSHI_API_KEY")
 _kalshi_pem      = _get_secret("KALSHI_PRIVATE_KEY_PEM")
+_news_tavily     = _get_secret("NEWS_TAVILY_API_KEY")
+_news_newsapi    = _get_secret("NEWS_NEWSAPI_KEY")
 
 # ── AI provider resolution ────────────────────────────────────────────────────
 # Build an ordered provider chain. Claude is primary when its key is present;
@@ -917,6 +996,10 @@ with st.sidebar:
         st.markdown(f"✅ Z.ai key set → GLM (`{_ai_model}`)")
     else:
         st.markdown("⚪ No AI key → mock AI")
+    if _news_tavily or _news_newsapi:
+        st.markdown("✅ News sentiment **live** (real headlines + AI rationale)")
+    else:
+        st.markdown("🟡 Sentiment from AI rationale only — add `NEWS_TAVILY_API_KEY` for live news")
     st.markdown("✅ Polymarket key set" if _poly_key       else "⚪ No Polymarket key → mock data")
     if _kalshi_key and _kalshi_pem:
         st.markdown("✅ Kalshi keys set (API key + RSA PEM)")
@@ -1141,6 +1224,8 @@ def _live_dashboard():
     _eff_kalshi_pem = "" if _dm else _kalshi_pem
     # Demo mode disables AI entirely; otherwise pass the full fallback chain.
     _eff_ai_chain   = () if _dm else tuple(_ai_chain)
+    # News-sentiment keys (real news layered onto the AI-rationale sentiment).
+    _eff_news_keys  = ("", "") if _dm else (_news_tavily, _news_newsapi)
 
     # ── load data ─────────────────────────────────────────────────────────────
     try:
@@ -1148,7 +1233,7 @@ def _live_dashboard():
             _source_markets, _poly_live, _kalshi_live, _poly_err, _kalshi_err = \
                 _get_markets(_eff_poly, _eff_kalshi, _eff_kalshi_pem)
             all_analyses, _live_ai_mode, _ai_err, _ai_used = _run_analysis(
-                _source_markets, _eff_ai_chain)
+                _source_markets, _eff_ai_chain, _eff_news_keys)
     except Exception as exc:
         st.error("Analysis pipeline failed — see details below.")
         st.exception(exc)
@@ -2288,6 +2373,8 @@ Then **Reboot app**. The brain will immediately start persisting after the next 
                         "MinEdge":  f"{_a['min_edge']:.1%}",
                         "AdjConf":  f"{_a['conf']:.2f}",
                         "Quality":  f"{_a['quality']:.2f}",
+                        "Sentiment": (f"{_a.get('sentiment', 0.0):+.2f}"
+                                      if _a.get('sentiment_n', 0) else "—"),
                         "Why":      _r,
                     })
                 with st.expander(f"🔬 Kalshi markets scanned ({len(_kal_all)}) — why they did/didn't signal", expanded=True):
