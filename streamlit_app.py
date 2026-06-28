@@ -49,8 +49,9 @@ try:
         EnsemblePredictor, KellyCriterion,
         MomentumAnalyzer, OrderBookAnalyzer,
         OrderBookSnapshot, PricePoint,
-        ResolutionDecayModel,
+        ResolutionDecayModel, SentimentConverter,
     )
+    from shared.news_fetcher import NewsFetcher
     from shared.intra_market_arb import IntraMarketArbitrage
     from shared.monte_carlo import MonteCarloPortfolio, position_from_signal
     from polymarket_bot.polymarket_client import PolymarketClient
@@ -644,6 +645,8 @@ _QUALITY_BASE  = 0.65   # confidence retained on a zero-quality market
 _QUALITY_SPAN  = 0.35   # extra confidence a top-quality market earns
 _MIN_ORDER_USD = 1.0    # floor an actionable order up to this so valid small
                         # signals still execute (Kalshi fills >= 1 contract anyway)
+_TAKE_PROFIT   = 0.25   # default: book profit when a position is +25% of its cost
+_STOP_LOSS     = 0.20   # default: cut a position at -20% of its cost
 
 
 def _price_movement(hist: list) -> float:
@@ -658,11 +661,78 @@ def _price_movement(hist: list) -> float:
         return 0.0
 
 
+# ── market sentiment factor ───────────────────────────────────────────────────
+# A small sentiment lexicon (mirrors news_fetcher) so we can score the AI's own
+# rationale text without a network call. Real news sentiment is layered on top
+# when a news API key is configured.
+_SENT_POS = ("win", "rise", "surge", "lead", "ahead", "victory", "likely", "favored",
+             "confirm", "approve", "pass", "increase", "beat", "record", "strong",
+             "advance", "dominant", "momentum", "boost", "gain")
+_SENT_NEG = ("loss", "fall", "drop", "behind", "defeat", "unlikely", "fail", "weak",
+             "reject", "deny", "decrease", "miss", "collapse", "crisis", "injury",
+             "eliminated", "struggle", "doubt", "setback", "risk")
+
+
+def _lex_sentiment(text: str) -> float:
+    """Lexicon sentiment in [-1, +1]. 0.0 for empty/neutral text."""
+    t = (text or "").lower()
+    if not t:
+        return 0.0
+    pos = sum(1 for w in _SENT_POS if w in t)
+    neg = sum(1 for w in _SENT_NEG if w in t)
+    total = pos + neg
+    if total == 0:
+        return 0.0
+    return max(-1.0, min(1.0, (pos - neg) / total))
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _news_sentiment_sync(question: str, tavily: str, newsapi: str) -> tuple[float, int]:
+    """Real news sentiment for a market question (cached 10 min). Returns
+    (sentiment[-1..1], article_count). 0 articles if no key / fetch fails."""
+    if not (tavily or newsapi):
+        return 0.0, 0
+    async def _inner():
+        nf = NewsFetcher(tavily_key=tavily, newsapi_key=newsapi, max_articles=5)
+        try:
+            res = await nf.fetch(question[:120])
+            real = [a for a in res.articles if a.source != "mock"]
+            return float(res.sentiment_score), len(real)
+        finally:
+            await nf.close()
+    try:
+        return _run_coro_sync(_inner(), timeout=20)
+    except Exception:
+        return 0.0, 0
+
+
+def _market_sentiment(ai_d: dict, question: str, tavily: str, newsapi: str) -> tuple[float, int]:
+    """Combine real news sentiment (when a key is set) with sentiment derived
+    from the AI's own rationale + risk flags. Returns (sentiment, evidence_count)."""
+    # AI-rationale sentiment — always available, no network.
+    _txt = " ".join([
+        str(ai_d.get("reasoning", "")),
+        " ".join(str(f) for f in ai_d.get("factors", [])),
+    ])
+    ai_sent = _lex_sentiment(_txt)
+    # More uncertainty flags → temper the read toward neutral.
+    _flags = len(ai_d.get("flags", []) or [])
+    ai_sent *= max(0.4, 1.0 - 0.15 * _flags)
+    ai_n = 2 if _txt.strip() else 0
+
+    news_sent, news_n = _news_sentiment_sync(question, tavily, newsapi)
+    if news_n > 0:
+        # Weight real news above the AI's self-rationale.
+        sent = (news_sent * news_n * 1.5 + ai_sent * ai_n) / (news_n * 1.5 + ai_n)
+        return max(-1.0, min(1.0, sent)), news_n + ai_n
+    return ai_sent, ai_n
+
+
 # ── full analysis pipeline — returns only plain primitives ────────────────────
 
 @st.cache_data(ttl=120, show_spinner=False)
 def _run_analysis(
-    markets: list[dict], providers: tuple = (),
+    markets: list[dict], providers: tuple = (), news_keys: tuple = ("", ""),
 ) -> tuple[list[dict], bool, str, str]:
     # Fetch AI probability estimates — try each provider in order, falling
     # through to the next on a usage-limit/auth/rate error (e.g. Claude exhausted
@@ -698,6 +768,8 @@ def _run_analysis(
     ob    = OrderBookAnalyzer()
     mom   = MomentumAnalyzer()
     ens   = EnsemblePredictor(kelly)
+    sentc = SentimentConverter()
+    _tavily, _newsapi = (news_keys + ("", ""))[:2]
     decay = ResolutionDecayModel()
     ls    = LongshotBiasDetector()
     cat   = CategoryEdgeModel()
@@ -724,6 +796,12 @@ def _run_analysis(
         ob_sigs  = ob.analyze(ob_snap)
         mom_sigs = mom.analyze(pp)
 
+        # Market sentiment factor: news sentiment (when a key is set) blended with
+        # the AI rationale's tone. Fires the dormant `news_sentiment` ensemble
+        # signal so it influences the estimate AND the brain learns its weight.
+        _sent, _sent_n = _market_sentiment(ai_d, mkt["question"], _tavily, _newsapi)
+        _sent_sig = sentc.to_signal(_sent, _sent_n) if _sent_n > 0 else None
+
         raw = ens.predict(
             market_price=mkt["price"],
             ai_probability=ai_d["prob"],
@@ -731,7 +809,7 @@ def _run_analysis(
             bayesian_estimate=float(bay_m),
             microstructure_signals=ob_sigs,
             momentum_signals=mom_sigs,
-            sentiment_signal=None,
+            sentiment_signal=_sent_sig,
         )
 
         adj_conf, adj_prob = decay.adjust_for_time(
@@ -772,6 +850,7 @@ def _run_analysis(
             "prob": float(adj_prob), "conf": float(adj_conf),
             "edge": float(edge), "kelly": float(kf),
             "quality": float(q_score), "signal": signal,
+            "sentiment": float(_sent), "sentiment_n": int(_sent_n),
             "min_edge": float(min_edge), "history": hist, "signals": sigs,
             "yes_token_id": str(mkt.get("yes_token_id", "")),
             "no_token_id":  str(mkt.get("no_token_id", "")),
@@ -785,6 +864,8 @@ _zai_key         = _get_secret("ZAI_API_KEY")
 _poly_key        = _get_secret("POLYMARKET_API_KEY")
 _kalshi_key      = _get_secret("KALSHI_API_KEY")
 _kalshi_pem      = _get_secret("KALSHI_PRIVATE_KEY_PEM")
+_news_tavily     = _get_secret("NEWS_TAVILY_API_KEY")
+_news_newsapi    = _get_secret("NEWS_NEWSAPI_KEY")
 
 # ── AI provider resolution ────────────────────────────────────────────────────
 # Build an ordered provider chain. Claude is primary when its key is present;
@@ -845,6 +926,10 @@ if "kalshi_budget"     not in st.session_state:
     st.session_state.kalshi_budget     = _qp_float("kb",  10.0)
 if "sidebar_min_conf"  not in st.session_state:
     st.session_state.sidebar_min_conf  = _qp_float("mc",  0.55)
+if "take_profit_pct"   not in st.session_state:
+    st.session_state.take_profit_pct   = _qp_float("tp",  _TAKE_PROFIT)
+if "stop_loss_pct"     not in st.session_state:
+    st.session_state.stop_loss_pct     = _qp_float("sl",  _STOP_LOSS)
 if "auto_paper"        not in st.session_state:
     st.session_state.auto_paper        = _qp_bool("ap",   False)
 if "refresh_label"     not in st.session_state:
@@ -917,6 +1002,10 @@ with st.sidebar:
         st.markdown(f"✅ Z.ai key set → GLM (`{_ai_model}`)")
     else:
         st.markdown("⚪ No AI key → mock AI")
+    if _news_tavily or _news_newsapi:
+        st.markdown("✅ News sentiment **live** (real headlines + AI rationale)")
+    else:
+        st.markdown("🟡 Sentiment from AI rationale only — add `NEWS_TAVILY_API_KEY` for live news")
     st.markdown("✅ Polymarket key set" if _poly_key       else "⚪ No Polymarket key → mock data")
     if _kalshi_key and _kalshi_pem:
         st.markdown("✅ Kalshi keys set (API key + RSA PEM)")
@@ -1033,6 +1122,14 @@ with _bar1:
                         key="kalshi_budget", help="Max $ per Kalshi trade")
     with _bc3:
         st.slider("Min confidence", 0.40, 0.90, step=0.05, key="sidebar_min_conf")
+    # Fast exit controls: book profits / cut losses on open positions.
+    _ec1, _ec2 = st.columns(2)
+    with _ec1:
+        st.slider("Take-profit %", 0.05, 1.00, step=0.05, key="take_profit_pct",
+                  help="Auto-sell an open position once it's up this % of its cost")
+    with _ec2:
+        st.slider("Stop-loss %", 0.05, 0.90, step=0.05, key="stop_loss_pct",
+                  help="Auto-sell an open position once it's down this % of its cost")
 with _bar2:
     st.toggle(
         "🔵 Demo mode",
@@ -1141,6 +1238,8 @@ def _live_dashboard():
     _eff_kalshi_pem = "" if _dm else _kalshi_pem
     # Demo mode disables AI entirely; otherwise pass the full fallback chain.
     _eff_ai_chain   = () if _dm else tuple(_ai_chain)
+    # News-sentiment keys (real news layered onto the AI-rationale sentiment).
+    _eff_news_keys  = ("", "") if _dm else (_news_tavily, _news_newsapi)
 
     # ── load data ─────────────────────────────────────────────────────────────
     try:
@@ -1148,7 +1247,7 @@ def _live_dashboard():
             _source_markets, _poly_live, _kalshi_live, _poly_err, _kalshi_err = \
                 _get_markets(_eff_poly, _eff_kalshi, _eff_kalshi_pem)
             all_analyses, _live_ai_mode, _ai_err, _ai_used = _run_analysis(
-                _source_markets, _eff_ai_chain)
+                _source_markets, _eff_ai_chain, _eff_news_keys)
     except Exception as exc:
         st.error("Analysis pipeline failed — see details below.")
         st.exception(exc)
@@ -1535,13 +1634,17 @@ def _live_dashboard():
 
     # ── auto-exit / position maintenance (Kalshi) ─────────────────────────────
     # "Maintaining proper trades" means not just opening positions but closing
-    # them when the thesis breaks. For each OPEN auto-live Kalshi position we
-    # re-check the live model: if it now signals the OPPOSITE direction with a
-    # real edge (a genuine reversal, not noise), the bot sells to close. Same
-    # gates as entry, so disabling auto-live also halts auto-exits.
+    # them fast: book profit at the take-profit target, cut losses at the
+    # stop-loss, or close on a genuine model reversal. The brain learns from
+    # every realized close. Same gates as entry, so disabling auto-live halts
+    # auto-exits too.
+    _brain_dirty = False  # set by exits below and resolution detection later
     if _al and _lt and _kalshi_key and _kalshi_pem and not _dm:
         _by_ticker = {a["id"]: a for a in all_analyses}
+        _tp = float(st.session_state.get("take_profit_pct", _TAKE_PROFIT))
+        _sl = float(st.session_state.get("stop_loss_pct", _STOP_LOSS))
         _closed = 0
+        _exit_reasons: list[str] = []
         for _row in st.session_state.live_ledger:
             if _row.get("Platform") != "Kalshi" or not _row.get("Open", False):
                 continue
@@ -1549,9 +1652,22 @@ def _live_dashboard():
             if not _cur:
                 continue
             _held = _row.get("Dir")  # "YES" / "NO"
+            # Position-aware exit decision, evaluated every refresh so the bot
+            # reacts fast: book profit at +TP, cut losses at -SL, or close on a
+            # genuine model reversal. P&L fraction = unrealized $ / position cost.
+            _size = float(_row.get("Size $") or 0.0)
+            _upnl = _trade_pnl(_row)
+            _pnl_frac = (_upnl / _size) if _size > 0 else 0.0
             _flipped = ((_held == "YES" and _cur["signal"] == "BUY_NO")
                         or (_held == "NO" and _cur["signal"] == "BUY_YES"))
-            if not (_flipped and abs(_cur["edge"]) >= _cur["min_edge"]):
+            _reason = None
+            if _pnl_frac >= _tp:
+                _reason = "take-profit"
+            elif _pnl_frac <= -_sl:
+                _reason = "stop-loss"
+            elif _flipped and abs(_cur["edge"]) >= _cur["min_edge"]:
+                _reason = "model-reversal"
+            if _reason is None:
                 continue
             _cnt = int(_row.get("count", 0))
             if _cnt <= 0:
@@ -1574,7 +1690,12 @@ def _live_dashboard():
                 _row["Exit"] = f"{_cur['price']:.0%}"
                 _row["Realized $"] = round(_pnl, 2)
                 _row["Exit ID"] = _ex.get("order_id", "")
+                _row["Exit Reason"] = _reason
+                # Brain evolves on every executed close, not just resolution.
+                _get_brain().on_trade_closed(_row.get("ticker"), won=_pnl > 0)
+                _brain_dirty = True
                 _closed += 1
+                _exit_reasons.append(_reason)
             except Exception as _exc:
                 _exc_str = str(_exc)
                 # A 410/404 on exit means the market already settled — Kalshi
@@ -1584,26 +1705,31 @@ def _live_dashboard():
                     _row["Open"] = False
                     _row["Status"] = "SETTLED"
                     _row["Exit"] = f"{_cur['price']:.0%}"
-                    _row["Realized $"] = round(_trade_pnl(_row), 2)
+                    _pnl = round(_trade_pnl(_row), 2)
+                    _row["Realized $"] = _pnl
+                    _row["Exit Reason"] = "settled"
+                    _get_brain().on_trade_closed(_row.get("ticker"), won=_pnl > 0)
+                    _brain_dirty = True
                     _closed += 1
                 st.session_state._last_live_error = (
                     f"{time.strftime('%H:%M:%S')} — exit {_row.get('Question','')[:30]}: {_exc}"
                 )
                 st.toast(f"Auto-exit failed: {_exc}", icon="❌")
         if _closed:
+            _rs = ", ".join(sorted(set(_exit_reasons))) or "settled"
             st.toast(
-                f"🔄 Bot auto-closed {_closed} reversed Kalshi position"
-                f"{'s' if _closed != 1 else ''}",
+                f"🔄 Bot auto-closed {_closed} Kalshi position"
+                f"{'s' if _closed != 1 else ''} ({_rs})",
                 icon="🔄",
             )
             st.session_state._last_kalshi_status = (
-                f"{time.strftime('%H:%M:%S')} — auto-closed {_closed} reversed "
-                "position(s) on model flip."
+                f"{time.strftime('%H:%M:%S')} — auto-closed {_closed} "
+                f"position(s): {_rs}."
             )
 
     # ── brain: detect resolutions + decay + save ──────────────────────────────
+    # (_brain_dirty may already be True from auto-exit trade-close learning above)
     _brain = _get_brain()
-    _brain_dirty = False
     for _ma in all_analyses:
         _mid = _ma["id"]
         if _mid in _brain._memories and _brain._memories[_mid].resolved_outcome is None:
@@ -2288,6 +2414,8 @@ Then **Reboot app**. The brain will immediately start persisting after the next 
                         "MinEdge":  f"{_a['min_edge']:.1%}",
                         "AdjConf":  f"{_a['conf']:.2f}",
                         "Quality":  f"{_a['quality']:.2f}",
+                        "Sentiment": (f"{_a.get('sentiment', 0.0):+.2f}"
+                                      if _a.get('sentiment_n', 0) else "—"),
                         "Why":      _r,
                     })
                 with st.expander(f"🔬 Kalshi markets scanned ({len(_kal_all)}) — why they did/didn't signal", expanded=True):
