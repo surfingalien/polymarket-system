@@ -29,11 +29,30 @@ import structlog
 
 log = structlog.get_logger(__name__)
 
+# Once a connection clearly can't work (bad URL / DNS), stop retrying every cycle
+# so we don't spam the logs. Reset only on process restart.
+_DISABLED_REASON: str | None = None
+
+
+def _looks_like_supabase_url(url: str) -> bool:
+    return url.startswith("https://") and ".supabase.co" in url and " " not in url.strip()
+
 
 def _client():
-    url = os.environ.get("SUPABASE_URL", "")
-    key = os.environ.get("SUPABASE_KEY", "")
+    global _DISABLED_REASON
+    if _DISABLED_REASON is not None:
+        return None
+    url = os.environ.get("SUPABASE_URL", "").strip()
+    key = os.environ.get("SUPABASE_KEY", "").strip()
     if not url or not key:
+        return None
+    if not _looks_like_supabase_url(url):
+        _DISABLED_REASON = (
+            f"SUPABASE_URL doesn't look valid ({url!r}). It must be exactly "
+            "https://<project-ref>.supabase.co (no path, no trailing slash). "
+            "Cloud persistence disabled for this session."
+        )
+        log.warning("supabase_url_invalid", detail=_DISABLED_REASON)
         return None
     try:
         from supabase import create_client  # type: ignore
@@ -41,6 +60,15 @@ def _client():
     except Exception as exc:
         log.warning("supabase_client_init_failed", error=str(exc))
         return None
+
+
+def _disable(reason: str) -> None:
+    """Turn off cloud persistence for the session after an unrecoverable error
+    (e.g. DNS 'Name or service not known' = wrong SUPABASE_URL host)."""
+    global _DISABLED_REASON
+    if _DISABLED_REASON is None:
+        _DISABLED_REASON = reason
+        log.warning("cloud_disabled", detail=reason)
 
 
 def is_available() -> bool:
@@ -57,7 +85,10 @@ def cloud_load(key: str) -> dict | None:
         if res and res.data:
             return res.data[0]["value"]
     except Exception as exc:
-        log.warning("cloud_load_failed", key=key, error=str(exc))
+        _es = str(exc)
+        log.warning("cloud_load_failed", key=key, error=_es)
+        if "Name or service not known" in _es or "getaddrinfo" in _es or "Errno -2" in _es:
+            _disable(f"Supabase host unreachable (DNS): {_es}. Check SUPABASE_URL.")
     return None
 
 
@@ -76,5 +107,8 @@ def cloud_save(key: str, value: dict) -> bool:
         log.info("cloud_save_ok", key=key)
         return True
     except Exception as exc:
-        log.warning("cloud_save_failed", key=key, error=str(exc))
+        _es = str(exc)
+        log.warning("cloud_save_failed", key=key, error=_es)
+        if "Name or service not known" in _es or "getaddrinfo" in _es or "Errno -2" in _es:
+            _disable(f"Supabase host unreachable (DNS): {_es}. Check SUPABASE_URL.")
         return False
