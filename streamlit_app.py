@@ -75,6 +75,28 @@ def _get_secret(name: str) -> str:
 _UNSET = object()  # sentinel: distinguishes "never set" from a real None/[] result
 
 
+# Python 3.14 + httpx: when a per-call event loop closes, the SSL transport's
+# deferred connection-lost callback can fire during later garbage collection and
+# raise a benign 'Event loop is closed' RuntimeError from a finalizer. It's
+# non-fatal but noisy. Swallow ONLY that exact case via the unraisable hook;
+# everything else passes through untouched. (The clean fix is Python 3.12.)
+_prev_unraisablehook = getattr(sys, "unraisablehook", None)
+
+
+def _quiet_unraisablehook(unraisable):
+    exc = getattr(unraisable, "exc_value", None)
+    if isinstance(exc, RuntimeError) and "Event loop is closed" in str(exc):
+        return
+    if _prev_unraisablehook is not None:
+        _prev_unraisablehook(unraisable)
+
+
+try:
+    sys.unraisablehook = _quiet_unraisablehook
+except Exception:
+    pass
+
+
 def _run_coro_sync(coro, timeout: int = 30):
     """Run an async coroutine safely from a synchronous Streamlit context.
 
