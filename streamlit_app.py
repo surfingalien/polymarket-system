@@ -75,50 +75,39 @@ def _get_secret(name: str) -> str:
 _UNSET = object()  # sentinel: distinguishes "never set" from a real None/[] result
 
 
-def _run_coro_sync(coro, timeout: int = 30):
-    """Run an async coroutine safely from a synchronous Streamlit context.
+_BG_LOOP = None
+_BG_LOOP_LOCK = threading.Lock()
 
-    Uses a managed event loop (not bare asyncio.run) and flushes pending
-    callbacks before closing. Python 3.14 closes the loop more aggressively, so
-    httpx's deferred SSL transport teardown (call_soon → _call_connection_lost)
-    could otherwise fire after the loop is gone and raise 'Event loop is closed'.
+
+def _get_bg_loop():
+    """One persistent background event loop for the whole app process.
+
+    Creating + closing a fresh loop per call (asyncio.run / run_until_complete)
+    races httpx's deferred SSL transport teardown on Python 3.14 and raises
+    'Event loop is closed'. A single long-lived loop never closes during the
+    session, so that race can't happen. Coroutines are submitted thread-safely.
     """
-    result_box: list = [_UNSET]
-    exc_box: list = [None]
+    global _BG_LOOP
+    with _BG_LOOP_LOCK:
+        if _BG_LOOP is None or _BG_LOOP.is_closed():
+            _BG_LOOP = asyncio.new_event_loop()
+            threading.Thread(target=_BG_LOOP.run_forever, daemon=True).start()
+        return _BG_LOOP
 
-    def _target():
-        loop = asyncio.new_event_loop()
-        try:
-            asyncio.set_event_loop(loop)
-            result_box[0] = loop.run_until_complete(coro)
-        except Exception as e:
-            exc_box[0] = e
-        finally:
-            # Let transports/SSL connection-lost callbacks run while the loop is
-            # still open, then shut down async generators, THEN close.
-            try:
-                loop.run_until_complete(asyncio.sleep(0.05))
-                loop.run_until_complete(loop.shutdown_asyncgens())
-            except Exception:
-                pass
-            try:
-                asyncio.set_event_loop(None)
-                loop.close()
-            except Exception:
-                pass
 
-    t = threading.Thread(target=_target, daemon=True)
-    t.start()
-    t.join(timeout=timeout)
-    if t.is_alive():
-        raise TimeoutError(f"API request timed out after {timeout} s — the host may be unreachable")
-    if exc_box[0]:
-        raise exc_box[0]
-    if result_box[0] is _UNSET:
-        # Thread finished without setting a result or raising — should be
-        # unreachable, but fail loudly rather than returning the sentinel.
-        raise RuntimeError("API call returned no data")
-    return result_box[0]  # empty list / None are valid results
+def _run_coro_sync(coro, timeout: int = 30):
+    """Run an async coroutine from synchronous Streamlit code on the persistent
+    background loop, blocking up to `timeout` seconds for the result."""
+    import concurrent.futures as _cf
+    loop = _get_bg_loop()
+    fut = asyncio.run_coroutine_threadsafe(coro, loop)
+    try:
+        return fut.result(timeout=timeout)
+    except _cf.TimeoutError:
+        fut.cancel()
+        raise TimeoutError(
+            f"API request timed out after {timeout} s — the host may be unreachable"
+        )
 
 
 def _live_ai_analysis(
@@ -1548,17 +1537,19 @@ def _live_dashboard():
         if "usage limit" in _err_low or "api usage" in _err_low or "quota" in _err_low:
             import re as _re
             _reset = (_re.search(r'(\d{4}-\d{2}-\d{2})', _ai_err) or type("", (), {"group": lambda *a: "July 1"})()).group(1)
-            # If Z.ai is not configured, point the user at it as the fallback.
             _fallback_hint = (
-                "Add a **ZAI_API_KEY** secret to auto-fall back to Z.ai GLM when Claude is exhausted. "
+                "Add a **ZAI_API_KEY** secret to auto-fall back to Z.ai GLM. "
                 if not _zai_key else
-                "The Z.ai fallback also failed — check **ZAI_API_KEY**. "
+                "**Both AI providers are unavailable** — Z.ai is out of credits "
+                "(recharge it) and Claude is rate-capped. "
             )
             st.warning(
-                f"**AI usage limit reached** — primary provider unavailable until **{_reset}**.  \n"
+                f"**AI unavailable** (Claude monthly cap resets ~**{_reset}**; note: "
+                "adding Claude credits does NOT lift the monthly token cap — that's "
+                "a usage-tier limit).  \n"
                 f"{_fallback_hint}"
                 "Analysis is running on Bayesian + momentum signals (no AI). "
-                "Switch to **Demo mode** (toggle above) to silence this warning.",
+                "Switch to **Demo mode** to silence this warning.",
                 icon="💳",
             )
         elif any(s in _err_low for s in (
