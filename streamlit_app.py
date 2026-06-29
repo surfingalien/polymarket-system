@@ -75,39 +75,47 @@ def _get_secret(name: str) -> str:
 _UNSET = object()  # sentinel: distinguishes "never set" from a real None/[] result
 
 
-_BG_LOOP = None
-_BG_LOOP_LOCK = threading.Lock()
-
-
-def _get_bg_loop():
-    """One persistent background event loop for the whole app process.
-
-    Creating + closing a fresh loop per call (asyncio.run / run_until_complete)
-    races httpx's deferred SSL transport teardown on Python 3.14 and raises
-    'Event loop is closed'. A single long-lived loop never closes during the
-    session, so that race can't happen. Coroutines are submitted thread-safely.
-    """
-    global _BG_LOOP
-    with _BG_LOOP_LOCK:
-        if _BG_LOOP is None or _BG_LOOP.is_closed():
-            _BG_LOOP = asyncio.new_event_loop()
-            threading.Thread(target=_BG_LOOP.run_forever, daemon=True).start()
-        return _BG_LOOP
-
-
 def _run_coro_sync(coro, timeout: int = 30):
-    """Run an async coroutine from synchronous Streamlit code on the persistent
-    background loop, blocking up to `timeout` seconds for the result."""
-    import concurrent.futures as _cf
-    loop = _get_bg_loop()
-    fut = asyncio.run_coroutine_threadsafe(coro, loop)
-    try:
-        return fut.result(timeout=timeout)
-    except _cf.TimeoutError:
-        fut.cancel()
-        raise TimeoutError(
-            f"API request timed out after {timeout} s — the host may be unreachable"
-        )
+    """Run an async coroutine safely from a synchronous Streamlit context.
+
+    A fresh event loop in a short-lived worker thread, created on demand DURING
+    a call (never at import time). The previous persistent-background-loop
+    approach raced Python 3.14's stricter cross-thread import locking and could
+    deadlock at startup, so we keep loops short-lived and per-call. The flush
+    before close lets httpx's deferred SSL transport teardown run in-loop.
+    """
+    result_box: list = [_UNSET]
+    exc_box: list = [None]
+
+    def _target():
+        loop = asyncio.new_event_loop()
+        try:
+            asyncio.set_event_loop(loop)
+            result_box[0] = loop.run_until_complete(coro)
+        except Exception as e:
+            exc_box[0] = e
+        finally:
+            try:
+                loop.run_until_complete(asyncio.sleep(0.05))
+                loop.run_until_complete(loop.shutdown_asyncgens())
+            except Exception:
+                pass
+            try:
+                asyncio.set_event_loop(None)
+                loop.close()
+            except Exception:
+                pass
+
+    t = threading.Thread(target=_target, daemon=True)
+    t.start()
+    t.join(timeout=timeout)
+    if t.is_alive():
+        raise TimeoutError(f"API request timed out after {timeout} s — the host may be unreachable")
+    if exc_box[0]:
+        raise exc_box[0]
+    if result_box[0] is _UNSET:
+        raise RuntimeError("API call returned no data")
+    return result_box[0]
 
 
 def _live_ai_analysis(
