@@ -82,8 +82,7 @@ def _run_coro_sync(coro, timeout: int = 30):
     a call (never at import time). The previous persistent-background-loop
     approach raced Python 3.14's stricter cross-thread import locking and could
     deadlock at startup, so we keep loops short-lived and per-call. The flush
-    before close lets httpx's deferred SSL transport teardown run in-loop so it
-    doesn't emit a (non-fatal) 'Event loop is closed' afterwards.
+    before close lets httpx's deferred SSL transport teardown run in-loop.
     """
     result_box: list = [_UNSET]
     exc_box: list = [None]
