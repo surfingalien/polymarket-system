@@ -892,6 +892,7 @@ def _run_analysis(
     using_live = False
     ai_err = ""
     provider_used = ""
+    _provider_errs: list[str] = []   # collect EACH provider's real error
     for _pkey, _pmodel, _pbase, _pname in providers:
         if not _pkey:
             continue
@@ -905,7 +906,11 @@ def _run_analysis(
         except Exception as _live_err:
             live_ai = {}
             using_live = False
-            ai_err = f"{_pname} — {type(_live_err).__name__}: {_live_err}"
+            # Keep the raw error for EVERY provider so the UI can show why each
+            # one failed (e.g. Z.ai bad key vs out of credits vs wrong endpoint),
+            # not just the last provider's message.
+            _provider_errs.append(f"{_pname}: {type(_live_err).__name__}: {str(_live_err)[:200]}")
+            ai_err = " | ".join(_provider_errs)
             # Fall through to the next provider on any "provider unavailable"
             # failure — usage limit, auth, rate limit, OR out of credits
             # (Z.ai's "insufficient balance / recharge", OpenAI's "insufficient
@@ -1027,7 +1032,7 @@ _news_newsapi    = _get_secret("NEWS_NEWSAPI_KEY")
 # credits); Claude is the fallback. If Z.ai is out of credits / rate-limited,
 # analysis falls through to Claude automatically. Order is overridable via the
 # AI_PRIMARY secret ("claude" to make Claude primary instead).
-_ZAI_BASE_URL = "https://api.z.ai/api/anthropic"
+_ZAI_BASE_URL = (_get_secret("ZAI_BASE_URL") or "https://api.z.ai/api/anthropic").rstrip("/")
 _ZAI_MODEL    = _get_secret("ZAI_MODEL") or "glm-4.6"
 _AI_PRIMARY   = (_get_secret("AI_PRIMARY") or "zai").strip().lower()
 _claude_entry = (_anthropic_key, "claude-opus-4-8", "", "Claude") if _anthropic_key else None
@@ -1543,21 +1548,14 @@ def _live_dashboard():
     if _eff_anthropic and not _live_ai_mode:
         _err_low = _ai_err.lower()
         if "usage limit" in _err_low or "api usage" in _err_low or "quota" in _err_low:
-            import re as _re
-            _reset = (_re.search(r'(\d{4}-\d{2}-\d{2})', _ai_err) or type("", (), {"group": lambda *a: "July 1"})()).group(1)
-            _fallback_hint = (
-                "Add a **ZAI_API_KEY** secret to auto-fall back to Z.ai GLM. "
-                if not _zai_key else
-                "**Both AI providers are unavailable** — Z.ai is out of credits "
-                "(recharge it) and Claude is rate-capped. "
-            )
             st.warning(
-                f"**AI unavailable** (Claude monthly cap resets ~**{_reset}**; note: "
-                "adding Claude credits does NOT lift the monthly token cap — that's "
-                "a usage-tier limit).  \n"
-                f"{_fallback_hint}"
-                "Analysis is running on Bayesian + momentum signals (no AI). "
-                "Switch to **Demo mode** to silence this warning.",
+                "**AI unavailable** — analysis is on Bayesian + momentum signals (no AI).  \n"
+                "Per-provider errors (this is the real cause for each):  \n"
+                f"`{_ai_err}`  \n"
+                "Note: Claude's *monthly* token cap is a usage-tier limit that adding "
+                "credits does NOT lift (resets at month start). For Z.ai, verify the "
+                "key is a GLM key valid for the Anthropic-compatible endpoint and has "
+                "credits. Switch to **Demo mode** to silence this warning.",
                 icon="💳",
             )
         elif any(s in _err_low for s in (
