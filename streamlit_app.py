@@ -1032,7 +1032,7 @@ _news_newsapi    = _get_secret("NEWS_NEWSAPI_KEY")
 # credits); Claude is the fallback. If Z.ai is out of credits / rate-limited,
 # analysis falls through to Claude automatically. Order is overridable via the
 # AI_PRIMARY secret ("claude" to make Claude primary instead).
-_ZAI_BASE_URL = "https://api.z.ai/api/anthropic"
+_ZAI_BASE_URL = (_get_secret("ZAI_BASE_URL") or "https://api.z.ai/api/anthropic").rstrip("/")
 _ZAI_MODEL    = _get_secret("ZAI_MODEL") or "glm-4.6"
 _AI_PRIMARY   = (_get_secret("AI_PRIMARY") or "zai").strip().lower()
 _claude_entry = (_anthropic_key, "claude-opus-4-8", "", "Claude") if _anthropic_key else None
